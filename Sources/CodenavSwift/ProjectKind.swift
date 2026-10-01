@@ -128,4 +128,38 @@ public enum ProjectKind: Equatable, Sendable {
 			return nil
 		}
 	}
+
+	/// Local packages the project depends on that live outside `root`: `XCLocalSwiftPackageReference`
+	/// entries of an Xcode project and `.package(path:)` dependencies of a Package.swift. sourcekit-lsp
+	/// only builds a proper index view of directories registered as workspace folders.
+	public static func localPackageFolders(in root: URL) -> [URL] {
+		let fileManager = FileManager.default
+		var relativePaths: [String] = []
+		func matches(_ pattern: String, in text: String, group: Int = 1) -> [String] {
+			guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+			let range = NSRange(text.startIndex..., in: text)
+			return regex.matches(in: text, range: range).compactMap { match in
+				Range(match.range(at: group), in: text).map { String(text[$0]) }
+			}
+		}
+		for entry in (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? [] where entry.hasSuffix(".xcodeproj") {
+			let file = root.appendingPathComponent(entry).appendingPathComponent("project.pbxproj")
+			guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+			relativePaths += matches(#"isa = XCLocalSwiftPackageReference;\s*relativePath = ([^;]+);"#, in: text)
+				.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\" ")) }
+		}
+		if let manifest = try? String(contentsOf: root.appendingPathComponent("Package.swift"), encoding: .utf8) {
+			relativePaths += matches(#"\.package\(\s*(?:name:\s*"[^"]*",\s*)?path:\s*"([^"]+)""#, in: manifest)
+		}
+		let rootPath = root.realPath.path + "/"
+		var seen: Set<String> = []
+		return relativePaths.compactMap { relative in
+			let url = URL(fileURLWithPath: relative, relativeTo: root.realPath).realPath
+			var isDirectory: ObjCBool = false
+			guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue,
+				!(url.path + "/").hasPrefix(rootPath), seen.insert(url.path).inserted
+			else { return nil }
+			return url
+		}
+	}
 }

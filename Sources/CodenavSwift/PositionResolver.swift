@@ -97,13 +97,14 @@ enum PositionResolver {
 	/// First line of `.swift` source under `root` where `name` appears as a whole word, skipping
 	/// comment lines: how a name `workspace/symbol` can't see (an SDK or third-party type, whose
 	/// declaration isn't in the index) is located through its use in the project.
-	static func findUsage(of name: String, under root: URL, fileLimit: Int = 4000) -> (path: String, line: Int, column: Int)? {
+	static func findUsages(of name: String, under root: URL, limit: Int = 1, fileLimit: Int = 4000) -> [(path: String, line: Int, column: Int)] {
 		guard name.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil,
 			let pattern = identifierPattern(name),
 			let enumerator = FileManager.default.enumerator(
 				at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
 			)
-		else { return nil }
+		else { return [] }
+		var found: [(path: String, line: Int, column: Int)] = []
 		var visited = 0
 		for case let url as URL in enumerator {
 			let last = url.lastPathComponent
@@ -113,7 +114,7 @@ enum PositionResolver {
 			}
 			guard last.hasSuffix(".swift"), !last.hasSuffix(".generated.swift") else { continue }
 			visited += 1
-			if visited > fileLimit { return nil }
+			if visited > fileLimit { return found }
 			guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8), text.contains(name)
 			else { continue }
 			for (offset, line) in sourceLines(text).enumerated() {
@@ -123,10 +124,16 @@ enum PositionResolver {
 				}
 				let ns = line as NSString
 				if let match = pattern.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
-					return (url.path, offset + 1, match.range.location + 1)
+					found.append((url.path, offset + 1, match.range.location + 1))
+					if found.count >= limit { return found }
+					break  // one hit per file spreads the candidates over files
 				}
 			}
 		}
-		return nil
+		return found
+	}
+
+	static func findUsage(of name: String, under root: URL) -> (path: String, line: Int, column: Int)? {
+		findUsages(of: name, under: root).first
 	}
 }

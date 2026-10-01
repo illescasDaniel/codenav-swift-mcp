@@ -107,7 +107,8 @@ public actor SwiftNavigator {
 			// it reloads the package itself, with no restart.)
 			configNames: ["buildServer.json", "compile_commands.json", "compile_flags.txt"],
 			environment: nil,
-			requestTimeout: requestTimeout
+			requestTimeout: requestTimeout,
+			extraWorkspaceFolders: ProjectKind.localPackageFolders(in: root)
 		)
 		let task = Task { () -> LSPClient in
 			let newClient = LSPClient(configuration: configuration, onNotice: { notices.post($0) })
@@ -221,6 +222,29 @@ public actor SwiftNavigator {
 	}
 
 	static let maxListedSites = 25
+
+	/// References for the symbol at a position. For a declaration in a sibling package the index often
+	/// reports only the declaration itself, while the same query from a use site is complete: when the
+	/// answer is that thin, retry from a use whose definition leads back to this declaration.
+	private func referencesWithUsageFallback(
+		_ client: LSPClient, file: String, line: Int, column: Int, includeDeclaration: Bool = true
+	) async throws -> [LSPLocation] {
+		let direct = try await client.references(file, line: line, column: column, includeDeclaration: includeDeclaration)
+		guard direct.count <= 1, let text = try? readTextFile(URL(fileURLWithPath: file)),
+			let word = PositionResolver.word(at: column, onLine: line, in: text),
+			let declaration = try await client.definition(file, line: line, column: column).first
+		else { return direct }
+		let uses = PositionResolver.findUsages(of: word, under: workspaceRoot, limit: 8)
+		for use in uses where !(use.path == file && use.line == line) {
+			guard let target = try? await client.definition(use.path, line: use.line, column: use.column).first,
+				target.uri == declaration.uri, target.range.start.line == declaration.range.start.line
+			else { continue }
+			let retried = try await client.references(
+				use.path, line: use.line, column: use.column, includeDeclaration: includeDeclaration)
+			if retried.count > direct.count { return retried }
+		}
+		return direct
+	}
 
 	/// Locations as text: the project's own first (SDK headers last), capped, with the remainder counted.
 	private func formatSites(_ sites: [LSPLocation]) -> String {
@@ -383,9 +407,9 @@ public actor SwiftNavigator {
 			let client = try await liveClient()
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			await awaitIndex(client)
-			let locations = try await client.references(
-				filePath, line: line, column: column, includeDeclaration: includeDeclaration
-			)
+			let locations = try await referencesWithUsageFallback(
+				client, file: await client.resolve(filePath).path, line: line, column: column,
+				includeDeclaration: includeDeclaration)
 			let text = formatReferences(locations, workspaceRoot: workspaceRoot)
 			return locations.isEmpty ? text + (await emptyResultHint(client)) : text
 		}
@@ -483,7 +507,7 @@ public actor SwiftNavigator {
 			var references: [LSPLocation] = []
 			if includeReferences {
 				await awaitIndex(client)
-				references = try await client.references(file, line: line, column: column)
+				references = try await referencesWithUsageFallback(client, file: file, line: line, column: column)
 			}
 			let header = "\(resolved.qualifiedName)  [\(SymbolKind.label(resolved.kind))]  (\(relativePath):\(line):\(column))"
 			var parts = [header]
@@ -616,7 +640,13 @@ public actor SwiftNavigator {
 		if entries.isEmpty {
 			// Without a type hierarchy the conformance sites are still known.
 			let sites = try await client.implementation(file, line: line, column: column)
-			if sites.isEmpty { return "No types \(verb) \(resolved.qualifiedName)." }
+			if sites.isEmpty {
+				let hint =
+					resolved.kind == SymbolKind.protocol
+					? " Conformances declared in an extension of a type from another module (`extension Dep.Type: \(resolved.name)`) may not be reported here; `references` lists them."
+					: ""
+				return "No types \(verb) \(resolved.qualifiedName)." + hint
+			}
 			return "\(sites.count) site(s) that \(verb) \(resolved.qualifiedName):\n\n"
 				+ formatSites(sites)
 		}

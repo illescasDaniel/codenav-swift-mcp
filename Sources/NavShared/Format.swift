@@ -57,7 +57,13 @@ public func uriToRelative(_ uri: String, workspaceRoot: URL) -> String {
 	if path.contains("/sourcekit-lsp/GeneratedInterfaces/") {
 		return "<generated> " + (path.split(separator: "/").last.map(String.init) ?? path)
 	}
-	return relativePath(path, in: workspaceRoot) ?? displayPathOutside(path, root: workspaceRoot)
+	if let relative = relativePath(path, in: workspaceRoot) { return relative }
+	// A SwiftPM/Xcode dependency checkout: `<dependency> DIC/Sources/DIC/File.swift` instead of a
+	// path through DerivedData or `.build`.
+	if let range = path.range(of: "/checkouts/") {
+		return "<dependency> " + path[range.upperBound...]
+	}
+	return displayPathOutside(path, root: workspaceRoot)
 }
 
 private final class LineCache: @unchecked Sendable {

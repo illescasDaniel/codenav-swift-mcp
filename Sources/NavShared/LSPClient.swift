@@ -181,6 +181,9 @@ public actor LSPClient {
 		/// How long an ordinary request may take. A cold workspace-wide query can legitimately take
 		/// a while while the index is first built, so this is generous.
 		public var requestTimeout: TimeInterval
+		/// Further directories to register as workspace folders: local packages that live outside the
+		/// root (`../Octopus`), whose sources the server otherwise treats as loose files.
+		public var extraWorkspaceFolders: [URL]
 
 		public init(
 			workspaceRoot: URL,
@@ -189,9 +192,11 @@ public actor LSPClient {
 			watchSuffixes: Set<String> = [],
 			configNames: Set<String> = [],
 			environment: [String: String]? = nil,
-			requestTimeout: TimeInterval = 60
+			requestTimeout: TimeInterval = 60,
+			extraWorkspaceFolders: [URL] = []
 		) {
 			self.requestTimeout = requestTimeout
+			self.extraWorkspaceFolders = extraWorkspaceFolders
 			self.workspaceRoot = workspaceRoot
 			self.command = command
 			self.languageID = languageID
@@ -336,7 +341,10 @@ public actor LSPClient {
 				"processId": .int(Int(ProcessInfo.processInfo.processIdentifier)),
 				"rootUri": .string(rootURI),
 				"capabilities": capabilities,
-				"workspaceFolders": [["uri": .string(rootURI), "name": .string(configuration.workspaceRoot.lastPathComponent)]],
+				"workspaceFolders": .array(
+					([configuration.workspaceRoot] + configuration.extraWorkspaceFolders).map {
+						["uri": .string($0.absoluteString), "name": .string($0.lastPathComponent)]
+					}),
 			],
 			timeout: 60
 		)

@@ -119,3 +119,25 @@ struct IntegrationTests {
 		#expect(ProjectKind.none.advice(in: root)?.contains("src/App") == true)
 	}
 }
+
+@Suite struct LocalPackageTests {
+	@Test func findsSiblingPackagesFromXcodeProjectAndManifest() throws {
+		let base = FileManager.default.temporaryDirectory.appendingPathComponent("codenav-local-\(UUID())")
+		let app = base.appendingPathComponent("App")
+		let library = base.appendingPathComponent("Lib")
+		let xcodeproj = app.appendingPathComponent("App.xcodeproj")
+		try FileManager.default.createDirectory(at: xcodeproj, withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: base) }
+		try """
+			/* Begin XCLocalSwiftPackageReference section */
+			\t\tABC /* XCLocalSwiftPackageReference "../Lib" */ = {
+			\t\t\tisa = XCLocalSwiftPackageReference;
+			\t\t\trelativePath = ../Lib;
+			\t\t};
+			""".write(to: xcodeproj.appendingPathComponent("project.pbxproj"), atomically: true, encoding: .utf8)
+		#expect(ProjectKind.localPackageFolders(in: app).map(\.lastPathComponent) == ["Lib"])
+		try #".package(path: "../Lib")"#.write(to: app.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+		#expect(ProjectKind.localPackageFolders(in: app).count == 1)  // de-duplicated
+	}
+}
