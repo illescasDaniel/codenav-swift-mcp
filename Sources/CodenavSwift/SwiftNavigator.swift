@@ -609,7 +609,14 @@ public actor SwiftNavigator {
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			let text = try await client.hover(filePath, line: line, column: column)
 			guard !text.isEmpty else { return "No type information at that position." + (await emptyResultHint(client)) }
-			let locations = (try? await client.typeDefinition(filePath, line: line, column: column)) ?? []
+			var locations = (try? await client.typeDefinition(filePath, line: line, column: column)) ?? []
+			if locations.isEmpty, let typeName = Self.declaredTypeName(inHover: text),
+				let found = try? await resolveSymbol(client: client, workspaceRoot: workspaceRoot, query: typeName)
+			{
+				// Older sourcekit-lsp (Swift 6.3 and earlier) answers typeDefinition with nothing; look the type up by name.
+				let position = LSPPosition(line: found.line, character: found.column)
+				locations = [LSPLocation(uri: found.uri, range: LSPRange(start: position, end: position))]
+			}
 			let local = locations.filter { !isExternal($0.uri) }.prefix(Self.maxTypeLocations)
 			var parts = [text]
 			if local.isEmpty {
@@ -979,6 +986,15 @@ public actor SwiftNavigator {
 			of: #"^((public|internal|private|fileprivate|open|static|final|lazy|weak|unowned|nonisolated|@\w+(\([^)]*\))?)\s+)*(let|var)\s"#,
 			options: .regularExpression
 		) != nil
+	}
+
+	/// The type named by a `let`/`var` declaration in hover text (`let user: User`), without optionality or `any`/`some`.
+	static func declaredTypeName(inHover text: String) -> String? {
+		let pattern = #"\b(?:let|var)\s+\w+\s*:\s*(?:any\s+|some\s+)?([A-Za-z_][\w]*(?:\.[A-Za-z_]\w*)*)"#
+		guard let match = text.range(of: pattern, options: .regularExpression) else { return nil }
+		let declaration = String(text[match])
+		guard let name = declaration.split(whereSeparator: { $0 == ":" || $0.isWhitespace }).last else { return nil }
+		return String(name)
 	}
 
 	private func describeTypeDefinition(_ location: LSPLocation) -> String {

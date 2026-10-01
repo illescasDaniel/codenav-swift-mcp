@@ -21,6 +21,16 @@ import Testing
 	}
 }
 
+@Suite struct TypeNameTests {
+	@Test func readsTheDeclaredTypeFromHover() {
+		#expect(SwiftNavigator.declaredTypeName(inHover: "```swift\n@MainActor let user: User\n```") == "User")
+		#expect(SwiftNavigator.declaredTypeName(inHover: "var store: (any UserStore)?") == nil)
+		#expect(SwiftNavigator.declaredTypeName(inHover: "let store: any UserStore") == "UserStore")
+		#expect(SwiftNavigator.declaredTypeName(inHover: "var name: Models.User?") == "Models.User")
+		#expect(SwiftNavigator.declaredTypeName(inHover: "func make() -> User") == nil)
+	}
+}
+
 @Suite struct CatalogTests {
 	@Test func exposesAllTools() {
 		#expect(ToolCatalog.tools.map(\.name) == [
