@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+* `type_at` finds the type definition on sourcekit-lsp from Swift 6.3, which answers `typeDefinition` with nothing for
+  local declarations; the type named in the hover text is looked up by name instead.
+* Prebuilt macOS binaries (arm64 and x86_64) are attached to each GitHub release, smoke-tested before publishing.
+* CI builds and tests on Xcode 26.6.
+
 ## 0.1.0
 
 First public release.

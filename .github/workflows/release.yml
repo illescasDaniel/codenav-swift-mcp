@@ -37,8 +37,32 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
 
-  release:
+  smoke-test:
     needs: build
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: dist
+      - name: Run the packaged binary
+        run: |
+          set -euo pipefail
+          tar -xzf dist/*.tar.gz -C dist
+          BIN="$(ls dist/*/codenav-swift-mcp)"
+          file "$BIN"
+          python3 scripts/smoke-test.py "$BIN" Fixtures/SamplePackage
+
+  release:
+    needs: [build, smoke-test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

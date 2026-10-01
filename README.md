@@ -127,8 +127,10 @@ or unknown names, server errors) are returned with MCP `isError` set.
 ## Requirements
 
 * macOS 13 or later.
-* A Swift 6.2 toolchain (Xcode 26+ or one from [swift.org](https://www.swift.org/install/)). It ships `sourcekit-lsp`,
-  which codenav finds with `xcrun`, then `PATH`, then the usual install locations.
+* A Swift toolchain at runtime (Xcode or one from [swift.org](https://www.swift.org/install/)). It ships `sourcekit-lsp`,
+  which codenav finds with `xcrun`, then `PATH`, then the usual install locations. Swift 6.3 or newer is recommended;
+  older sourcekit-lsp versions answer some queries with less detail.
+* Swift 6.2 or newer (Xcode 26+) only to build from source. The prebuilt binaries need no compiler.
 * Swift packages work out of the box. Xcode projects need a `buildServer.json`; see [Xcode projects](#xcode-projects).
 
 ## Installation
