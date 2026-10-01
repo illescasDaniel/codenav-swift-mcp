@@ -84,6 +84,9 @@ public enum DependencyRoots {
 
 public func uriToRelative(_ uri: String, workspaceRoot: URL) -> String {
 	guard let path = uriToPath(uri) else { return uri }
+	if let range = path.range(of: "/DerivedSources/") {
+		return "<generated> " + path[range.upperBound...]
+	}
 	if path.contains("/sourcekit-lsp/GeneratedInterfaces/") {
 		return "<generated> " + (path.split(separator: "/").last.map(String.init) ?? path)
 	}
@@ -215,7 +218,7 @@ private func isTestPath(_ path: String) -> Bool {
 /// package checkouts, build output, DerivedData, Pods, generated SDK interfaces.
 public func isDependencyPath(_ uri: String) -> Bool {
 	let path = uriToPath(uri) ?? uri
-	return ["/checkouts/", "/.build/", "/SourcePackages/", "/DerivedData/", "/Pods/", "/Carthage/", ".sdk/", "/sourcekit-lsp/GeneratedInterfaces/"]
+	return ["/checkouts/", "/.build/", "/SourcePackages/", "/DerivedData/", "/Pods/", "/Carthage/", "/Build/Intermediates.noindex/", "/DerivedSources/", ".sdk/", "/sourcekit-lsp/GeneratedInterfaces/"]
 		.contains { path.contains($0) }
 }
 

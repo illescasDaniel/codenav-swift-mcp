@@ -160,3 +160,11 @@ import Testing
 		#expect(listing.range(of: "XQ")!.lowerBound < listing.range(of: "XxQxxxxLongName")!.lowerBound)
 	}
 }
+
+@Suite struct BuildOutputPathTests {
+	@Test func derivedSourcesAreLabelledGeneratedAndCountAsDependencies() {
+		let uri = "file:///tmp/dd/Build/Intermediates.noindex/App.build/Debug/App.build/DerivedSources/GeneratedStrings.swift"
+		#expect(uriToRelative(uri, workspaceRoot: URL(fileURLWithPath: "/work/app")) == "<generated> GeneratedStrings.swift")
+		#expect(isDependencyPath(uri))
+	}
+}

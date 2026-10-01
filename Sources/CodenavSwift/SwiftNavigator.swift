@@ -9,6 +9,7 @@ public actor SwiftNavigator {
 
 	public static let workspaceEnvironmentKey = "CODENAV_SWIFT_WORKSPACE"
 	public static let indexTimeoutEnvironmentKey = "CODENAV_SWIFT_INDEX_TIMEOUT"
+	static let clangExtensions: Set<String> = ["m", "mm", "h", "c", "cc", "cpp", "cxx", "hpp"]
 	public static let localPackageFoldersEnvironmentKey = "CODENAV_SWIFT_LOCAL_PACKAGE_FOLDERS"
 	public static let requestTimeoutEnvironmentKey = "CODENAV_SWIFT_REQUEST_TIMEOUT"
 	static let defaultRequestTimeout: TimeInterval = 60
@@ -166,8 +167,11 @@ public actor SwiftNavigator {
 	/// Validates the extension and turns a displayed `<dependency> Pkg/...` spelling back into a real path.
 	@discardableResult
 	private func checkSwiftFile(_ filePath: String) throws -> String {
-		guard (filePath as NSString).pathExtension.lowercased() == "swift" else {
-			throw ToolInputError("codenav-swift only supports Swift files (.swift), got '\(filePath)'")
+		let ext = (filePath as NSString).pathExtension.lowercased()
+		guard ext == "swift" || Self.clangExtensions.contains(ext) else {
+			throw ToolInputError(
+				"codenav-swift supports Swift files (.swift) and the C-family sources of a mixed project (.m, .mm, .h, .c, .cpp), got '\(filePath)'"
+			)
 		}
 		return DependencyRoots.expand(filePath, extra: dependencyCheckoutDirectories())
 	}
@@ -186,8 +190,17 @@ public actor SwiftNavigator {
 	}
 
 	/// Directories whose sources a text scan covers: the project and its local sibling packages.
-	private var scanRoots: [URL] {
-		[workspaceRoot] + ProjectKind.localPackageFolders(in: workspaceRoot)
+	/// For a symbol declared in a dependency checkout, the checkout's own package is scanned too: the
+	/// index doesn't know how that package uses its own declarations (its types conforming to its protocols).
+	private func scanRoots(declaredIn uri: String) -> [URL] {
+		var roots = [workspaceRoot] + ProjectKind.localPackageFolders(in: workspaceRoot)
+		if let path = uriToPath(uri), let range = path.range(of: "/checkouts/") {
+			let rest = path[range.upperBound...]
+			if let package = rest.split(separator: "/").first {
+				roots.append(URL(fileURLWithPath: String(path[..<range.upperBound]) + package, isDirectory: true))
+			}
+		}
+		return roots
 	}
 
 	/// Runs a tool body, turning any failure into text and appending pending notices.
@@ -271,7 +284,7 @@ public actor SwiftNavigator {
 			let origin = await declaration(client, file: file, line: line, column: column),
 			direct.count <= 1 || isOutsideWorkspace(origin.uri)
 		else { return direct }
-		let scan = await UsageScan.uses(of: word, declaration: origin, roots: scanRoots, client: client)
+		let scan = await UsageScan.uses(of: word, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
 		var merged = direct
 		var seen = Set(direct.map { "\($0.uri)#\($0.range.start.line)#\($0.range.start.character)" })
 		for use in scan.uses {
@@ -291,7 +304,7 @@ public actor SwiftNavigator {
 	private func scannedCallers(
 		_ client: LSPClient, name: String, origin: LSPLocation
 	) async -> (text: String, count: Int) {
-		let scan = await UsageScan.uses(of: name, declaration: origin, roots: scanRoots, client: client)
+		let scan = await UsageScan.uses(of: name, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
 		struct Key: Hashable { var path: String; var line: Int; var name: String }
 		var grouped: [Key: (kind: Int, sites: [Int])] = [:]
 		var symbolsByFile: [String: [SymbolNode]] = [:]
@@ -552,7 +565,15 @@ public actor SwiftNavigator {
 			await useWorkspace()
 			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
-			return formatDiagnostics(try await client.diagnostics(filePath))
+			let diagnostics = try await client.diagnostics(filePath)
+			var text = formatDiagnostics(diagnostics)
+			let unresolved = diagnostics.filter { $0.message.contains("Cannot find") && $0.message.contains("in scope") }.count
+			if diagnostics.contains(where: { $0.message.hasPrefix("No such module") }) || unresolved >= 3 {
+				text += "\n\nThese look like missing build settings for this file rather than real errors (the file is analyzed "
+					+ "without its target's SDK and module search paths). With an Xcode project, run a full build and regenerate "
+					+ "buildServer.json (`xcode-build-server config`): a build that only relinked doesn't record Swift compile commands."
+			}
+			return text
 		}
 	}
 
@@ -740,7 +761,7 @@ public actor SwiftNavigator {
 				range: LSPRange(
 					start: LSPPosition(line: resolved.line, character: resolved.column),
 					end: LSPPosition(line: resolved.line, character: resolved.column)))
-			let scan = await UsageScan.uses(of: resolved.name, declaration: origin, roots: scanRoots, client: client)
+			let scan = await UsageScan.uses(of: resolved.name, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
 			var symbolsByFile: [String: [SymbolNode]] = [:]
 			var added = Set<String>()
 			var unverified = false
@@ -751,6 +772,12 @@ public actor SwiftNavigator {
 				}
 				guard let owner = UsageScan.enclosing(line: use.line, in: symbolsByFile[use.path] ?? []), owner.isHeader
 				else { continue }
+				// `extension Proto { … }` names the protocol without conforming: it must follow a `:`.
+				if let text = try? readTextFile(URL(fileURLWithPath: use.path)) {
+					let lines = PositionResolver.sourceLines(text)
+					guard use.line <= lines.count, lines[use.line - 1].utf16.prefix(use.column - 1).contains(0x3A)
+					else { continue }
+				}
 				let position = "\(relative(URL(fileURLWithPath: use.path).absoluteString)):\(owner.line):\(use.column)"
 				let isExtension = owner.kind == SymbolKind.extensionKind
 				let kind = isExtension ? "conformance in extension" : SymbolKind.label(owner.kind)

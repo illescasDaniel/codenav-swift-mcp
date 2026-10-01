@@ -709,13 +709,25 @@ public actor LSPClient {
 				"textDocument/didOpen",
 				params: [
 					"textDocument": [
-						"uri": .string(uri), "languageId": .string(configuration.languageID), "version": 1, "text": .string(text),
+						"uri": .string(uri), "languageId": .string(Self.languageID(for: url, default: configuration.languageID)), "version": 1, "text": .string(text),
 					]
 				]
 			)
 			openFiles[uri] = OpenFile(version: 1, modified: stamp.modified, size: stamp.size, text: text)
 		}
 		return uri
+	}
+
+	/// The LSP language of a file by extension, so Objective-C and C sources in a mixed project are
+	/// served by sourcekit-lsp's clang side instead of being parsed as Swift.
+	static func languageID(for url: URL, default fallback: String) -> String {
+		switch url.pathExtension.lowercased() {
+		case "m", "h": "objective-c"
+		case "mm": "objective-cpp"
+		case "c": "c"
+		case "cpp", "cc", "cxx", "hpp": "cpp"
+		default: fallback
+		}
 	}
 
 	private static func stamp(of url: URL) throws -> FileStamp {
