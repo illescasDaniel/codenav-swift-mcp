@@ -5,6 +5,30 @@ import NavShared
 
 let serverVersion = "0.1.2"
 
+// A stdio server has no other command line; answer the usual flags instead of waiting for MCP input.
+let commandLineArguments = CommandLine.arguments.dropFirst()
+if commandLineArguments.contains(where: { $0 == "--version" || $0 == "-v" }) {
+	print("codenav-swift-mcp \(serverVersion)")
+	exit(0)
+}
+if commandLineArguments.contains(where: { $0 == "--help" || $0 == "-h" }) {
+	print(
+		"""
+		codenav-swift-mcp \(serverVersion)
+		Compiler-accurate code navigation for Swift codebases, as an MCP server.
+
+		Speaks MCP over stdio and takes no arguments: register it with an MCP client, for example
+		  claude mcp add codenav-swift --scope user -- codenav-swift-mcp
+
+		Options:
+		  -v, --version  Print the version and exit
+		  -h, --help     Print this help and exit
+
+		Documentation: https://github.com/illescasDaniel/codenav-swift-mcp
+		""")
+	exit(0)
+}
+
 func inputSchema(for tool: ToolSpec) -> Value {
 	var properties: [String: Value] = [:]
 	for parameter in tool.parameters {

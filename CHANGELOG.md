@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* `--version` and `--help` print and exit instead of waiting for MCP input on stdin.
+
 ## 0.1.2
 
 * The server reports its real version in the MCP handshake (0.1.1 still reported 0.1.0).

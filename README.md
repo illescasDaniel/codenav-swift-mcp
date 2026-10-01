@@ -142,7 +142,7 @@ brew install illescasDaniel/tap/codenav-swift-mcp
 ```
 
 This installs a prebuilt binary (arm64 or Intel, picked automatically) with no compiler
-needed, and puts `codenav-swift-mcp` on your `PATH`. Update it with `brew upgrade codenav-swift-mcp`. The binaries are
+needed, and puts `codenav-swift-mcp` on your `PATH`. Update it with `brew upgrade codenav-swift-mcp`; `codenav-swift-mcp --version` shows what is installed. The binaries are
 the same ones attached to each [GitHub release](https://github.com/illescasDaniel/codenav-swift-mcp/releases).
 
 ### Build from source
