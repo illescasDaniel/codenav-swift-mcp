@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+* The server reports its real version in the MCP handshake (0.1.1 still reported 0.1.0).
+* Install through Homebrew (`brew install illescasDaniel/tap/codenav-swift-mcp`); the README documents the release process.
+
 ## 0.1.1
 
 * `type_at` finds the type definition on sourcekit-lsp from Swift 6.3, which answers `typeDefinition` with nothing for

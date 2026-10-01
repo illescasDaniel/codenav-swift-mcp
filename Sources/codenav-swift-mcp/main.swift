@@ -3,7 +3,7 @@ import Foundation
 import MCP
 import NavShared
 
-let serverVersion = "0.1.1"
+let serverVersion = "0.1.2"
 
 func inputSchema(for tool: ToolSpec) -> Value {
 	var properties: [String: Value] = [:]
