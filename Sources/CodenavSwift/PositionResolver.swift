@@ -37,7 +37,7 @@ enum PositionResolver {
 
 	/// `create(name:)` -> `create`; names with no labels are returned unchanged.
 	static func baseName(of name: String) -> String {
-		name.split(separator: "(").first.map(String.init) ?? name
+		NavShared.baseName(name)
 	}
 
 	/// The identifier touching 1-indexed UTF-16 `column` on `line`.
@@ -111,7 +111,8 @@ enum PositionResolver {
 	/// Stops at `limit`; `truncated` says there was more. This is the text side of "scan, then ask the
 	/// language server which hits really are the symbol", for names the index can't answer for.
 	static func occurrences(
-		of name: String, under roots: [URL], limit: Int, perFile: Bool = false, fileLimit: Int = 4000
+		of name: String, under roots: [URL], limit: Int, perFile: Bool = false, fileLimit: Int = 4000,
+		includeClang: Bool = false
 	) -> (hits: [Occurrence], truncated: Bool) {
 		guard name.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil,
 			let pattern = identifierPattern(name)
@@ -128,14 +129,17 @@ enum PositionResolver {
 					enumerator.skipDescendants()
 					continue
 				}
-				guard last.hasSuffix(".swift"), !last.hasSuffix(".generated.swift") else { continue }
+				let isSwift = last.hasSuffix(".swift") && !last.hasSuffix(".generated.swift")
+				guard isSwift || (includeClang && Self.isClangFile(last)) else { continue }
 				visited += 1
 				if visited > fileLimit { return (found, true) }
 				guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8), text.contains(name)
 				else { continue }
 				for (offset, line) in sourceLines(text).enumerated() {
 					let trimmed = line.trimmingCharacters(in: .whitespaces)
-					if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ") {
+					if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ")
+						|| trimmed.hasPrefix("#import") || trimmed.hasPrefix("#include")
+					{
 						continue
 					}
 					let whole = NSRange(location: 0, length: (line as NSString).length)
@@ -149,6 +153,22 @@ enum PositionResolver {
 			}
 		}
 		return (found, false)
+	}
+
+	static func isClangFile(_ fileName: String) -> Bool {
+		["m", "mm", "h", "c", "cc", "cpp", "cxx", "hpp"].contains((fileName as NSString).pathExtension.lowercased())
+	}
+
+	/// How Objective-C code spells a Swift method exposed with `@objc`: `increment(by:)` is `incrementBy:`
+	/// (or `incrementWithBy:`), so a plain-name scan would miss every Objective-C caller. Verification by
+	/// the language server discards the guesses that aren't the declaration.
+	static func objcSpellings(ofSwiftName name: String) -> [String] {
+		let base = NavShared.baseName(name)
+		guard let open = name.firstIndex(of: "("), let close = name.lastIndex(of: ")"), open < close else { return [] }
+		let labels = name[name.index(after: open)..<close].split(separator: ":").map(String.init)
+		guard let first = labels.first, first != "_", let initial = first.first else { return [] }
+		let capitalized = initial.uppercased() + first.dropFirst()
+		return [base + capitalized, base + "With" + capitalized]
 	}
 
 	static func findUsages(of name: String, under root: URL, limit: Int = 1) -> [Occurrence] {

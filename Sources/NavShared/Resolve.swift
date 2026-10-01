@@ -54,16 +54,25 @@ public struct ParsedQuery: Equatable, Sendable {
 	public var base: String
 	/// `(name:)` including parentheses, when the caller spelled out argument labels.
 	public var signature: String?
+	/// The full Objective-C selector when the caller spelled one (`loadImageWithURL:options:`), to tell overloads apart.
+	public var selector: String?
 
 	public init(_ raw: String) {
 		var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
 		text = text.replacingOccurrences(of: "<[^<>]*>", with: "", options: .regularExpression)  // drop generic arguments
+		var selector: String?
 		if let open = text.firstIndex(of: "(") {
 			signature = String(text[open...]).replacingOccurrences(of: " ", with: "")
 			text = String(text[..<open])
 		} else {
 			signature = nil
+			// An Objective-C selector (`greet:` or `loadFileAtPath:error:`) is looked up by its first part.
+			if let colon = text.firstIndex(of: ":") {
+				selector = text.split(separator: ".").last.map(String.init)
+				text = String(text[..<colon])
+			}
 		}
+		self.selector = selector
 		var parts = text.split(separator: ".", omittingEmptySubsequences: true).map(String.init)
 		base = parts.popLast() ?? text
 		container = parts
@@ -148,6 +157,10 @@ public func resolveSymbol(
 	if !caseExact.isEmpty { exact = caseExact }
 	if let signature = parsed.signature {
 		exact = exact.filter { $0.name == parsed.base + signature }
+	}
+	if let selector = parsed.selector {
+		let spelled = exact.filter { $0.name == selector }
+		if !spelled.isEmpty { exact = spelled }
 	}
 
 	var candidates = exact.filter { $0.matches(container: parsed.container) }

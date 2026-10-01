@@ -302,9 +302,9 @@ public actor SwiftNavigator {
 	/// Callers found by scan: each use of the name that resolves to the declaration, attributed to the
 	/// function or type that contains it. For callees the call hierarchy can't answer for (dependencies, sibling packages).
 	private func scannedCallers(
-		_ client: LSPClient, name: String, origin: LSPLocation
+		_ client: LSPClient, name: String, aliases: [String] = [], origin: LSPLocation
 	) async -> (text: String, count: Int) {
-		let scan = await UsageScan.uses(of: name, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
+		let scan = await UsageScan.uses(of: name, aliases: aliases, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
 		struct Key: Hashable { var path: String; var line: Int; var name: String }
 		var grouped: [Key: (kind: Int, sites: [Int])] = [:]
 		var symbolsByFile: [String: [SymbolNode]] = [:]
@@ -476,7 +476,10 @@ public actor SwiftNavigator {
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			let locations = try await client.definition(filePath, line: line, column: column)
 			if locations.isEmpty { return "No definition found at that position." + (await emptyResultHint(client)) }
-			return locations.map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n")
+			// A header declaration before the implementation file (Objective-C reports both).
+			let isHeader: (LSPLocation) -> Bool = { ["h", "hpp"].contains((($0.uri as NSString).pathExtension).lowercased()) }
+			let ordered = locations.filter(isHeader) + locations.filter { !isHeader($0) }
+			return ordered.map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n")
 		}
 	}
 
@@ -665,7 +668,7 @@ public actor SwiftNavigator {
 				range: LSPRange(
 					start: LSPPosition(line: resolved.line, character: resolved.column),
 					end: LSPPosition(line: resolved.line, character: resolved.column)))
-			let scanned = await scannedCallers(client, name: PositionResolver.baseName(of: resolved.name), origin: origin)
+			let scanned = await scannedCallers(client, name: PositionResolver.baseName(of: resolved.name), aliases: PositionResolver.objcSpellings(ofSwiftName: resolved.name), origin: origin)
 			if scanned.count > 0 {
 				let fromIndex = calls.isEmpty ? "" : formatCallers(calls, workspaceRoot: workspaceRoot) + "\n"
 				return prefix + (calls.isEmpty ? scanned.text : mergeCallerText(fromIndex, scanned.text))
@@ -738,7 +741,9 @@ public actor SwiftNavigator {
 		}
 		while let (sub, depth) = stack.popLast() {
 			guard visited < Self.maxSubtypesVisited else { break }
-			guard seen.insert("\(sub.uri)#\(sub.name)#\(sub.selectionRange.start.line)").inserted else { continue }
+			// The real path folds a header reachable through two include directories into one.
+			let realURI = uriToPath(sub.uri).map { URL(fileURLWithPath: $0).realPath.path } ?? sub.uri
+			guard seen.insert("\(realURI)#\(sub.name)#\(sub.selectionRange.start.line)").inserted else { continue }
 			visited += 1
 			let position = "\(relative(sub.uri)):\(sub.selectionRange.start.line + 1):\(sub.selectionRange.start.character + 1)"
 			if Self.isExtensionConformance(sub) {
@@ -746,7 +751,9 @@ public actor SwiftNavigator {
 				let typeName = sub.name.components(separatedBy: ":").first ?? sub.name
 				entries.append(Entry(depth: depth, text: "\(typeName)  [conformance in extension]  (\(position))"))
 			} else {
-				entries.append(Entry(depth: depth, text: "\(sub.name)  [\(SymbolKind.label(sub.kind))]  (\(position))"))
+				// A class extension or category has no name of its own in Objective-C.
+				let shownName = sub.name.isEmpty ? "(class extension)" : sub.name
+				entries.append(Entry(depth: depth, text: "\(shownName)  [\(SymbolKind.label(sub.kind))]  (\(position))"))
 				stack.append(contentsOf: try await client.subtypes(sub).reversed().map { (item: $0, depth: depth + 1) })
 			}
 		}
@@ -783,7 +790,9 @@ public actor SwiftNavigator {
 				let kind = isExtension ? "conformance in extension" : SymbolKind.label(owner.kind)
 				let text = "\(owner.name)  [\(kind)\(verified ? "" : ", unverified")]  (\(position))"
 				let alreadyListed = known.contains { $0.contains("(\(position.components(separatedBy: ":").dropLast().joined(separator: ":"))") }
-				if !alreadyListed, added.insert(text).inserted {
+				// Headers reachable through symlinked include directories are one site.
+				let siteKey = "\(URL(fileURLWithPath: use.path).realPath.path):\(owner.line):\(use.column)"
+				if !alreadyListed, added.insert(siteKey).inserted {
 					entries.append(Entry(depth: 0, text: text))
 					if !verified { unverified = true }
 				}

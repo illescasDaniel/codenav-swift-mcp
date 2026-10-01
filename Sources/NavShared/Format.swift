@@ -90,13 +90,13 @@ public func uriToRelative(_ uri: String, workspaceRoot: URL) -> String {
 	if path.contains("/sourcekit-lsp/GeneratedInterfaces/") {
 		return "<generated> " + (path.split(separator: "/").last.map(String.init) ?? path)
 	}
-	if let relative = relativePath(path, in: workspaceRoot) { return relative }
 	// A SwiftPM/Xcode dependency checkout: `<dependency> DIC/Sources/DIC/File.swift` instead of a
-	// path through DerivedData or `.build`.
+	// path through DerivedData or `.build` (also when `.build` is inside the workspace).
 	if let range = path.range(of: "/checkouts/") {
 		DependencyRoots.register(String(path[..<range.upperBound]))
 		return dependencyPrefix + path[range.upperBound...]
 	}
+	if let relative = relativePath(path, in: workspaceRoot) { return relative }
 	return displayPathOutside(path, root: workspaceRoot)
 }
 
@@ -161,9 +161,16 @@ func isGeneratedName(_ name: String) -> Bool {
 	name.hasPrefix("$")
 }
 
-/// `create(name:)` -> `create`. Swift symbol names carry their argument labels.
+/// `create(name:)` -> `create`, and the Objective-C selector `loadFileAtPath:error:` -> `loadFileAtPath`.
+/// Swift symbol names carry their argument labels; Objective-C ones their colons.
 public func baseName(_ name: String) -> String {
-	name.firstIndex(of: "(").map { String(name[..<$0]) } ?? name
+	name.firstIndex(where: { $0 == "(" || $0 == ":" }).map { String(name[..<$0]) } ?? name
+}
+
+/// Letters and digits only, lowercased: `increment(by:)` and the Objective-C `incrementBy:` it is exported
+/// as (and `greet(_:)` / `greet:`) become the same string.
+func squashed(_ name: String) -> String {
+	String(name.lowercased().filter { $0.isLetter || $0.isNumber })
 }
 
 extension WorkspaceSymbol {
@@ -196,6 +203,7 @@ func matchTier(name: String, query: String) -> Int {
 	let foldedName = candidate.lowercased()
 	let foldedQuery = query.lowercased()
 	if foldedName == foldedQuery { return 1 }
+	if squashed(name) == squashed(query) { return 1 }
 	if foldedName.hasPrefix(foldedQuery) { return 2 }
 	if foldedName.contains(foldedQuery) { return 3 }
 	return fuzzyTier
@@ -471,6 +479,8 @@ public func formatOutline(_ symbols: [DocumentSymbol], indent: String = "  ") ->
 	func walk(_ nodes: [SymbolNode], depth: Int, parent: SymbolNode? = nil) {
 		for node in nodes {
 			if isGenericParameter(node, in: parent) { continue }
+			// clangd lists the locals of an Objective-C/C method as children; Swift's outline never does.
+			if node.kind == 13, let parent, [6, 9, 12].contains(parent.kind) { continue }
 			let start = node.startLine + 1
 			let end = node.endLine + 1
 			let span = start == end ? ":\(start)" : ":\(start)-\(end)"

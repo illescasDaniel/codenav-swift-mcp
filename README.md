@@ -84,3 +84,11 @@ occurrence of the name in the project and its local packages is checked with the
 those leading back to the declaration are kept. Conformances written as `extension Dep.Type: Proto` are found
 the same way (marked `unverified` when the server can't resolve the name in that file). Results over 600 candidates
 are truncated with a note. `<dependency> Pkg/...` paths shown in results are accepted as `file_path`.
+
+## Mixed Swift / Objective-C / C++ projects
+
+`.m`, `.mm`, `.h`, `.c` and `.cpp` files are opened with their own language id, so sourcekit-lsp's built-in clangd
+serves them (it needs the same build index as Swift). Calls, references and subclasses cross the language boundary
+in both directions. Objective-C selectors fold to their Swift spelling (`incrementBy:` finds `increment(by:)`; a full
+selector such as `loadImageWithURL:options:progress:completed:` picks an overload), `definition` lists a header
+declaration before its implementation, and the text scan used for dependencies also covers Objective-C/C sources.

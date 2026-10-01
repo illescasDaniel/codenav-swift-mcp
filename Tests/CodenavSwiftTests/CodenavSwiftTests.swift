@@ -174,3 +174,21 @@ struct IntegrationTests {
 		#expect(DependencyRoots.expand("plain.swift") == "plain.swift")
 	}
 }
+
+@Suite struct ObjectiveCScanTests {
+	@Test func swiftMethodsAreSpelledTheObjectiveCWay() {
+		#expect(PositionResolver.objcSpellings(ofSwiftName: "increment(by:)") == ["incrementBy", "incrementWithBy"])
+		#expect(PositionResolver.objcSpellings(ofSwiftName: "reset()").isEmpty)
+		#expect(PositionResolver.objcSpellings(ofSwiftName: "greet(_:)").isEmpty)
+	}
+
+	@Test func clangSourcesAreScannedOnlyWhenAsked() throws {
+		let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("clang-\(UUID().uuidString)")
+		try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: dir) }
+		try "#import \"Foo.h\"\n[x incrementBy:3];\n".write(to: dir.appendingPathComponent("a.m"), atomically: true, encoding: .utf8)
+		#expect(PositionResolver.occurrences(of: "incrementBy", under: [dir], limit: 5).hits.isEmpty)
+		let hits = PositionResolver.occurrences(of: "incrementBy", under: [dir], limit: 5, includeClang: true).hits
+		#expect(hits.map(\.line) == [2])
+	}
+}

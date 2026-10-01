@@ -168,3 +168,14 @@ import Testing
 		#expect(isDependencyPath(uri))
 	}
 }
+
+@Suite struct ObjectiveCNamingTests {
+	@Test func selectorsFoldToTheirSwiftSpelling() {
+		#expect(baseName("loadFileAtPath:error:") == "loadFileAtPath")
+		#expect(baseName("greet:") == "greet")
+		#expect(matchTier(name: "increment(by:)", query: "incrementBy") == 1)
+		#expect(matchTier(name: "incrementBy:", query: "incrementBy") <= 1)
+		#expect(ParsedQuery("Greeter.greet:").base == "greet")
+		#expect(ParsedQuery("Greeter.greet:").container == ["Greeter"])
+	}
+}
