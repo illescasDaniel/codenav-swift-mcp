@@ -30,6 +30,15 @@ public struct ResolvedSymbol: Sendable {
 	public var line: Int
 	public var column: Int
 
+	public init(name: String, containerName: String?, kind: Int, uri: String, line: Int, column: Int) {
+		self.name = name
+		self.containerName = containerName
+		self.kind = kind
+		self.uri = uri
+		self.line = line
+		self.column = column
+	}
+
 	public var qualifiedName: String {
 		guard let containerName, !containerName.isEmpty else { return name }
 		return "\(containerName).\(name)"
@@ -70,6 +79,13 @@ extension WorkspaceSymbol {
 	}
 
 	fileprivate func matches(file: String, workspaceRoot: URL) -> Bool {
+		// Exact: the caller's path (relative to the workspace, `../Sibling/...`, or absolute) names this very file.
+		if let actual = uriToPath(location.uri),
+			URL(fileURLWithPath: file, relativeTo: workspaceRoot).realPath.path == URL(fileURLWithPath: actual).realPath.path
+		{
+			return true
+		}
+		// Loose: a trailing part of the path (`Models/User.swift`).
 		let relative = uriToRelative(location.uri, workspaceRoot: workspaceRoot)
 		let target = (file as NSString).standardizingPath.replacingOccurrences(of: "\\", with: "/")
 		return relative == target || relative.hasSuffix("/" + target) || target.hasSuffix("/" + relative)
@@ -91,8 +107,13 @@ private func candidateLines(_ candidates: [WorkspaceSymbol], workspaceRoot: URL)
 private func ambiguous(_ query: String, _ candidates: [WorkspaceSymbol], workspaceRoot: URL) -> SymbolResolutionError {
 	let sameContainer = Set(candidates.map { $0.containerName ?? "" }).count == 1
 	let hint: String
-	if sameContainer, candidates.allSatisfy({ $0.name.contains("(") }) {
-		// Overloads: file_path can't tell them apart, but their labels can.
+	let distinctNames = Set(candidates.map(\.name))
+	if sameContainer, distinctNames.count == 1, candidates.allSatisfy({ $0.name.contains("(") }) {
+		// Same labels, so only the parameter types differ: labels can't help, a position can.
+		hint =
+			"these overloads share the same argument labels and differ only by parameter types; "
+			+ "pass file_path and `line` (the declaration line listed below) to pick one"
+	} else if sameContainer, distinctNames.count > 1, candidates.allSatisfy({ $0.name.contains("(") }) {
 		hint = "these are overloads; include the argument labels, e.g. \(candidates[0].qualifiedName)"
 	} else if Set(candidates.map(\.location.uri)).count > 1 {
 		hint = "qualify with the type (`Type.member`) or pass file_path to disambiguate"
@@ -113,7 +134,7 @@ private func ambiguous(_ query: String, _ candidates: [WorkspaceSymbol], workspa
 /// callers should pass `file_path`, qualify the name, or add argument labels to disambiguate
 /// rather than guess.
 public func resolveSymbol(
-	client: LSPClient, workspaceRoot: URL, query: String, filePath: String? = nil
+	client: LSPClient, workspaceRoot: URL, query: String, filePath: String? = nil, line: Int? = nil
 ) async throws -> ResolvedSymbol {
 	let parsed = ParsedQuery(query)
 	guard !parsed.base.isEmpty else { throw SymbolResolutionError(message: "No symbol found matching '\(query)'.") }
@@ -145,6 +166,18 @@ public func resolveSymbol(
 			)
 		}
 		candidates = narrowed
+	}
+
+	if let line {
+		// 1-indexed declaration line: tells apart overloads that share labels.
+		let onLine = candidates.filter { $0.position.line + 1 == line }
+		if !candidates.isEmpty, onLine.isEmpty {
+			throw SymbolResolutionError(
+				message: "No symbol '\(query)' declared on line \(line); candidates:\n"
+					+ candidateLines(candidates, workspaceRoot: workspaceRoot)
+			)
+		}
+		candidates = onLine
 	}
 
 	switch candidates.count {

@@ -57,8 +57,8 @@ let toolList = ToolCatalog.tools.map {
 
 await server.withMethodHandler(ListTools.self) { _ in .init(tools: toolList) }
 await server.withMethodHandler(CallTool.self) { params in
-	let text = await ToolCatalog.call(params.name, arguments: convert(params.arguments), navigator: navigator)
-	return .init(content: [.text(text: text, annotations: nil, _meta: nil)], isError: false)
+	let result = await ToolCatalog.call(params.name, arguments: convert(params.arguments), navigator: navigator)
+	return .init(content: [.text(text: result.text, annotations: nil, _meta: nil)], isError: result.isError)
 }
 
 do {

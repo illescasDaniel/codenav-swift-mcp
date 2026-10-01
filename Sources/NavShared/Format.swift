@@ -9,6 +9,7 @@ import Foundation
 /// protocols as `Interface`, extensions as `Namespace`, and typealiases as `TypeParameter`.
 public enum SymbolKind {
 	public static let labels: [Int: String] = [
+		0: "Symbol",
 		1: "File", 2: "Module", 3: "Extension", 4: "Package", 5: "Class", 6: "Method", 7: "Property", 8: "Field",
 		9: "Initializer", 10: "Enum", 11: "Protocol", 12: "Function", 13: "Variable", 14: "Constant", 15: "String",
 		16: "Number", 17: "Boolean", 18: "Array", 19: "Object", 20: "Key", 21: "Null", 22: "Case", 23: "Struct",
@@ -48,16 +49,15 @@ public func uriToPath(_ uri: String) -> String? {
 	return url.path
 }
 
-/// Workspace-relative path for a URI; absolute when outside the workspace. Interfaces that
-/// sourcekit-lsp generates for SDK/stdlib symbols live in a temp directory, which is noise:
-/// they're shown as `<generated> Swift.String.swiftinterface`.
+/// Workspace-relative path for a URI; `../sibling/...` for a nearby local package; absolute otherwise.
+/// Interfaces that sourcekit-lsp generates for SDK/stdlib symbols live in a temp directory, which is
+/// noise: they're shown as `<generated> Swift.String.swiftinterface`.
 public func uriToRelative(_ uri: String, workspaceRoot: URL) -> String {
 	guard let path = uriToPath(uri) else { return uri }
 	if path.contains("/sourcekit-lsp/GeneratedInterfaces/") {
 		return "<generated> " + (path.split(separator: "/").last.map(String.init) ?? path)
 	}
-	let root = workspaceRoot.path.hasSuffix("/") ? workspaceRoot.path : workspaceRoot.path + "/"
-	return path.hasPrefix(root) ? String(path.dropFirst(root.count)) : path
+	return relativePath(path, in: workspaceRoot) ?? displayPathOutside(path, root: workspaceRoot)
 }
 
 private final class LineCache: @unchecked Sendable {
@@ -174,17 +174,35 @@ private func isTestPath(_ path: String) -> Bool {
 		|| ["Tests.swift", "Test.swift", "Spec.swift", "Mock.swift", "Mocks.swift"].contains { file.hasSuffix($0) }
 }
 
-/// Exact -> case-insensitive exact -> prefix -> substring -> other; within a tier, production code
-/// before tests, then declarations before properties/fields (original order otherwise).
+/// Code that belongs to a dependency or the SDK rather than to the project being navigated:
+/// package checkouts, build output, DerivedData, Pods, generated SDK interfaces.
+public func isDependencyPath(_ uri: String) -> Bool {
+	let path = uriToPath(uri) ?? uri
+	return ["/checkouts/", "/.build/", "/SourcePackages/", "/DerivedData/", "/Pods/", "/Carthage/", ".sdk/", "/sourcekit-lsp/GeneratedInterfaces/"]
+		.contains { path.contains($0) }
+}
+
+/// Where a symbol lives, for ordering within a match tier: the project's own code, then its tests,
+/// then dependencies.
+private func locationClass(_ uri: String) -> Int {
+	if isDependencyPath(uri) { return 2 }
+	return isTestPath(uriToPath(uri) ?? uri) ? 1 : 0
+}
+
+/// Exact -> case-insensitive exact -> prefix -> substring -> other; within a tier, the project's own
+/// code before tests before dependencies, then declarations before properties/fields; among fuzzy-only
+/// hits the shortest name first (a short name is the one that most closely resembles the query).
 public func rankWorkspaceSymbols(_ symbols: [WorkspaceSymbol], query: String) -> [WorkspaceSymbol] {
 	guard !query.isEmpty else { return symbols }
 	let keyed = symbols.enumerated().map { index, symbol in
-		(
+		let tier = matchTier(name: symbol.name, query: query)
+		return (
 			symbol,
 			[
-				matchTier(name: symbol.name, query: query),
-				isTestPath(symbol.location.uri) ? 1 : 0,
+				tier,
+				locationClass(symbol.location.uri),
 				lowPriorityKinds.contains(symbol.kind) ? 1 : 0,
+				tier == fuzzyTier ? baseName(symbol.name).count : 0,
 				index,
 			]
 		)
@@ -268,15 +286,22 @@ public func formatWorkspaceSymbols(
 	guard !symbols.isEmpty else { return "" }
 	var ranked = filterWorkspaceSymbols(rankWorkspaceSymbols(symbols, query: query))
 	var hiddenFuzzy = 0
-	if !query.isEmpty, !fuzzy {
+	var onlyFuzzy = false
+	if !query.isEmpty {
 		let real = ranked.filter { matchTier(name: $0.name, query: query) < fuzzyTier }
-		if !real.isEmpty {
+		if real.isEmpty {
+			onlyFuzzy = true
+		} else if !fuzzy {
 			hiddenFuzzy = ranked.count - real.count
 			ranked = real
 		}
 	}
 	let shown = Array(ranked.prefix(max(0, limit)))
 	var lines = shown.map { formatWorkspaceSymbol($0, workspaceRoot: workspaceRoot) }
+	if onlyFuzzy {
+		// Every hit is a loose subsequence match: say so, or they read as if they all contained the query.
+		lines.insert("No symbol name contains '\(query)'; these are the closest fuzzy matches (closest first):", at: 0)
+	}
 	let omitted = ranked.count - shown.count
 	if omitted > 0 {
 		lines.append("… and \(omitted) more (showing first \(shown.count)); narrow with kind=… or path=…")
@@ -389,20 +414,29 @@ public func toSymbolTree(_ symbols: [DocumentSymbol]) -> [SymbolNode] {
 	}.sorted { $0.startLine < $1.startLine }
 }
 
+/// sourcekit-lsp lists a generic parameter (`T` in `func f<T>()`) as a type-alias child of its
+/// declaration. It sits on the declaration's own line after the name, unlike a real `typealias`
+/// member, which has a line of its own: those would only clutter every generic method.
+private func isGenericParameter(_ node: SymbolNode, in parent: SymbolNode?) -> Bool {
+	guard node.kind == 26, let parent else { return false }
+	return node.startLine == parent.selectionLine && node.selectionColumn > parent.selectionColumn
+}
+
 /// Indented `name  [Kind]  :start-end` tree. The end line lets an agent judge a member's size
 /// ("is this method worth reading in full?") without a separate call. Extensions print as
 /// `extension Name`.
 public func formatOutline(_ symbols: [DocumentSymbol], indent: String = "  ") -> String {
 	guard !symbols.isEmpty else { return "No symbols found." }
 	var lines: [String] = []
-	func walk(_ nodes: [SymbolNode], depth: Int) {
+	func walk(_ nodes: [SymbolNode], depth: Int, parent: SymbolNode? = nil) {
 		for node in nodes {
+			if isGenericParameter(node, in: parent) { continue }
 			let start = node.startLine + 1
 			let end = node.endLine + 1
 			let span = start == end ? ":\(start)" : ":\(start)-\(end)"
 			let name = node.kind == SymbolKind.extensionKind ? "extension \(node.name)" : node.name
 			lines.append("\(String(repeating: indent, count: depth))\(name)  [\(SymbolKind.label(node.kind))]  \(span)")
-			walk(node.children, depth: depth + 1)
+			walk(node.children, depth: depth + 1, parent: node)
 		}
 	}
 	walk(toSymbolTree(symbols), depth: 0)

@@ -9,6 +9,8 @@ public actor SwiftNavigator {
 
 	public static let workspaceEnvironmentKey = "CODENAV_SWIFT_WORKSPACE"
 	public static let indexTimeoutEnvironmentKey = "CODENAV_SWIFT_INDEX_TIMEOUT"
+	public static let requestTimeoutEnvironmentKey = "CODENAV_SWIFT_REQUEST_TIMEOUT"
+	static let defaultRequestTimeout: TimeInterval = 60
 	static let defaultIndexTimeout: TimeInterval = 30
 	static let maxTypeLocations = 3
 	static let maxSubtypesVisited = 300
@@ -18,6 +20,7 @@ public actor SwiftNavigator {
 	private let selector: WorkspaceSelector
 	private let rootsProvider: RootsProvider?
 	private let indexTimeout: TimeInterval
+	private let requestTimeout: TimeInterval
 	private let commandOverride: [String]?
 
 	private var workspaceRoot: URL
@@ -44,6 +47,8 @@ public actor SwiftNavigator {
 		workspaceSource = selector.baseSource
 		projectKind = ProjectKind.detect(in: selector.base)
 		indexTimeout = environment[Self.indexTimeoutEnvironmentKey].flatMap(TimeInterval.init) ?? Self.defaultIndexTimeout
+		requestTimeout = environment[Self.requestTimeoutEnvironmentKey].flatMap(TimeInterval.init).flatMap { $0 > 0 ? $0 : nil }
+			?? Self.defaultRequestTimeout
 	}
 
 	// MARK: - Workspace and client lifecycle
@@ -60,7 +65,7 @@ public actor SwiftNavigator {
 	/// checkout/worktree of the same repository.
 	private func useWorkspace() async {
 		let roots = selector.pinned ? [] : await (rootsProvider?() ?? [])
-		let selection = selector.select(clientRootURIs: roots)
+		let selection = selector.select(clientRootURIs: roots, isProject: { ProjectKind.detect(in: $0).isNavigable })
 		guard selection.root != workspaceRoot else { return }
 		await stopClient()
 		workspaceRoot = selection.root
@@ -90,6 +95,7 @@ public actor SwiftNavigator {
 			return started
 		}
 		let root = workspaceRoot
+		try requireProject()
 		let notices = notices
 		let command = try commandOverride ?? SourceKitLSPLocator.command(environment: environment)
 		let configuration = LSPClient.Configuration(
@@ -100,7 +106,8 @@ public actor SwiftNavigator {
 			// sourcekit-lsp reads these once at startup. (Package.swift is a watched .swift file:
 			// it reloads the package itself, with no restart.)
 			configNames: ["buildServer.json", "compile_commands.json", "compile_flags.txt"],
-			environment: nil
+			environment: nil,
+			requestTimeout: requestTimeout
 		)
 		let task = Task { () -> LSPClient in
 			let newClient = LSPClient(configuration: configuration, onNotice: { notices.post($0) })
@@ -112,13 +119,26 @@ public actor SwiftNavigator {
 			let started = try await task.value
 			client = started
 			startingClient = nil
-			if let advice = projectKind.advice { notices.post(advice) }
+			if let advice = projectKind.advice(in: root) { notices.post(advice) }
 			try await started.refresh()
 			return started
 		} catch {
 			startingClient = nil
 			throw error
 		}
+	}
+
+	/// Starting sourcekit-lsp in `$HOME` or a folder with no Swift in it would index the wrong tree for
+	/// minutes and answer nothing useful: say what to do instead.
+	private func requireProject() throws {
+		guard projectKind == .none else { return }
+		let looseSwift = !WorkspaceSelector.isHomeOrRoot(workspaceRoot) && ProjectKind.hasLooseSwiftFiles(in: workspaceRoot)
+		if looseSwift { return }
+		throw ToolInputError(
+			"No Swift project at \(workspaceRoot.path) (chosen because: \(selector.explain(workspaceSource)))."
+				+ ProjectKind.nestedAdvice(ProjectKind.nestedProjects(in: workspaceRoot))
+				+ " Set CODENAV_SWIFT_WORKSPACE to the package/project root (an absolute path), or start the MCP client there."
+		)
 	}
 
 	/// Waits for background indexing so references/callers/implementations are complete; says so
@@ -128,8 +148,14 @@ public actor SwiftNavigator {
 		guard !status.isReady else { return }
 		let detail = status.detail.map { " (\($0))" } ?? ""
 		notices.post(
-			"the index is still being built\(detail); references, callers and implementations may be incomplete. Retry in a bit."
+			"the index is still being built\(detail); references, callers, implementations and symbol search may be incomplete. Retry in a bit."
 		)
+	}
+
+	/// Name lookups (`workspace/symbol`) answer from the index too, so a query right after startup or
+	/// after files changed on disk would otherwise return stale or empty results.
+	private func awaitIndexIfBusy(_ client: LSPClient) async {
+		await awaitIndex(client)
 	}
 
 	private func checkSwiftFile(_ filePath: String) throws {
@@ -139,16 +165,19 @@ public actor SwiftNavigator {
 	}
 
 	/// Runs a tool body, turning any failure into text and appending pending notices.
-	func run(_ body: () async throws -> String) async -> String {
+	func run(_ body: () async throws -> String) async -> ToolResult {
 		let text: String
+		var failed = false
 		do {
 			text = try await body()
 		} catch let error as SymbolResolutionError {
 			text = error.message
+			failed = true
 		} catch {
 			text = formatToolError(error)
+			failed = true
 		}
-		return notices.annotate(text)
+		return ToolResult(notices.annotate(text), isError: failed)
 	}
 
 	private func relative(_ uri: String) -> String {
@@ -162,9 +191,131 @@ public actor SwiftNavigator {
 		return path
 	}
 
+	/// What explains an empty or "not found" answer when the cause isn't the question: a failed
+	/// background build, or a workspace with no build description.
+	private func emptyResultHint(_ client: LSPClient) async -> String {
+		var parts: [String] = []
+		if let first = await client.recentErrors.first {
+			parts.append(
+				"The language server's background build failed (\(first.prefix(240))), which leaves results empty or partial until the project compiles. `workspace` shows the details."
+			)
+		}
+		if projectKind == .none, let advice = projectKind.advice(in: workspaceRoot) { parts.append(advice) }
+		return parts.isEmpty ? "" : "\n\n" + parts.joined(separator: "\n")
+	}
+
+	/// The 1-indexed column to query: `column` itself, or where `symbol` first appears on the line.
+	private func resolveColumn(_ client: LSPClient, filePath: String, line: Int, column: Int?, symbol: String?) async throws -> Int {
+		if let column { return column }
+		guard let symbol else {
+			throw ToolInputError("Pass `column` (1-indexed) or `symbol` (the identifier's text on that line).")
+		}
+		let text = try readTextFile(await client.resolve(filePath))
+		return try PositionResolver.column(of: symbol, onLine: line, in: text, filePath: filePath)
+	}
+
+	/// A symbol picked by name, or by the line/identifier it appears on.
+	private struct Target {
+		var symbol: ResolvedSymbol
+		var note: String?
+	}
+
+	static let maxListedSites = 25
+
+	/// Locations as text: the project's own first (SDK headers last), capped, with the remainder counted.
+	private func formatSites(_ sites: [LSPLocation]) -> String {
+		let ordered = sites.filter { !isExternal($0.uri) && !isDependencyPath($0.uri) }
+			+ sites.filter { isExternal($0.uri) || isDependencyPath($0.uri) }
+		let shown = ordered.prefix(Self.maxListedSites).map { formatLocation($0, workspaceRoot: workspaceRoot) }
+		let more = ordered.count > shown.count ? "\n\n… and \(ordered.count - shown.count) more" : ""
+		return shown.joined(separator: "\n\n") + more
+	}
+
+	private func isExternal(_ uri: String) -> Bool {
+		uri.contains("/sourcekit-lsp/GeneratedInterfaces/") || uri.contains(".sdk/")
+	}
+
+	/// By position when `line` plus `column`/`symbol` is given (the symbol under it is whatever the type checker
+	/// says: no name lookup, so overloads, locals and members of any type work), otherwise by name.
+	private func resolveTarget(
+		_ client: LSPClient, name: String?, query: String?, aliases: KeyValuePairs<String, String?> = [:],
+		example: String, filePath: String?, line: Int?, column: Int?, symbol: String?
+	) async throws -> Target {
+		if let line, column != nil || symbol != nil {
+			guard let filePath else { throw ToolInputError("Pass `file_path` together with `line` and `column`/`symbol`.") }
+			try checkSwiftFile(filePath)
+			return try await resolvePosition(client, filePath: filePath, line: line, column: column, symbol: symbol)
+		}
+		if symbol != nil || column != nil {
+			throw ToolInputError("`column` and `symbol` need `line` and `file_path`: pass the line the identifier is on.")
+		}
+		var named: KeyValuePairs<String, String?> = ["name": name, "query": query]
+		if !aliases.isEmpty { named = aliases }
+		let wanted = try resolveNameQuery(preferred: "name", example: example, named)
+		await awaitIndexIfBusy(client)
+		do {
+			let resolved = try await resolveSymbol(
+				client: client, workspaceRoot: workspaceRoot, query: wanted, filePath: filePath, line: line
+			)
+			return Target(symbol: resolved, note: nil)
+		} catch let error as SymbolResolutionError where error.message.hasPrefix("No symbol found matching") {
+			let parsed = ParsedQuery(wanted)
+			// Types from the SDK or a dependency aren't in the workspace index: find a use of the name instead.
+			if parsed.container.isEmpty, parsed.signature == nil,
+				let usage = PositionResolver.findUsage(of: parsed.base, under: workspaceRoot),
+				let target = try? await resolvePosition(
+					client, filePath: usage.path, line: usage.line, column: usage.column, symbol: nil
+				)
+			{
+				let place = "\(relative(URL(fileURLWithPath: usage.path).absoluteString)):\(usage.line)"
+				return Target(
+					symbol: target.symbol,
+					note: "'\(wanted)' isn't declared in the indexed workspace; resolved through its use at \(place)."
+						+ (target.note.map { " " + $0 } ?? ""))
+			}
+			throw SymbolResolutionError(message: error.message + (await emptyResultHint(client)))
+		}
+	}
+
+	private func resolvePosition(
+		_ client: LSPClient, filePath: String, line: Int, column: Int?, symbol: String?
+	) async throws -> Target {
+		let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
+		let file = await client.resolve(filePath).path
+		let text = try readTextFile(URL(fileURLWithPath: file))
+		let hoverText = try await client.hover(file, line: line, column: column)
+		let definitions = try await client.definition(file, line: line, column: column)
+		let word = PositionResolver.word(at: column, onLine: line, in: text)
+		guard let word, !(hoverText.isEmpty && definitions.isEmpty) else {
+			let lineText = PositionResolver.sourceLines(text).dropFirst(line - 1).first ?? ""
+			throw SymbolResolutionError(
+				message: "No symbol at \(filePath):\(line):\(column) (\(lineText.trimmingCharacters(in: .whitespaces))). "
+					+ "Point at an identifier, or pass `symbol` with its text."
+			)
+		}
+		var kind = PositionResolver.kind(fromHover: hoverText) ?? 0
+		if let local = definitions.first(where: { !isExternal($0.uri) }) {
+			// A declaration site is the stable place for references, call hierarchy and type hierarchy.
+			if kind == 0, let declaration = readLines(of: local.uri)?[safe: local.range.start.line] {
+				kind = PositionResolver.kind(fromHover: declaration) ?? 0
+			}
+			let resolved = ResolvedSymbol(
+				name: word, containerName: nil, kind: kind, uri: local.uri, line: local.range.start.line,
+				column: local.range.start.character
+			)
+			return Target(symbol: resolved, note: nil)
+		}
+		let resolved = ResolvedSymbol(
+			name: word, containerName: nil, kind: kind, uri: URL(fileURLWithPath: file).absoluteString, line: line - 1,
+			column: column - 1
+		)
+		let note = definitions.isEmpty ? nil : "\(word) is declared outside the project (SDK or a dependency without sources here)."
+		return Target(symbol: resolved, note: note)
+	}
+
 	// MARK: - Tools
 
-	public func workspace() async -> String {
+	public func workspace() async -> ToolResult {
 		await run {
 			await useWorkspace()
 			var lines = [
@@ -172,6 +323,9 @@ public actor SwiftNavigator {
 				"chosen because: \(selector.explain(workspaceSource))",
 				"project: \(projectKind.summary)",
 			]
+			if let advice = projectKind.advice(in: workspaceRoot), projectKind == .none || !projectKind.isNavigable {
+				lines.append(advice)
+			}
 			if let command = try? commandOverride ?? SourceKitLSPLocator.command(environment: environment) {
 				lines.append("language server: \(command.joined(separator: " "))")
 			}
@@ -183,6 +337,12 @@ public actor SwiftNavigator {
 					lines.append("recent language-server errors (a failed background build explains empty results):")
 					lines += errors.map { "  \($0)" }
 				}
+				let harmless = await client.dependencyFailureCount
+				if harmless > 0 {
+					lines.append(
+						"\(harmless) background build task(s) failed on dependency code only (checkouts/.build); that is usually harmless."
+					)
+				}
 			} else {
 				lines.append("language server: not started yet (it starts on the first navigation call)")
 			}
@@ -190,49 +350,81 @@ public actor SwiftNavigator {
 		}
 	}
 
-	public func hover(filePath: String, line: Int, column: Int) async -> String {
+	public func hover(filePath: String, line: Int, column: Int?, symbol: String? = nil) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			try checkSwiftFile(filePath)
 			let client = try await liveClient()
+			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			var text = try await client.hover(filePath, line: line, column: column)
 			if !text.isEmpty { text = await enrichVariableType(text, client: client, filePath: filePath, line: line, column: column) }
-			return text.isEmpty ? "No hover information at that position." : text
+			return text.isEmpty ? "No hover information at that position." + (await emptyResultHint(client)) : text
 		}
 	}
 
-	public func definition(filePath: String, line: Int, column: Int) async -> String {
+	public func definition(filePath: String, line: Int, column: Int?, symbol: String? = nil) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			try checkSwiftFile(filePath)
 			let client = try await liveClient()
+			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			let locations = try await client.definition(filePath, line: line, column: column)
-			if locations.isEmpty { return "No definition found at that position." }
+			if locations.isEmpty { return "No definition found at that position." + (await emptyResultHint(client)) }
 			return locations.map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n")
 		}
 	}
 
-	public func references(filePath: String, line: Int, column: Int, includeDeclaration: Bool = true) async -> String {
+	public func references(
+		filePath: String, line: Int, column: Int?, symbol: String? = nil, includeDeclaration: Bool = true
+	) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			try checkSwiftFile(filePath)
 			let client = try await liveClient()
+			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			await awaitIndex(client)
 			let locations = try await client.references(
 				filePath, line: line, column: column, includeDeclaration: includeDeclaration
 			)
-			return formatReferences(locations, workspaceRoot: workspaceRoot)
+			let text = formatReferences(locations, workspaceRoot: workspaceRoot)
+			return locations.isEmpty ? text + (await emptyResultHint(client)) : text
+		}
+	}
+
+	/// The type of the expression or declaration at a position, and where that type is defined:
+	/// `hover` shows the declaration, this answers "what type is this value?".
+	public func typeAt(filePath: String, line: Int, column: Int?, symbol: String? = nil) async -> ToolResult {
+		await run {
+			await useWorkspace()
+			try checkSwiftFile(filePath)
+			let client = try await liveClient()
+			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
+			let text = try await client.hover(filePath, line: line, column: column)
+			guard !text.isEmpty else { return "No type information at that position." + (await emptyResultHint(client)) }
+			let locations = (try? await client.typeDefinition(filePath, line: line, column: column)) ?? []
+			let local = locations.filter { !isExternal($0.uri) }.prefix(Self.maxTypeLocations)
+			var parts = [text]
+			if local.isEmpty {
+				parts.append(
+					locations.isEmpty
+						? "(no type definition reported: the position may be a type itself, a function, or have no declared type)"
+						: "Type is defined in the SDK or the standard library.")
+			} else {
+				parts += local.map(describeTypeDefinition)
+			}
+			return parts.joined(separator: "\n")
 		}
 	}
 
 	public func searchSymbol(
 		query: String?, name: String?, kind: String?, path: String?, fuzzy: Bool = false
-	) async -> String {
+	) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			let kinds = try parseKindFilter(kind)
 			let query = try resolveNameQuery(preferred: "query", example: "UserService", ["query": query, "name": name])
 			let client = try await liveClient()
+			await awaitIndexIfBusy(client)
 			// sourcekit-lsp matches plain names; `Type.member` is that member name filtered by container.
 			let parsed = Self.splitQualified(query)
 			var symbols = try await client.workspaceSymbol(parsed.name)
@@ -243,7 +435,7 @@ public actor SwiftNavigator {
 					return container == wanted || container.hasSuffix("." + wanted)
 				}
 			}
-			if symbols.isEmpty { return "No symbols matching '\(query)'." }
+			if symbols.isEmpty { return "No symbols matching '\(query)'." + (await emptyResultHint(client)) }
 			let matching = filterSymbols(symbols, workspaceRoot: workspaceRoot, kinds: kinds, path: path)
 			if matching.isEmpty {
 				let filters = [("kind", kind), ("path", path)].compactMap { key, value in
@@ -262,7 +454,7 @@ public actor SwiftNavigator {
 		return (parsed.container, parsed.base + (parsed.signature ?? ""))
 	}
 
-	public func diagnostics(filePath: String) async -> String {
+	public func diagnostics(filePath: String) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			try checkSwiftFile(filePath)
@@ -271,12 +463,17 @@ public actor SwiftNavigator {
 		}
 	}
 
-	public func symbolInfo(name: String?, query: String?, filePath: String?, includeReferences: Bool = true) async -> String {
+	public func symbolInfo(
+		name: String?, query: String?, filePath: String?, line: Int? = nil, column: Int? = nil, symbol: String? = nil,
+		includeReferences: Bool = true
+	) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			let name = try resolveNameQuery(preferred: "name", example: "UserService.create(name:)", ["name": name, "query": query])
 			let client = try await liveClient()
-			let resolved = try await resolveSymbol(client: client, workspaceRoot: workspaceRoot, query: name, filePath: filePath)
+			let target = try await resolveTarget(
+				client, name: name, query: query, example: "UserService.create(name:)", filePath: filePath, line: line,
+				column: column, symbol: symbol)
+			let resolved = target.symbol
 			let relativePath = relative(resolved.uri)
 			let file = try path(of: resolved.uri)
 			let line = resolved.line + 1
@@ -289,7 +486,9 @@ public actor SwiftNavigator {
 				references = try await client.references(file, line: line, column: column)
 			}
 			let header = "\(resolved.qualifiedName)  [\(SymbolKind.label(resolved.kind))]  (\(relativePath):\(line):\(column))"
-			var parts = [header, "", hoverText.isEmpty ? "No hover information." : hoverText]
+			var parts = [header]
+			if let note = target.note { parts.append(note) }
+			parts += ["", hoverText.isEmpty ? "No hover information." : hoverText]
 			if SymbolKind.types.contains(resolved.kind), let supers = try? await supertypeLine(client, file: file, line: line, column: column) {
 				parts += ["", supers]
 			}
@@ -301,6 +500,7 @@ public actor SwiftNavigator {
 			]
 			if includeReferences {
 				parts += ["", "References:", formatReferencesGrouped(references, workspaceRoot: workspaceRoot)]
+				if references.isEmpty { parts.append(await emptyResultHint(client)) }
 			}
 			return parts.joined(separator: "\n")
 		}
@@ -317,7 +517,7 @@ public actor SwiftNavigator {
 		return unique.isEmpty ? nil : "Inherits / conforms to: " + unique.joined(separator: ", ")
 	}
 
-	public func outline(filePath: String) async -> String {
+	public func outline(filePath: String) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			try checkSwiftFile(filePath)
@@ -326,45 +526,57 @@ public actor SwiftNavigator {
 		}
 	}
 
-	public func callers(name: String?, query: String?, filePath: String?) async -> String {
+	public func callers(
+		name: String?, query: String?, filePath: String?, line: Int? = nil, column: Int? = nil, symbol: String? = nil
+	) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			let name = try resolveNameQuery(preferred: "name", example: "UserService.create(name:)", ["name": name, "query": query])
 			let client = try await liveClient()
-			let resolved = try await resolveSymbol(client: client, workspaceRoot: workspaceRoot, query: name, filePath: filePath)
+			let target = try await resolveTarget(
+				client, name: name, query: query, example: "UserService.create(name:)", filePath: filePath, line: line,
+				column: column, symbol: symbol)
+			let resolved = target.symbol
 			let file = try path(of: resolved.uri)
 			await awaitIndex(client)
 			let items = try await client.prepareCallHierarchy(file, line: resolved.line + 1, column: resolved.column + 1)
 			guard let item = items.first else {
 				return "\(resolved.name) has no call hierarchy entry at that position (it may not be a callable)."
 			}
-			return formatCallers(try await client.incomingCalls(item), workspaceRoot: workspaceRoot)
+			let calls = try await client.incomingCalls(item)
+			let text = formatCallers(calls, workspaceRoot: workspaceRoot)
+			return (target.note.map { $0 + "\n" } ?? "") + text + (calls.isEmpty ? await emptyResultHint(client) : "")
 		}
 	}
 
 	/// Types that conform to a protocol / inherit from a class (transitively, through refining
 	/// protocols and subclasses), or the members that implement or override a protocol requirement /
 	/// class member.
-	public func implementations(name: String?, query: String?, portName: String?, filePath: String?) async -> String {
+	public func implementations(
+		name: String?, query: String?, portName: String?, filePath: String?, line: Int? = nil, column: Int? = nil,
+		symbol: String? = nil
+	) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			let name = try resolveNameQuery(
-				preferred: "name", example: "UserStore", ["name": name, "query": query, "port_name": portName]
-			)
 			let client = try await liveClient()
-			let resolved = try await resolveSymbol(client: client, workspaceRoot: workspaceRoot, query: name, filePath: filePath)
+			let target = try await resolveTarget(
+				client, name: name, query: query, aliases: ["name": name, "query": query, "port_name": portName],
+				example: "UserStore", filePath: filePath, line: line, column: column, symbol: symbol)
+			let resolved = target.symbol
 			let file = try path(of: resolved.uri)
 			await awaitIndex(client)
 			let line = resolved.line + 1
 			let column = resolved.column + 1
+			let prefix = target.note.map { $0 + "\n\n" } ?? ""
 			if SymbolKind.types.contains(resolved.kind) {
-				return try await formatSubtypes(of: resolved, client: client, file: file, line: line, column: column)
+				return prefix + (try await formatSubtypes(of: resolved, client: client, file: file, line: line, column: column))
 			}
 			let locations = try await client.implementation(file, line: line, column: column)
 				.filter { !($0.uri == resolved.uri && $0.range.start.line == resolved.line) }
-			if locations.isEmpty { return "No implementations or overrides of \(resolved.qualifiedName) found." }
+			if locations.isEmpty {
+				return prefix + "No implementations or overrides of \(resolved.qualifiedName) found." + (await emptyResultHint(client))
+			}
 			let heading = "\(locations.count) implementation(s) of \(resolved.qualifiedName):"
-			return heading + "\n\n" + locations.map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n")
+			return prefix + heading + "\n\n" + formatSites(locations)
 		}
 	}
 
@@ -406,7 +618,7 @@ public actor SwiftNavigator {
 			let sites = try await client.implementation(file, line: line, column: column)
 			if sites.isEmpty { return "No types \(verb) \(resolved.qualifiedName)." }
 			return "\(sites.count) site(s) that \(verb) \(resolved.qualifiedName):\n\n"
-				+ sites.map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n")
+				+ formatSites(sites)
 		}
 		let list = entries.map { String(repeating: "  ", count: $0.depth) + $0.text }
 		let note = visited >= Self.maxSubtypesVisited ? "\n… stopped after \(Self.maxSubtypesVisited) types" : ""
@@ -461,5 +673,11 @@ public actor SwiftNavigator {
 			lines.append("  " + first)
 		}
 		return lines.joined(separator: "\n")
+	}
+}
+
+private extension Array {
+	subscript(safe index: Int) -> Element? {
+		indices.contains(index) ? self[index] : nil
 	}
 }

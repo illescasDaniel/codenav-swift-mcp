@@ -178,6 +178,9 @@ public actor LSPClient {
 		/// the project: servers read them once at startup, so a change restarts the server.
 		public var configNames: Set<String>
 		public var environment: [String: String]?
+		/// How long an ordinary request may take. A cold workspace-wide query can legitimately take
+		/// a while while the index is first built, so this is generous.
+		public var requestTimeout: TimeInterval
 
 		public init(
 			workspaceRoot: URL,
@@ -185,8 +188,10 @@ public actor LSPClient {
 			languageID: String,
 			watchSuffixes: Set<String> = [],
 			configNames: Set<String> = [],
-			environment: [String: String]? = nil
+			environment: [String: String]? = nil,
+			requestTimeout: TimeInterval = 60
 		) {
+			self.requestTimeout = requestTimeout
 			self.workspaceRoot = workspaceRoot
 			self.command = command
 			self.languageID = languageID
@@ -236,6 +241,11 @@ public actor LSPClient {
 	private var timeouts: [Int: Task<Void, Never>] = [:]
 	private var stderrTail: [String] = []
 	private var errorLog: [String] = []
+	/// Lines of each running background task (sourcekit-lsp tags every log line of one task with the
+	/// same three-emoji prefix), so a failing task's compiler errors can be shown with its exit code.
+	private var taskLines: [String: [String]] = [:]
+	private var taskOrder: [String] = []
+	private var dependencyFailures = 0
 
 	private var openFiles: [String: OpenFile] = [:]
 	private var pushedDiagnostics: [String: [LSPDiagnostic]] = [:]
@@ -262,8 +272,13 @@ public actor LSPClient {
 
 	public var isAlive: Bool { process?.isRunning ?? false }
 
-	/// Recent error-level messages the server logged (e.g. a failed background build).
+	/// Recent background-build failures the server logged, with the compiler error behind each one.
+	/// Failures that only concern dependency code (checkouts, `.build`) are left out: they are the
+	/// norm and say nothing about the project's own sources.
 	public var recentErrors: [String] { errorLog }
+
+	/// How many background tasks failed on dependency code only (reported separately as harmless).
+	public var dependencyFailureCount: Int { dependencyFailures }
 
 	// MARK: - Lifecycle
 
@@ -495,14 +510,75 @@ public actor LSPClient {
 				break
 			}
 		case "window/logMessage":
-			// type 1 = Error. Background build failures land here and explain empty results.
-			if params?["type"]?.intValue == 1, let message = params?["message"]?.stringValue {
-				errorLog.append(String(message.prefix(500)))
-				if errorLog.count > 5 { errorLog.removeFirst() }
-			}
+			guard let message = params?["message"]?.stringValue else { return }
+			recordLog(message, isError: params?["type"]?.intValue == 1)
 		default:
 			break
 		}
+	}
+
+	private static let dependencyPathMarkers = ["/checkouts/", "/.build/", "/SourcePackages/", "/DerivedData/", "/.swiftpm/"]
+
+	/// `🟥🟩🟪 Finished with exit code 1 ...` -> ("🟥🟩🟪", rest). nil for a message with no task tag.
+	static func splitTaskTag(_ line: String) -> (tag: String, rest: String)? {
+		guard let space = line.firstIndex(of: " ") else { return nil }
+		let tag = line[..<space]
+		guard tag.count == 3, tag.unicodeScalars.allSatisfy({ $0.value > 0x2000 }) else { return nil }
+		return (String(tag), String(line[line.index(after: space)...]))
+	}
+
+	/// Keeps each task's output until it finishes; when it finishes badly, records the compiler error
+	/// that explains it. The failure line itself (`Finished with exit code 1`) says nothing useful,
+	/// and the error is logged separately, at a lower severity, under the same task tag.
+	private func recordLog(_ message: String, isError: Bool) {
+		let lines = message.components(separatedBy: "\n")
+		guard let tag = lines.first.flatMap(Self.splitTaskTag)?.tag else {
+			if isError { appendError(String(message.prefix(500))) }
+			return
+		}
+		var buffer = taskLines[tag] ?? []
+		if taskLines[tag] == nil {
+			taskOrder.append(tag)
+			if taskOrder.count > 40 { taskLines.removeValue(forKey: taskOrder.removeFirst()) }
+		}
+		for line in lines {
+			let text = Self.splitTaskTag(line).map(\.rest) ?? line
+			if !text.isEmpty { buffer.append(text) }
+		}
+		if buffer.count > 120 { buffer.removeFirst(buffer.count - 120) }
+		taskLines[tag] = buffer
+
+		guard let finished = buffer.last(where: { $0.hasPrefix("Finished with exit code ") }) else { return }
+		taskLines.removeValue(forKey: tag)
+		taskOrder.removeAll { $0 == tag }
+		guard !finished.hasPrefix("Finished with exit code 0 ") else { return }
+		let errors = buffer.filter { $0.contains(": error:") || $0.hasPrefix("error: ") }
+		let specific = errors.filter { !$0.contains("command failed with exit code") }
+		var seen: Set<String> = []
+		let unique = (specific.isEmpty ? errors : specific).filter { seen.insert($0).inserted }
+		let isDependencyOnly = !unique.isEmpty && unique.allSatisfy { line in Self.dependencyPathMarkers.contains { line.contains($0) } }
+		if isDependencyOnly {
+			dependencyFailures += 1
+			return
+		}
+		if unique.isEmpty {
+			let title = buffer.first.map { String($0.prefix(80)) } ?? "background task"
+			appendError("\(title): \(finished)")
+			return
+		}
+		// One clean `File.swift:3:12: error: ...` line per distinct compiler error, workspace-relative.
+		var reasons = unique.prefix(2).map { line -> String in
+			var text = line
+			for prefix in rootSpellings(configuration.workspaceRoot) { text = text.replacingOccurrences(of: prefix, with: "") }
+			return String(text.prefix(300))
+		}
+		if unique.count > 2 { reasons.append("(+\(unique.count - 2) more)") }
+		appendError(reasons.joined(separator: " | "))
+	}
+
+	private func appendError(_ message: String) {
+		if !errorLog.contains(message) { errorLog.append(message) }
+		if errorLog.count > 5 { errorLog.removeFirst() }
 	}
 
 	private func send<Message: Encodable>(_ message: Message) {
@@ -516,7 +592,8 @@ public actor LSPClient {
 		send(OutgoingRequest(id: nil, method: method, params: params))
 	}
 
-	private func requestData(_ method: String, params: JSONValue, timeout: TimeInterval = 20) async throws -> Data {
+	private func requestData(_ method: String, params: JSONValue, timeout: TimeInterval? = nil) async throws -> Data {
+		let timeout = timeout ?? configuration.requestTimeout
 		for delay in Self.contentModifiedBackoff {
 			do {
 				return try await requestOnce(method, params: params, timeout: timeout)
@@ -553,7 +630,7 @@ public actor LSPClient {
 
 	/// Sends a request and decodes its `result` (nil when the server answered `null`).
 	private func request<Result: Decodable>(
-		_ method: String, params: JSONValue, as type: Result.Type = Result.self, timeout: TimeInterval = 20
+		_ method: String, params: JSONValue, as type: Result.Type = Result.self, timeout: TimeInterval? = nil
 	) async throws -> Result? {
 		let data = try await requestData(method, params: params, timeout: timeout)
 		do {
@@ -595,7 +672,7 @@ public actor LSPClient {
 
 	public func resolve(_ filePath: String) -> URL {
 		let url = URL(fileURLWithPath: filePath, relativeTo: configuration.workspaceRoot)
-		return url.standardizedFileURL.resolvingSymlinksInPath()
+		return url.realPath
 	}
 
 	@discardableResult
@@ -666,7 +743,7 @@ public actor LSPClient {
 		if suffixes.isEmpty && configNames.isEmpty { return scan }
 		let fileManager = FileManager.default
 		let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]
-		let root = root.resolvingSymlinksInPath()
+		let root = root.realPath
 		var stack = [root]
 		while let directory = stack.popLast() {
 			guard let entries = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys) else {
@@ -683,7 +760,7 @@ public actor LSPClient {
 				let isConfig = configNames.contains(name)
 				if !isConfig, !suffixes.contains("." + entry.pathExtension.lowercased()) { continue }
 				let stamp = FileStamp(modified: values.contentModificationDate ?? .distantPast, size: values.fileSize ?? 0)
-				let key = values.isSymbolicLink == true ? entry.resolvingSymlinksInPath() : entry
+				let key = values.isSymbolicLink == true ? entry.realPath : entry
 				if isConfig { scan.configs[key] = stamp } else { scan.sources[key] = stamp }
 			}
 		}

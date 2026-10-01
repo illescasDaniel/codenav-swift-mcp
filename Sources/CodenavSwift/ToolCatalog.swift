@@ -33,6 +33,13 @@ public struct ToolArguments: Sendable {
 		}
 	}
 
+	/// Optional integer: absent or null is nil; a present value that isn't an integer is an error.
+	public func optionalInt(_ key: String) throws -> Int? {
+		guard let value = values[key], value != .null else { return nil }
+		if case .string(let text) = value, text.trimmingCharacters(in: .whitespaces).isEmpty { return nil }
+		return try int(key)
+	}
+
 	public func int(_ key: String) throws -> Int {
 		guard let value = values[key], value != .null else { throw ToolInputError("Missing required parameter '\(key)'.") }
 		if let number = value.intValue { return number }
@@ -74,7 +81,9 @@ public enum ToolCatalog {
 		+ "chaining search_symbol → hover → definition → references by hand; drop to the position tools once "
 		+ "you have a specific line to inspect. The first query after startup can take a while if the project "
 		+ "is still being indexed; results note when the index was incomplete. Xcode projects need a "
-		+ "buildServer.json (see `workspace`). " + positionNote
+		+ "buildServer.json (see `workspace`). Everywhere a `column` is asked for you can pass `symbol` (the identifier's "
+		+ "text on that line) instead. symbol_info/callers/implementations also work from a position "
+		+ "(`file_path` + `line` + `symbol`) when a name is ambiguous or the symbol is local. " + positionNote
 
 	private static func p(_ name: String, _ kind: ToolSpec.Parameter.Kind, _ description: String, required: Bool = false)
 		-> ToolSpec.Parameter
@@ -84,7 +93,18 @@ public enum ToolCatalog {
 
 	private static let filePath = p("file_path", .string, "Path to the Swift file, relative to the workspace root (or absolute).", required: true)
 	private static let line = p("line", .integer, "1-indexed line.", required: true)
-	private static let column = p("column", .integer, "1-indexed UTF-16 column.", required: true)
+	private static let column = p(
+		"column", .integer, "1-indexed UTF-16 column. Optional when `symbol` is given.")
+	private static let symbolOnLine = p(
+		"symbol", .string,
+		"Alternative to `column`: the identifier's text on `line` (first whole-word occurrence), so no column counting is needed.")
+	private static let optionalLine = p(
+		"line", .integer,
+		"1-indexed line. With `file_path` and `column`/`symbol` this selects the symbol by position instead of by name; "
+			+ "with `name` it picks the overload declared on that line.")
+	private static let optionalFile = p(
+		"file_path", .string, "Disambiguating file, or the file `line` refers to (relative to the workspace, `../Sibling/...` or absolute).")
+	private static let positionTargets = [optionalLine, column, symbolOnLine]
 
 	public static let tools: [ToolSpec] = [
 		ToolSpec(
@@ -95,15 +115,15 @@ public enum ToolCatalog {
 		ToolSpec(
 			name: "hover",
 			description: "Get type/documentation info for the symbol at a position. " + positionNote,
-			parameters: [filePath, line, column]),
+			parameters: [filePath, line, column, symbolOnLine]),
 		ToolSpec(
 			name: "definition",
 			description: "Go to the definition of the symbol at a position. " + positionNote,
-			parameters: [filePath, line, column]),
+			parameters: [filePath, line, column, symbolOnLine]),
 		ToolSpec(
 			name: "references",
 			description: "Find all usages of the symbol at a position across the workspace. " + positionNote,
-			parameters: [filePath, line, column, p("include_declaration", .boolean, "Include the declaration itself (default true).")]),
+			parameters: [filePath, line, column, symbolOnLine, p("include_declaration", .boolean, "Include the declaration itself (default true).")]),
 		ToolSpec(
 			name: "search_symbol",
 			description:
@@ -131,7 +151,7 @@ public enum ToolCatalog {
 				+ "Pass `file_path` to disambiguate; if still ambiguous the candidates are listed. `query` is an alias for `name`.",
 			parameters: [
 				p("name", .string, "Symbol name."), p("query", .string, "Alias for name."),
-				p("file_path", .string, "Disambiguating file."),
+				optionalFile, optionalLine, column, symbolOnLine,
 				p("include_references", .boolean, "Include grouped references (default true)."),
 			]),
 		ToolSpec(
@@ -147,7 +167,7 @@ public enum ToolCatalog {
 				+ "`name` resolves like symbol_info; `query` is an alias.",
 			parameters: [
 				p("name", .string, "Function/method name."), p("query", .string, "Alias for name."),
-				p("file_path", .string, "Disambiguating file."),
+				optionalFile, optionalLine, column, symbolOnLine,
 			]),
 		ToolSpec(
 			name: "implementations",
@@ -157,25 +177,40 @@ public enum ToolCatalog {
 				+ "`name` resolves like symbol_info; `port_name` and `query` are aliases.",
 			parameters: [
 				p("name", .string, "Protocol/class/member name."), p("query", .string, "Alias for name."),
-				p("port_name", .string, "Alias for name."), p("file_path", .string, "Disambiguating file."),
+				p("port_name", .string, "Alias for name."), optionalFile, optionalLine, column, symbolOnLine,
 			]),
+		ToolSpec(
+			name: "type_at",
+			description:
+				"What type is this value? The type of the expression or declaration at a position (`file_path` + `line` + `column` "
+				+ "or `symbol`), with where that type is defined. Use for inferred `let`/`var`s, closure parameters and call results. "
+				+ positionNote,
+			parameters: [filePath, line, column, symbolOnLine]),
 	]
 
-	public static func call(_ name: String, arguments: ToolArguments, navigator: SwiftNavigator) async -> String {
+	public static func call(_ name: String, arguments: ToolArguments, navigator: SwiftNavigator) async -> ToolResult {
 		do {
+			let optionalColumn = { try arguments.optionalInt("column") }
 			switch name {
 			case "workspace":
 				return await navigator.workspace()
 			case "hover":
 				return await navigator.hover(
-					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"), column: try arguments.int("column"))
+					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"),
+					column: try optionalColumn(), symbol: arguments.string("symbol"))
 			case "definition":
 				return await navigator.definition(
-					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"), column: try arguments.int("column"))
+					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"),
+					column: try optionalColumn(), symbol: arguments.string("symbol"))
 			case "references":
 				return await navigator.references(
-					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"), column: try arguments.int("column"),
+					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"),
+					column: try optionalColumn(), symbol: arguments.string("symbol"),
 					includeDeclaration: arguments.bool("include_declaration", default: true))
+			case "type_at":
+				return await navigator.typeAt(
+					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"),
+					column: try optionalColumn(), symbol: arguments.string("symbol"))
 			case "search_symbol":
 				return await navigator.searchSymbol(
 					query: arguments.string("query"), name: arguments.string("name"), kind: arguments.string("kind"),
@@ -185,22 +220,26 @@ public enum ToolCatalog {
 			case "symbol_info":
 				return await navigator.symbolInfo(
 					name: arguments.string("name"), query: arguments.string("query"), filePath: arguments.string("file_path"),
+					line: try arguments.optionalInt("line"), column: try optionalColumn(), symbol: arguments.string("symbol"),
 					includeReferences: arguments.bool("include_references", default: true))
 			case "outline":
 				return await navigator.outline(filePath: try arguments.requiredString("file_path"))
 			case "callers":
-				return await navigator.callers(name: arguments.string("name"), query: arguments.string("query"), filePath: arguments.string("file_path"))
+				return await navigator.callers(
+					name: arguments.string("name"), query: arguments.string("query"), filePath: arguments.string("file_path"),
+					line: try arguments.optionalInt("line"), column: try optionalColumn(), symbol: arguments.string("symbol"))
 			case "implementations":
 				return await navigator.implementations(
 					name: arguments.string("name"), query: arguments.string("query"), portName: arguments.string("port_name"),
-					filePath: arguments.string("file_path"))
+					filePath: arguments.string("file_path"), line: try arguments.optionalInt("line"),
+					column: try optionalColumn(), symbol: arguments.string("symbol"))
 			default:
-				return "Unknown tool '\(name)'."
+				return ToolResult("Unknown tool '\(name)'.", isError: true)
 			}
 		} catch let error as ToolInputError {
-			return formatToolError(error)
+			return ToolResult(formatToolError(error), isError: true)
 		} catch {
-			return "Error: \(error)"
+			return ToolResult("Error: \(error)", isError: true)
 		}
 	}
 }

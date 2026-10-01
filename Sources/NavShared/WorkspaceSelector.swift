@@ -35,13 +35,16 @@ public final class WorkspaceSelector: Sendable {
 	}
 
 	static func canonical(_ url: URL) -> URL {
-		url.standardizedFileURL.resolvingSymlinksInPath()
+		url.realPath
 	}
 
 	/// One sentence an agent can act on for a `WorkspaceSelection.source` value.
 	public func explain(_ source: String) -> String {
 		if source == "client roots" {
 			return "client roots (the MCP client reported this checkout/worktree of the same repository as the configured base \(base.path))"
+		}
+		if source == Self.rootsBecauseNoProjectSource {
+			return "client roots (the server's working directory \(base.path) is not a Swift project, so the MCP client's workspace root was used instead)"
 		}
 		if source == explicitEnv { return "pinned by $\(explicitEnv); client roots are ignored" }
 		if source == "CLAUDE_PROJECT_DIR" {
@@ -50,15 +53,31 @@ public final class WorkspaceSelector: Sendable {
 		return "server working directory ($\(explicitEnv) and $CLAUDE_PROJECT_DIR are unset)"
 	}
 
+	static let rootsBecauseNoProjectSource = "client roots (cwd is not a project)"
+
 	/// Order of authority: the pinned env var (never overridden); then the client's MCP roots, first
 	/// one that is the configured base or another worktree/checkout of the same git repository;
 	/// then the configured base. A session in some unrelated project must never redirect the server.
-	public func select(clientRootURIs: [String]) -> WorkspaceSelection {
+	///
+	/// The one exception: when the configured base is not a project at all (a host that launches
+	/// stdio servers in `$HOME`, say), there is nothing to protect and navigating it would index the
+	/// wrong tree, so the client's own roots win, preferring one that is a project.
+	public func select(clientRootURIs: [String], isProject: (URL) -> Bool = { _ in true }) -> WorkspaceSelection {
 		if pinned { return WorkspaceSelection(root: base, source: baseSource) }
-		for root in Self.rootPaths(clientRootURIs) where Self.sameRepository(root, base) {
+		let roots = Self.rootPaths(clientRootURIs)
+		for root in roots where Self.sameRepository(root, base) {
 			return WorkspaceSelection(root: root, source: "client roots")
 		}
+		if !isProject(base), let root = roots.first(where: isProject) ?? roots.first(where: { !Self.isHomeOrRoot($0) }) {
+			return WorkspaceSelection(root: root, source: Self.rootsBecauseNoProjectSource)
+		}
 		return WorkspaceSelection(root: base, source: baseSource)
+	}
+
+	/// `/` or the user's home: never a workspace worth handing to a language server.
+	public static func isHomeOrRoot(_ url: URL) -> Bool {
+		let path = url.realPath.path
+		return path == "/" || path == NSHomeDirectory() || path == URL(fileURLWithPath: NSHomeDirectory()).realPath.path
 	}
 
 	static func rootPaths(_ uris: [String]) -> [URL] {

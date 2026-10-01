@@ -25,7 +25,7 @@ import Testing
 	@Test func exposesAllTools() {
 		#expect(ToolCatalog.tools.map(\.name) == [
 			"workspace", "hover", "definition", "references", "search_symbol", "diagnostics", "symbol_info", "outline",
-			"callers", "implementations",
+			"callers", "implementations", "type_at",
 		])
 	}
 }
@@ -60,5 +60,62 @@ struct IntegrationTests {
 		#expect(impls.contains("FakeStore"))
 		let ambiguous = await navigator.symbolInfo(name: "greet", query: nil, filePath: nil)
 		#expect(ambiguous.contains("match 'greet'"))
+		#expect(ambiguous.isError)
+		#expect(!info.isError)
+	}
+
+	@Test func resolvesByPositionAndTextOnLine() async {
+		var environment = ProcessInfo.processInfo.environment
+		environment["CODENAV_SWIFT_WORKSPACE"] = Self.fixture.path
+		let navigator = SwiftNavigator(environment: environment, currentDirectory: Self.fixture)
+		let info = await navigator.symbolInfo(
+			name: nil, query: nil, filePath: "Sources/SampleApp/main.swift", line: 3, symbol: "UserService", includeReferences: false)
+		#expect(info.contains("UserService  [Class]"))
+		let type = await navigator.typeAt(filePath: "Sources/SampleApp/main.swift", line: 4, column: nil, symbol: "user")
+		#expect(type.contains("struct User"))
+		let missing = await navigator.hover(filePath: "Sources/SampleApp/main.swift", line: 4, column: nil, symbol: "nope")
+		#expect(missing.isError)
+		let sdk = await navigator.symbolInfo(name: "String", query: nil, filePath: nil, includeReferences: false)
+		#expect(sdk.contains("[Struct]"))
+	}
+}
+
+@Suite struct PositionResolverTests {
+	@Test func columnOfWholeWordSymbol() throws {
+		let text = "let username = user.name\n\tlet user = 1\n"
+		#expect(try PositionResolver.column(of: "user", onLine: 1, in: text, filePath: "f.swift") == 16)
+		#expect(try PositionResolver.column(of: "user", onLine: 2, in: text, filePath: "f.swift") == 6)
+		#expect(throws: ToolInputError.self) { try PositionResolver.column(of: "missing", onLine: 1, in: text, filePath: "f.swift") }
+		#expect(throws: ToolInputError.self) { try PositionResolver.column(of: "user", onLine: 9, in: text, filePath: "f.swift") }
+	}
+
+	@Test func wordAtColumn() {
+		let text = "foo.createUser(name: x)"
+		#expect(PositionResolver.word(at: 8, onLine: 1, in: text) == "createUser")
+		#expect(PositionResolver.word(at: 15, onLine: 1, in: text) == "createUser")  // just past the end
+		#expect(PositionResolver.word(at: 4, onLine: 1, in: text) == "foo")
+	}
+
+	@Test func kindFromHover() {
+		#expect(PositionResolver.kind(fromHover: "```swift\npublic struct User: Sendable\n```") == SymbolKind.structure)
+		#expect(PositionResolver.kind(fromHover: "```swift\nfinal class Box\n```") == SymbolKind.class)
+		#expect(PositionResolver.kind(fromHover: "```swift\nclass func make() -> Box\n```") == SymbolKind.function)
+		#expect(PositionResolver.kind(fromHover: "```swift\n@MainActor func run()\n```") == SymbolKind.function)
+		#expect(PositionResolver.kind(fromHover: "```swift\ntypealias Id = UUID\n```") == 26)
+		#expect(PositionResolver.kind(fromHover: "```swift\nprotocol Store\n```") == SymbolKind.protocol)
+		#expect(PositionResolver.kind(fromHover: "not a declaration") == nil)
+	}
+}
+
+@Suite struct ProjectDiscoveryTests {
+	@Test func findsNestedPackageAndRefusesPlainFolder() throws {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("codenav-nested-\(UUID())")
+		let package = root.appendingPathComponent("src/App")
+		try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+		try "// swift-tools-version: 5.9".write(to: package.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+		defer { try? FileManager.default.removeItem(at: root) }
+		#expect(ProjectKind.detect(in: root) == .none)
+		#expect(ProjectKind.nestedProjects(in: root).map(\.directory) == ["src/App"])
+		#expect(ProjectKind.none.advice(in: root)?.contains("src/App") == true)
 	}
 }

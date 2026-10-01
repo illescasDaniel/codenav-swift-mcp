@@ -90,3 +90,73 @@ import Testing
 		#expect(value["b"]?.stringValue == "x")
 	}
 }
+
+@Suite struct PathsTests {
+	@Test func realPathKeepsPrivatePrefix() {
+		let tmp = URL(fileURLWithPath: "/tmp").realPath.path
+		#expect(tmp == "/private/tmp")
+	}
+
+	@Test func realPathOfParsedFileURLIsADirectory() {
+		let url = URL(string: "file:///tmp")!.realPath
+		#expect(url.hasDirectoryPath)
+		#expect(URL(fileURLWithPath: "x.swift", relativeTo: url).path == "/private/tmp/x.swift")
+	}
+
+	@Test func relativePathAcceptsEitherSpelling() {
+		let root = URL(fileURLWithPath: "/tmp/ws")
+		#expect(relativePath("/private/tmp/ws/Sources/A.swift", in: root) == "Sources/A.swift")
+		#expect(relativePath("/tmp/ws/Sources/A.swift", in: root) == "Sources/A.swift")
+		#expect(relativePath("/elsewhere/A.swift", in: root) == nil)
+	}
+
+	@Test func siblingPackagesShowAsRelative() {
+		let root = URL(fileURLWithPath: "/Users/dev/repo/src/Planes")
+		#expect(displayPathOutside("/Users/dev/repo/src/Octopus/Sources/X.swift", root: root) == "../Octopus/Sources/X.swift")
+		#expect(displayPathOutside("/opt/other/X.swift", root: root) == "/opt/other/X.swift")
+	}
+}
+
+@Suite struct SelectorFallbackTests {
+	@Test func nonProjectBaseDefersToClientRoots() {
+		let selector = WorkspaceSelector(
+			explicitEnv: "CODENAV_TEST_UNSET", environment: [:], currentDirectory: URL(fileURLWithPath: "/tmp")
+		)
+		let project = URL(fileURLWithPath: "/tmp/codenav-fixture-project").realPath
+		let selection = selector.select(clientRootURIs: ["file:///tmp/codenav-fixture-project"], isProject: { $0 == project })
+		#expect(selection.root == project)
+		#expect(selection.source == WorkspaceSelector.rootsBecauseNoProjectSource)
+	}
+
+	@Test func pinnedWorkspaceIgnoresRoots() {
+		let selector = WorkspaceSelector(
+			explicitEnv: "PIN", environment: ["PIN": "/tmp"], currentDirectory: URL(fileURLWithPath: "/")
+		)
+		#expect(selector.select(clientRootURIs: ["file:///usr"]).source == "PIN")
+	}
+}
+
+@Suite struct RankingExtraTests {
+	@Test func dependenciesRankAfterProjectAndTests() {
+		let symbols = [
+			WorkspaceSymbol(name: "Client", kind: 5, uri: "file:///w/.build/checkouts/Dep/Sources/Client.swift"),
+			WorkspaceSymbol(name: "Client", kind: 5, uri: "file:///w/Tests/ClientTests/Client.swift"),
+			WorkspaceSymbol(name: "Client", kind: 5, uri: "file:///w/Sources/Client.swift"),
+		]
+		let uris = rankWorkspaceSymbols(symbols, query: "Client").map(\.location.uri)
+		#expect(uris == [
+			"file:///w/Sources/Client.swift", "file:///w/Tests/ClientTests/Client.swift",
+			"file:///w/.build/checkouts/Dep/Sources/Client.swift",
+		])
+	}
+
+	@Test func fuzzyOnlyHitsAreLabelledAndShortestFirst() {
+		let symbols = [
+			WorkspaceSymbol(name: "XxQxxxxLongName", kind: 5, uri: "file:///w/A.swift"),
+			WorkspaceSymbol(name: "XQ", kind: 5, uri: "file:///w/B.swift"),
+		]
+		let listing = formatWorkspaceSymbols(symbols, workspaceRoot: URL(fileURLWithPath: "/w"), query: "xq9", fuzzy: false)
+		#expect(listing.contains("closest fuzzy matches"))
+		#expect(listing.range(of: "XQ")!.lowerBound < listing.range(of: "XxQxxxxLongName")!.lowerBound)
+	}
+}
