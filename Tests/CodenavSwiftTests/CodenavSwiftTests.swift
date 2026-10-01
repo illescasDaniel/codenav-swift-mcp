@@ -221,6 +221,26 @@ struct IntegrationTests {
 	}
 }
 
+@Suite struct ReexportTests {
+	@Test func appImportingAReexportingModuleStillSeesTheDeclaration() throws {
+		let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("reexport-\(UUID().uuidString)")
+		defer { try? FileManager.default.removeItem(at: dir) }
+		let wrapper = dir.appendingPathComponent("Wrapper/Sources/Wrapper")
+		try FileManager.default.createDirectory(at: wrapper, withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: dir.appendingPathComponent("App"), withIntermediateDirectories: true)
+		try "@_exported import Lib\n".write(to: wrapper.appendingPathComponent("Lib.swift"), atomically: true, encoding: .utf8)
+		try "import Wrapper\nrun()\n".write(to: dir.appendingPathComponent("App/a.swift"), atomically: true, encoding: .utf8)
+		try "run()\n".write(to: dir.appendingPathComponent("App/b.swift"), atomically: true, encoding: .utf8)
+		let reexporters = PositionResolver.reexportingModules(of: "Lib", under: [dir])
+		#expect(reexporters == ["Wrapper"])
+		let direct = PositionResolver.occurrences(of: "run", under: [dir], limit: 10, requiringImport: "Lib").hits
+		#expect(direct.isEmpty)
+		let viaWrapper = PositionResolver.occurrences(
+			of: "run", under: [dir], limit: 10, requiringImport: "Lib", reexportedVia: reexporters).hits
+		#expect(viaWrapper.map { ($0.path as NSString).lastPathComponent } == ["a.swift"])
+	}
+}
+
 @Suite struct ObjectiveCAliasTests {
 	@Test func swiftNameFromDeclarationLine() {
 		#expect(PositionResolver.swiftName(declaredOn: "\tpublic func increment(by amount: Int) {", word: "increment") == "increment(by:)")
@@ -270,6 +290,39 @@ struct IntegrationTests {
 		try "".write(
 			to: derived.appendingPathComponent("Build/Intermediates.noindex/App/App.SwiftFileList"), atomically: true, encoding: .utf8)
 		#expect(ProjectKind.buildSettingsProblems(in: root).isEmpty)
+	}
+
+	@Test func localPackageOutsideTheBuildServerDirectoryIsReported() throws {
+		let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("outside-\(UUID().uuidString)")
+		defer { try? FileManager.default.removeItem(at: base) }
+		let app = base.appendingPathComponent("src/App")
+		let package = base.appendingPathComponent("src/Lib")
+		try FileManager.default.createDirectory(at: app.appendingPathComponent("App.xcodeproj"), withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+		try """
+			/* Begin XCLocalSwiftPackageReference section */
+			\t\tABC /* XCLocalSwiftPackageReference "../lib" */ = {
+			\t\t\tisa = XCLocalSwiftPackageReference;
+			\t\t\trelativePath = ../Lib;
+			\t\t};
+			""".write(to: app.appendingPathComponent("App.xcodeproj/project.pbxproj"), atomically: true, encoding: .utf8)
+		let derived = base.appendingPathComponent("derived")
+		try FileManager.default.createDirectory(at: derived.appendingPathComponent("Index.noindex/DataStore"), withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: derived.appendingPathComponent("Build/Intermediates.noindex/App"), withIntermediateDirectories: true)
+		try "".write(to: derived.appendingPathComponent("Build/Intermediates.noindex/App/App.SwiftFileList"), atomically: true, encoding: .utf8)
+		try "{\"build_root\": \"\(derived.path)\", \"scheme\": \"AppScheme\"}".write(
+			to: app.appendingPathComponent("buildServer.json"), atomically: true, encoding: .utf8)
+		let problems = ProjectKind.buildSettingsProblems(in: app)
+		#expect(problems.count == 1)
+		#expect(problems[0].contains("Lib"))
+		#expect(problems[0].contains("-project App/App.xcodeproj -scheme AppScheme"))
+		#expect(problems[0].contains(base.realPath.appendingPathComponent("src").path))
+	}
+
+	@Test func maintenanceTipMentionsRestartAndReconfigure() {
+		#expect(SwiftNavigator.maintenanceTip.contains("restart the MCP client"))
+		#expect(SwiftNavigator.maintenanceTip.contains("xcode-build-server config"))
+		#expect(ToolCatalog.tools.first { $0.name == "workspace" }?.description.contains("xcode-build-server config") == true)
 	}
 
 	@Test func swiftPackagesAndForeignConfigsAreNotChecked() throws {

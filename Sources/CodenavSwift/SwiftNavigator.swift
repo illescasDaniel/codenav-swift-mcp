@@ -471,6 +471,12 @@ public actor SwiftNavigator {
 
 	// MARK: - Tools
 
+	/// Shown by `workspace` for Xcode projects: what to redo when something outside the MCP changes.
+	static let maintenanceTip =
+		"tip: restart the MCP client after rebuilding codenav-swift-mcp itself (`swift build -c release`): tools load once per session. "
+		+ "Re-run `xcode-build-server config -project|-workspace <name> -scheme <Scheme>` after a scheme or project layout change "
+		+ "(new scheme, moved project, new local package) and build the scheme once in Xcode so the index store stays current."
+
 	public func workspace() async -> ToolResult {
 		await run {
 			await useWorkspace()
@@ -486,6 +492,7 @@ public actor SwiftNavigator {
 			if projectKind == .buildServer {
 				lines.append(setupProblems.isEmpty ? "build settings: ok (buildServer.json, build root with a Swift compilation and an index store)" : "build settings: PROBLEMS")
 				lines += setupProblems.map { "  - \($0)" }
+				lines.append(Self.maintenanceTip)
 			}
 			if let command = try? commandOverride ?? SourceKitLSPLocator.command(environment: environment) {
 				lines.append("language server: \(command.joined(separator: " "))")

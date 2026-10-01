@@ -133,6 +133,47 @@ public enum ProjectKind: Equatable, Sendable {
 	/// root it points at is gone, never compiled any Swift (a relink-only build records nothing), has no index
 	/// store, or predates the project's last change. Empty when it looks healthy or the project isn't one.
 	public static func buildSettingsProblems(in root: URL) -> [String] {
+		outsidePackageProblems(in: root) + buildRootProblems(in: root)
+	}
+
+	/// xcode-build-server only advertises the directory holding `buildServer.json` as its source tree, so
+	/// sourcekit-lsp gets no build settings for a local package that lives outside it (hover, definition and
+	/// references on its declarations come back empty, although the app's own files resolve into it).
+	private static func outsidePackageProblems(in root: URL) -> [String] {
+		guard !FileManager.default.fileExists(atPath: root.appendingPathComponent("Package.swift").path),
+			let data = try? Data(contentsOf: root.appendingPathComponent("buildServer.json")),
+			let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+			json["build_root"] is String
+		else { return [] }
+		let outside = localPackageFolders(in: root)
+		guard !outside.isEmpty else { return [] }
+		var ancestor = root.realPath.pathComponents
+		for package in outside {
+			let components = package.pathComponents
+			var common = 0
+			while common < min(ancestor.count, components.count), ancestor[common] == components[common] { common += 1 }
+			ancestor = Array(ancestor[..<common])
+		}
+		let ancestorURL = URL(fileURLWithPath: NSString.path(withComponents: ancestor), isDirectory: true)
+		let entries = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).sorted()
+		let flag = entries.contains { $0.hasSuffix(".xcworkspace") } ? "-workspace" : "-project"
+		let name = entries.first { $0.hasSuffix(".xcworkspace") } ?? entries.first { $0.hasSuffix(".xcodeproj") } ?? "<name>"
+		func below(_ path: String) -> String {
+			let base = ancestorURL.path.hasSuffix("/") ? ancestorURL.path : ancestorURL.path + "/"
+			return path.hasPrefix(base) ? String(path.dropFirst(base.count)) : path
+		}
+		let projectPath = root.realPath.path == ancestorURL.path ? name : below(root.realPath.path) + "/" + name
+		let scheme = (json["scheme"] as? String) ?? "<Scheme>"
+		let names = outside.map { below($0.path) }
+		return [
+			"local package(s) \(names.joined(separator: ", ")) are outside \(root.path), the directory holding buildServer.json, "
+				+ "so sourcekit-lsp has no build settings for their files (hover, definition and references there come back empty). "
+				+ "Move the build server up to a directory that contains them: `cd \(ancestorURL.path) && xcode-build-server config \(flag) \(projectPath) -scheme \(scheme)`, "
+				+ "delete \(root.path)/buildServer.json, and set CODENAV_SWIFT_WORKSPACE (or the MCP client's root) to \(ancestorURL.path)."
+		]
+	}
+
+	private static func buildRootProblems(in root: URL) -> [String] {
 		let fileManager = FileManager.default
 		let configURL = root.appendingPathComponent("buildServer.json")
 		guard !fileManager.fileExists(atPath: root.appendingPathComponent("Package.swift").path),

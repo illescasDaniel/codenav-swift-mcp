@@ -112,7 +112,7 @@ enum PositionResolver {
 	/// language server which hits really are the symbol", for names the index can't answer for.
 	static func occurrences(
 		of name: String, under roots: [URL], limit: Int, perFile: Bool = false, fileLimit: Int = 4000,
-		includeClang: Bool = false, requiringImport module: String? = nil
+		includeClang: Bool = false, requiringImport module: String? = nil, reexportedVia reexporters: Set<String> = []
 	) -> (hits: [Occurrence], truncated: Bool) {
 		guard name.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil,
 			let pattern = identifierPattern(name)
@@ -136,7 +136,9 @@ enum PositionResolver {
 				guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8), text.contains(name)
 				else { continue }
 				// A Swift file can only use a declaration from another module if it imports that module.
-				if let module, isSwift, !url.path.contains("/Sources/\(module)/"), !importsModule(text, module) { continue }
+				if let module, isSwift, !(([module] + reexporters).contains { url.path.contains("/Sources/\($0)/") || importsModule(text, $0) }) {
+					continue
+				}
 				for (offset, line) in sourceLines(text).enumerated() {
 					let trimmed = line.trimmingCharacters(in: .whitespaces)
 					if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ")
@@ -155,6 +157,47 @@ enum PositionResolver {
 			}
 		}
 		return (found, false)
+	}
+
+	/// Modules that make `module` visible to whoever imports them (`@_exported import module`), transitively:
+	/// an app that only imports `Octopus` still uses `DIC` types when Octopus re-exports DIC.
+	static func reexportingModules(of module: String, under roots: [URL], fileLimit: Int = 4000) -> Set<String> {
+		guard let pattern = try? NSRegularExpression(
+			pattern: #"(?m)^\s*@_exported\s+(?:@\w+\s+)*import\s+(?:(?:struct|class|enum|protocol|func|var|let|typealias)\s+)?([A-Za-z_][A-Za-z0-9_]*)"#)
+		else { return [] }
+		var exports: [String: Set<String>] = [:]  // re-exporting module -> modules it re-exports
+		var visited = 0
+		for root in roots {
+			guard let enumerator = FileManager.default.enumerator(
+				at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+			else { continue }
+			for case let url as URL in enumerator {
+				if Exclude.directoryNames.contains(url.lastPathComponent) {
+					enumerator.skipDescendants()
+					continue
+				}
+				guard url.lastPathComponent.hasSuffix(".swift"), let owner = moduleName(ofPath: url.path) else { continue }
+				visited += 1
+				if visited > fileLimit { break }
+				guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8),
+					text.contains("@_exported")
+				else { continue }
+				for match in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+					if let range = Range(match.range(at: 1), in: text) { exports[owner, default: []].insert(String(text[range])) }
+				}
+			}
+		}
+		var reaching: Set<String> = [module]
+		var grew = true
+		while grew {
+			grew = false
+			for (owner, exported) in exports where !reaching.contains(owner) && !exported.isDisjoint(with: reaching) {
+				reaching.insert(owner)
+				grew = true
+			}
+		}
+		reaching.remove(module)
+		return reaching
 	}
 
 	/// `import M`, `@testable import M`, `import struct M.Type` (not a mention in a comment or string).

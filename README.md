@@ -40,6 +40,13 @@ or absolute. Failures (bad input, ambiguous or unknown names, server errors) are
 
   Also build the project once in Xcode so the index store exists.
 
+  Put `buildServer.json` in a directory that **contains every local package** the project uses
+  (`XCLocalSwiftPackageReference`), e.g. the repository root for `src/App/App.xcodeproj` plus `src/Lib`:
+  `xcode-build-server config -project src/App/App.xcodeproj -scheme App` run from the root. xcode-build-server only
+  serves files below the directory that holds `buildServer.json`; for a package outside it, sourcekit-lsp has no build
+  settings and hover, definition and references on its declarations come back empty. `workspace` flags this and prints
+  the command to run.
+
 ## Build and register
 
 ```bash
@@ -51,6 +58,14 @@ The workspace is chosen from `CODENAV_SWIFT_WORKSPACE`, then the MCP client's ro
 then `CLAUDE_PROJECT_DIR`, then the current directory. When that directory is not a Swift project (a host
 that launches servers in `$HOME`), the client's roots are used; if no Swift project can be found the tools say
 so and list projects found below the directory instead of indexing the wrong tree.
+
+## Keeping it working
+
+* **Restart the MCP client** (Claude Code, etc.) after rebuilding `codenav-swift-mcp` itself with `swift build -c release`:
+  the client launches the binary once per session and only loads tools at startup.
+* **Re-run `xcode-build-server config -project|-workspace <name> -scheme <Scheme>`** after a scheme or project layout change
+  (a new scheme, a moved project, a new local package), then build the scheme once in Xcode so the index store is current.
+  The `workspace` tool repeats this tip and reports when `buildServer.json` or its build root has gone stale.
 
 ## Environment
 
@@ -103,8 +118,9 @@ findings are appended to empty results and to `diagnostics` output, and posted o
 
 ## Scan details
 
-- A Swift file is only scanned for a dependency's symbol if it imports that module (or lives in the module's own
-  `Sources/<Target>/`), which skips most candidates in large projects. The module is taken from the `Sources/<Target>/` directory, so a package without that layout isn't prefiltered.
+- A Swift file is only scanned for a dependency's symbol if it imports that module, or a module that re-exports it with
+  `@_exported import` (an app importing only `Octopus`, which re-exports `DIC`, still uses DIC types), or lives in the
+  module's own `Sources/<Target>/`, which skips most candidates in large projects. The module is taken from the `Sources/<Target>/` directory, so a package without that layout isn't prefiltered.
 - Names the language server can't resolve in a file (the file isn't part of any build target, e.g. a dependency's tests)
   are listed separately under `Unverified` in `references` and `symbol_info`, never mixed into the verified list.
 - For Swift methods called from Objective-C the scan searches the `@objc(selector:)` name when there is one, else the

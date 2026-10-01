@@ -110,7 +110,7 @@ public enum ToolCatalog {
 		ToolSpec(
 			name: "workspace",
 			description:
-				"Which directory is codenav navigating, and why? Also reports the project kind (SwiftPM / Xcode) and index state. Use when results look like they come from the wrong checkout/worktree.",
+				"Which directory is codenav navigating, and why? Also reports the project kind (SwiftPM / Xcode) and index state. Use when results look like they come from the wrong checkout/worktree, or empty. For Xcode projects it also checks buildServer.json health and says when to restart the MCP client (after rebuilding this server) or re-run `xcode-build-server config` (after a scheme/project layout change).",
 			parameters: []),
 		ToolSpec(
 			name: "hover",

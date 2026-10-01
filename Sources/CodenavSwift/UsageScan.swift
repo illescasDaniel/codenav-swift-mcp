@@ -27,10 +27,11 @@ struct UsageScan {
 		// Objective-C and C sources are scanned too: they can use a Swift declaration (spelled `aliases`).
 		var candidates: [PositionResolver.Occurrence] = []
 		var truncated = false
+		let reexporters = module.map { PositionResolver.reexportingModules(of: $0, under: roots) } ?? []
 		for spelling in [name] + aliases {
 			let found = PositionResolver.occurrences(
 				of: spelling, under: roots, limit: maxCandidates - candidates.count, includeClang: true,
-				requiringImport: module)
+				requiringImport: module, reexportedVia: reexporters)
 			candidates += found.hits
 			truncated = truncated || found.truncated
 			if candidates.count >= maxCandidates { truncated = true; break }
