@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3
 
 * `--version` and `--help` print and exit instead of waiting for MCP input on stdin.
 

@@ -3,7 +3,7 @@ import Foundation
 import MCP
 import NavShared
 
-let serverVersion = "0.1.2"
+let serverVersion = "0.1.3"
 
 // A stdio server has no other command line; answer the usual flags instead of waiting for MCP input.
 let commandLineArguments = CommandLine.arguments.dropFirst()
