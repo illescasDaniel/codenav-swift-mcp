@@ -135,7 +135,19 @@ or unknown names, server errors) are returned with MCP `isError` set.
 
 ## Installation
 
-Build the server once:
+### Homebrew (recommended)
+
+```bash
+brew install illescasDaniel/tap/codenav-swift-mcp
+```
+
+This installs a prebuilt binary (arm64 or Intel, picked automatically) with no compiler
+needed, and puts `codenav-swift-mcp` on your `PATH`. Update it with `brew upgrade codenav-swift-mcp`. The binaries are
+the same ones attached to each [GitHub release](https://github.com/illescasDaniel/codenav-swift-mcp/releases).
+
+### Build from source
+
+Needs Swift 6.2 or newer (Xcode 26+). Build the server once:
 
 ```bash
 git clone https://github.com/illescasDaniel/codenav-swift-mcp.git
@@ -148,12 +160,16 @@ cd codenav-swift-mcp && swift build -c release
 The binary is `.build/release/codenav-swift-mcp`. Keep that absolute path handy for the client configuration below.
 `pwd` inside the clone prints the directory to put in front of it.
 
+The examples below use `codenav-swift-mcp`, which works after a Homebrew install. For a source build, replace it with
+the absolute path to the binary. Apps that don't inherit your shell's `PATH` (Cursor, for example) need the absolute
+path either way: `$(brew --prefix)/bin/codenav-swift-mcp`, typically `/opt/homebrew/bin/codenav-swift-mcp`.
+
 ### Claude Code
 
 Register it for every project (`--scope user`):
 
 ```bash
-claude mcp add codenav-swift --scope user -- /absolute/path/to/codenav-swift-mcp/.build/release/codenav-swift-mcp
+claude mcp add codenav-swift --scope user -- codenav-swift-mcp
 ```
 
 Claude Code starts the server in your project directory and also sets `CLAUDE_PROJECT_DIR`, so no further
@@ -165,7 +181,7 @@ To share the server with a team through the repository instead, add it to the pr
 {
   "mcpServers": {
     "codenav-swift": {
-      "command": "/absolute/path/to/codenav-swift-mcp/.build/release/codenav-swift-mcp"
+      "command": "codenav-swift-mcp"
     }
   }
 }
@@ -179,7 +195,7 @@ Add the server to `~/.cursor/mcp.json` (all projects) or to `.cursor/mcp.json` i
 {
   "mcpServers": {
     "codenav-swift": {
-      "command": "/absolute/path/to/codenav-swift-mcp/.build/release/codenav-swift-mcp",
+      "command": "/opt/homebrew/bin/codenav-swift-mcp",
       "env": {
         "CODENAV_SWIFT_WORKSPACE": "${workspaceFolder}"
       }
