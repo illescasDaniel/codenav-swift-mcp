@@ -292,6 +292,40 @@ struct IntegrationTests {
 		#expect(ProjectKind.buildSettingsProblems(in: root).isEmpty)
 	}
 
+	@Test func newestBuildLogWithoutSwiftCompilationIsReported() throws {
+		let derived = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("derived-\(UUID().uuidString)")
+		let root = try project(buildRoot: derived.path)
+		defer {
+			try? FileManager.default.removeItem(at: root)
+			try? FileManager.default.removeItem(at: derived)
+		}
+		let fileManager = FileManager.default
+		try fileManager.createDirectory(at: derived.appendingPathComponent("Index.noindex/DataStore"), withIntermediateDirectories: true)
+		try fileManager.createDirectory(at: derived.appendingPathComponent("Build/Intermediates.noindex/App"), withIntermediateDirectories: true)
+		try "".write(to: derived.appendingPathComponent("Build/Intermediates.noindex/App/App.SwiftFileList"), atomically: true, encoding: .utf8)
+		let logs = derived.appendingPathComponent("Logs/Build")
+		try fileManager.createDirectory(at: logs, withIntermediateDirectories: true)
+		func writeLog(_ name: String, _ text: String, age: TimeInterval) throws {
+			let plain = logs.appendingPathComponent(name + ".txt")
+			try text.write(to: plain, atomically: true, encoding: .utf8)
+			let gzip = Process()
+			gzip.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+			gzip.arguments = ["-f", plain.path]
+			try gzip.run()
+			gzip.waitUntilExit()
+			let target = logs.appendingPathComponent(name + ".xcactivitylog")
+			try? fileManager.removeItem(at: target)
+			try fileManager.moveItem(at: plain.appendingPathExtension("gz"), to: target)
+			try fileManager.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: target.path)
+		}
+		try writeLog("full", "SwiftDriver App normal arm64 -module-name App", age: -10)
+		#expect(ProjectKind.buildSettingsProblems(in: root).isEmpty)
+		try writeLog("relink", "Ld App.app/App normal arm64", age: -20)
+		let problems = ProjectKind.buildSettingsProblems(in: root)
+		#expect(problems.count == 1)
+		#expect(problems[0].contains("most recent build log"))
+	}
+
 	@Test func localPackageOutsideTheBuildServerDirectoryIsReported() throws {
 		let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("outside-\(UUID().uuidString)")
 		defer { try? FileManager.default.removeItem(at: base) }

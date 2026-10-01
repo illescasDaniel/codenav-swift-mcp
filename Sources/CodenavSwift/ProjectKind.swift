@@ -196,12 +196,50 @@ public enum ProjectKind: Equatable, Sendable {
 			problems.append("no Swift compilation was recorded in the build root, so files get fallback arguments (bogus \"No such module\" errors). A relink-only build leaves nothing: run a full build. " + regenerate)
 		}
 		let logs = buildRoot + "/Logs/Build"
-		let lastBuild = ((try? fileManager.contentsOfDirectory(atPath: logs)) ?? []).filter { $0.hasSuffix(".xcactivitylog") }
-			.compactMap { (try? fileManager.attributesOfItem(atPath: logs + "/" + $0))?[.modificationDate] as? Date }.max()
+		let logDates = ((try? fileManager.contentsOfDirectory(atPath: logs)) ?? []).filter { $0.hasSuffix(".xcactivitylog") }
+			.compactMap { name -> (path: String, date: Date)? in
+				(try? fileManager.attributesOfItem(atPath: logs + "/" + name))?[.modificationDate].flatMap { $0 as? Date }
+					.map { (logs + "/" + name, $0) }
+			}
+		let newestLog = logDates.max { $0.date < $1.date }
+		let lastBuild = newestLog?.date
+		// xcode-build-server derives compile arguments from the newest build log, so a later build that only relinked
+		// (or was up to date) leaves Swift files with fallback arguments although earlier builds compiled them.
+		if let newestLog, !logRecordsSwiftCompilation(atPath: newestLog.path) {
+			problems.append("the most recent build log has no Swift compilation (the last build only relinked, was up to date, or failed before compiling), so files get fallback arguments (bogus \"No such module\" errors). Touch a Swift file or run `xcodebuild clean build`, then regenerate with `xcode-build-server config -project|-workspace <name> -scheme <Scheme>`.")
+		}
 		if let lastBuild, let project = projectModificationDate(in: root), project > lastBuild.addingTimeInterval(1) {
 			problems.append("the project file changed after the last build (files or targets may have been added since). Rebuild so the build settings cover them.")
 		}
 		return problems
+	}
+
+	/// Whether a gzip-compressed `.xcactivitylog` mentions a Swift compile step. Unreadable logs count as yes so a
+	/// format change can't produce a false alarm.
+	private static func logRecordsSwiftCompilation(atPath path: String) -> Bool {
+		let process = Process()
+		process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+		process.arguments = ["-dc", path]
+		let pipe = Pipe()
+		process.standardOutput = pipe
+		process.standardError = FileHandle.nullDevice
+		guard (try? process.run()) != nil else { return true }
+		let markers = ["SwiftDriver", "SwiftCompile", "-module-name"].map { Data($0.utf8) }
+		let overlap = markers.map(\.count).max() ?? 0
+		var found = false
+		var tail = Data()
+		var sawOutput = false
+		while true {
+			let chunk = pipe.fileHandleForReading.readData(ofLength: 1 << 20)
+			if chunk.isEmpty { break }
+			sawOutput = true
+			if found { continue }  // keep draining so gzip can exit
+			let window = tail + chunk
+			if markers.contains(where: { window.range(of: $0) != nil }) { found = true }
+			tail = window.suffix(overlap)
+		}
+		process.waitUntilExit()
+		return found || !sawOutput
 	}
 
 	private static func hasSwiftCompilation(under directory: String) -> Bool {
