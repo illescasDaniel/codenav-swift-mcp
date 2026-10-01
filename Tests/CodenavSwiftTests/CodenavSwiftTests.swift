@@ -141,3 +141,36 @@ struct IntegrationTests {
 		#expect(ProjectKind.localPackageFolders(in: app).count == 1)  // de-duplicated
 	}
 }
+
+@Suite struct UsageScanTests {
+	@Test func occurrencesAreWholeWordAndSkipCommentsAndImports() throws {
+		let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("scan-\(UUID().uuidString)")
+		try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: dir) }
+		try "import Foo\n// Foo here\nlet a = Foo()\nlet b = FooBar()\nFoo.run()\n"
+			.write(to: dir.appendingPathComponent("a.swift"), atomically: true, encoding: .utf8)
+		let (hits, truncated) = PositionResolver.occurrences(of: "Foo", under: [dir], limit: 10)
+		#expect(!truncated)
+		#expect(hits.map(\.line) == [3, 5])
+	}
+
+	@Test func enclosingFindsCallableAndTypeHeader() {
+		let method = SymbolNode(name: "run()", kind: 6, startLine: 4, endLine: 6, selectionLine: 4, selectionColumn: 6, children: [])
+		let type = SymbolNode(name: "Box", kind: 23, startLine: 2, endLine: 8, selectionLine: 2, selectionColumn: 7, children: [method])
+		#expect(UsageScan.enclosing(line: 6, in: [type])?.name == "Box.run()")
+		let header = UsageScan.enclosing(line: 3, in: [type])
+		#expect(header?.name == "Box")
+		#expect(header?.isHeader == true)
+	}
+
+	@Test func dependencySpellingExpandsAgainstCandidates() throws {
+		let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("deps-\(UUID().uuidString)")
+		let file = dir.appendingPathComponent("Pkg/Sources/A.swift")
+		try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+		try "".write(to: file, atomically: true, encoding: .utf8)
+		defer { try? FileManager.default.removeItem(at: dir) }
+		#expect(DependencyRoots.expand("<dependency> Pkg/Sources/A.swift", extra: [dir.path]) == file.path)
+		#expect(DependencyRoots.expand("<dependency> Pkg/Missing.swift", extra: [dir.path]) == "<dependency> Pkg/Missing.swift")
+		#expect(DependencyRoots.expand("plain.swift") == "plain.swift")
+	}
+}

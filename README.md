@@ -60,6 +60,7 @@ so and list projects found below the directory instead of indexing the wrong tre
 | `CODENAV_SWIFT_LSP_ARGS` | Extra arguments for it |
 | `CODENAV_SWIFT_INDEX_TIMEOUT` | Seconds to wait for background indexing (a notice is appended if it's still running) |
 | `CODENAV_SWIFT_REQUEST_TIMEOUT` | Seconds an individual language-server request may take (default 60) |
+| `CODENAV_SWIFT_LOCAL_PACKAGE_FOLDERS` | `1` registers local sibling packages as extra language-server workspace folders. Off by default: sourcekit-lsp then builds and indexes each package on its own (slow, large `.build`). |
 
 ## Notes
 
@@ -74,3 +75,12 @@ swift test
 ```
 
 The integration test runs a real sourcekit-lsp against `Fixtures/SamplePackage` and is skipped if none is installed.
+
+## Cross-package and dependency symbols
+
+The index is thin for declarations in a sibling package or a dependency checkout. For those, `references`,
+`symbol_info`, `callers` and `implementations` complete the answer with a *scan + verify* pass: every whole-word
+occurrence of the name in the project and its local packages is checked with the server's `definition`, and only
+those leading back to the declaration are kept. Conformances written as `extension Dep.Type: Proto` are found
+the same way (marked `unverified` when the server can't resolve the name in that file). Results over 600 candidates
+are truncated with a note. `<dependency> Pkg/...` paths shown in results are accepted as `file_path`.

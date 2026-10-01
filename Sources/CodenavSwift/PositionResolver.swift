@@ -35,6 +35,11 @@ enum PositionResolver {
 		return found.location + 1
 	}
 
+	/// `create(name:)` -> `create`; names with no labels are returned unchanged.
+	static func baseName(of name: String) -> String {
+		name.split(separator: "(").first.map(String.init) ?? name
+	}
+
 	/// The identifier touching 1-indexed UTF-16 `column` on `line`.
 	static func word(at column: Int, onLine line: Int, in text: String) -> String? {
 		let lines = sourceLines(text)
@@ -94,46 +99,63 @@ enum PositionResolver {
 		return nil
 	}
 
-	/// First line of `.swift` source under `root` where `name` appears as a whole word, skipping
-	/// comment lines: how a name `workspace/symbol` can't see (an SDK or third-party type, whose
-	/// declaration isn't in the index) is located through its use in the project.
-	static func findUsages(of name: String, under root: URL, limit: Int = 1, fileLimit: Int = 4000) -> [(path: String, line: Int, column: Int)] {
+	struct Occurrence: Sendable, Hashable {
+		var path: String
+		/// 1-indexed line and UTF-16 column.
+		var line: Int
+		var column: Int
+	}
+
+	/// Whole-word occurrences of `name` in `.swift` files under `roots`, skipping comment and `import`
+	/// lines. `perFile` keeps only the first one per file (enough to locate a name; not to list uses).
+	/// Stops at `limit`; `truncated` says there was more. This is the text side of "scan, then ask the
+	/// language server which hits really are the symbol", for names the index can't answer for.
+	static func occurrences(
+		of name: String, under roots: [URL], limit: Int, perFile: Bool = false, fileLimit: Int = 4000
+	) -> (hits: [Occurrence], truncated: Bool) {
 		guard name.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil,
-			let pattern = identifierPattern(name),
-			let enumerator = FileManager.default.enumerator(
-				at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
-			)
-		else { return [] }
-		var found: [(path: String, line: Int, column: Int)] = []
+			let pattern = identifierPattern(name)
+		else { return ([], false) }
+		var found: [Occurrence] = []
 		var visited = 0
-		for case let url as URL in enumerator {
-			let last = url.lastPathComponent
-			if Exclude.directoryNames.contains(last) {
-				enumerator.skipDescendants()
-				continue
-			}
-			guard last.hasSuffix(".swift"), !last.hasSuffix(".generated.swift") else { continue }
-			visited += 1
-			if visited > fileLimit { return found }
-			guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8), text.contains(name)
+		for root in roots {
+			guard let enumerator = FileManager.default.enumerator(
+				at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
 			else { continue }
-			for (offset, line) in sourceLines(text).enumerated() {
-				let trimmed = line.trimmingCharacters(in: .whitespaces)
-				if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ") {
+			for case let url as URL in enumerator {
+				let last = url.lastPathComponent
+				if Exclude.directoryNames.contains(last) {
+					enumerator.skipDescendants()
 					continue
 				}
-				let ns = line as NSString
-				if let match = pattern.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
-					found.append((url.path, offset + 1, match.range.location + 1))
-					if found.count >= limit { return found }
-					break  // one hit per file spreads the candidates over files
+				guard last.hasSuffix(".swift"), !last.hasSuffix(".generated.swift") else { continue }
+				visited += 1
+				if visited > fileLimit { return (found, true) }
+				guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8), text.contains(name)
+				else { continue }
+				for (offset, line) in sourceLines(text).enumerated() {
+					let trimmed = line.trimmingCharacters(in: .whitespaces)
+					if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ") {
+						continue
+					}
+					let whole = NSRange(location: 0, length: (line as NSString).length)
+					for match in pattern.matches(in: line, range: whole) {
+						if found.count >= limit { return (found, true) }
+						found.append(Occurrence(path: url.path, line: offset + 1, column: match.range.location + 1))
+						if perFile { break }
+					}
+					if perFile, found.last?.path == url.path { break }
 				}
 			}
 		}
-		return found
+		return (found, false)
 	}
 
-	static func findUsage(of name: String, under root: URL) -> (path: String, line: Int, column: Int)? {
+	static func findUsages(of name: String, under root: URL, limit: Int = 1) -> [Occurrence] {
+		occurrences(of: name, under: [root], limit: limit, perFile: true).hits
+	}
+
+	static func findUsage(of name: String, under root: URL) -> Occurrence? {
 		findUsages(of: name, under: root).first
 	}
 }

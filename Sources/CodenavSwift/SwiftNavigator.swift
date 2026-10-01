@@ -9,6 +9,7 @@ public actor SwiftNavigator {
 
 	public static let workspaceEnvironmentKey = "CODENAV_SWIFT_WORKSPACE"
 	public static let indexTimeoutEnvironmentKey = "CODENAV_SWIFT_INDEX_TIMEOUT"
+	public static let localPackageFoldersEnvironmentKey = "CODENAV_SWIFT_LOCAL_PACKAGE_FOLDERS"
 	public static let requestTimeoutEnvironmentKey = "CODENAV_SWIFT_REQUEST_TIMEOUT"
 	static let defaultRequestTimeout: TimeInterval = 60
 	static let defaultIndexTimeout: TimeInterval = 30
@@ -108,7 +109,10 @@ public actor SwiftNavigator {
 			configNames: ["buildServer.json", "compile_commands.json", "compile_flags.txt"],
 			environment: nil,
 			requestTimeout: requestTimeout,
-			extraWorkspaceFolders: ProjectKind.localPackageFolders(in: root)
+			// Registering a sibling package makes sourcekit-lsp build and index it on its own (a second,
+			// separate index and a `.build` inside that package), so it is opt-in.
+			extraWorkspaceFolders: environment[Self.localPackageFoldersEnvironmentKey] == "1"
+				? ProjectKind.localPackageFolders(in: root) : []
 		)
 		let task = Task { () -> LSPClient in
 			let newClient = LSPClient(configuration: configuration, onNotice: { notices.post($0) })
@@ -159,10 +163,31 @@ public actor SwiftNavigator {
 		await awaitIndex(client)
 	}
 
-	private func checkSwiftFile(_ filePath: String) throws {
+	/// Validates the extension and turns a displayed `<dependency> Pkg/...` spelling back into a real path.
+	@discardableResult
+	private func checkSwiftFile(_ filePath: String) throws -> String {
 		guard (filePath as NSString).pathExtension.lowercased() == "swift" else {
 			throw ToolInputError("codenav-swift only supports Swift files (.swift), got '\(filePath)'")
 		}
+		return DependencyRoots.expand(filePath, extra: dependencyCheckoutDirectories())
+	}
+
+	/// Where dependency checkouts can live for this workspace, for resolving `<dependency> ...` paths
+	/// before any result has shown one: SwiftPM's `.build/checkouts`, and an Xcode build root's `SourcePackages`.
+	private func dependencyCheckoutDirectories() -> [String] {
+		var directories = [workspaceRoot.appendingPathComponent(".build/checkouts").path]
+		if let data = try? Data(contentsOf: workspaceRoot.appendingPathComponent("buildServer.json")),
+			let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+			let buildRoot = json["build_root"] as? String
+		{
+			directories.append(buildRoot + "/SourcePackages/checkouts")
+		}
+		return directories
+	}
+
+	/// Directories whose sources a text scan covers: the project and its local sibling packages.
+	private var scanRoots: [URL] {
+		[workspaceRoot] + ProjectKind.localPackageFolders(in: workspaceRoot)
 	}
 
 	/// Runs a tool body, turning any failure into text and appending pending notices.
@@ -223,27 +248,70 @@ public actor SwiftNavigator {
 
 	static let maxListedSites = 25
 
-	/// References for the symbol at a position. For a declaration in a sibling package the index often
-	/// reports only the declaration itself, while the same query from a use site is complete: when the
-	/// answer is that thin, retry from a use whose definition leads back to this declaration.
+	private func isOutsideWorkspace(_ uri: String) -> Bool {
+		guard let path = uriToPath(uri) else { return true }
+		return relativePath(path, in: workspaceRoot) == nil
+	}
+
+	/// The declaration the symbol at a position resolves to.
+	private func declaration(_ client: LSPClient, file: String, line: Int, column: Int) async -> LSPLocation? {
+		try? await client.definition(file, line: line, column: column).first
+	}
+
+	/// References for the symbol at a position. The index is complete for what the project itself compiles,
+	/// but thin for a declaration in a sibling package or a dependency checkout (it sometimes reports only the
+	/// declaration). In those cases the answer is completed by scanning the sources for the name and asking
+	/// the server which occurrences resolve to this declaration (`UsageScan`).
 	private func referencesWithUsageFallback(
 		_ client: LSPClient, file: String, line: Int, column: Int, includeDeclaration: Bool = true
 	) async throws -> [LSPLocation] {
 		let direct = try await client.references(file, line: line, column: column, includeDeclaration: includeDeclaration)
-		guard direct.count <= 1, let text = try? readTextFile(URL(fileURLWithPath: file)),
+		guard let text = try? readTextFile(URL(fileURLWithPath: file)),
 			let word = PositionResolver.word(at: column, onLine: line, in: text),
-			let declaration = try await client.definition(file, line: line, column: column).first
+			let origin = await declaration(client, file: file, line: line, column: column),
+			direct.count <= 1 || isOutsideWorkspace(origin.uri)
 		else { return direct }
-		let uses = PositionResolver.findUsages(of: word, under: workspaceRoot, limit: 8)
-		for use in uses where !(use.path == file && use.line == line) {
-			guard let target = try? await client.definition(use.path, line: use.line, column: use.column).first,
-				target.uri == declaration.uri, target.range.start.line == declaration.range.start.line
-			else { continue }
-			let retried = try await client.references(
-				use.path, line: use.line, column: use.column, includeDeclaration: includeDeclaration)
-			if retried.count > direct.count { return retried }
+		let scan = await UsageScan.uses(of: word, declaration: origin, roots: scanRoots, client: client)
+		var merged = direct
+		var seen = Set(direct.map { "\($0.uri)#\($0.range.start.line)#\($0.range.start.character)" })
+		for use in scan.uses {
+			let location = UsageScan.location(use, name: word)
+			guard seen.insert("\(location.uri)#\(location.range.start.line)#\(location.range.start.character)").inserted else { continue }
+			if !includeDeclaration, location.uri == origin.uri, location.range.start.line == origin.range.start.line { continue }
+			merged.append(location)
 		}
-		return direct
+		if scan.truncated {
+			notices.post("'\(word)' occurs in more than \(UsageScan.maxCandidates) places; the text scan stopped early, so references may be incomplete.")
+		}
+		return merged
+	}
+
+	/// Callers found by scan: each use of the name that resolves to the declaration, attributed to the
+	/// function or type that contains it. For callees the call hierarchy can't answer for (dependencies, sibling packages).
+	private func scannedCallers(
+		_ client: LSPClient, name: String, origin: LSPLocation
+	) async -> (text: String, count: Int) {
+		let scan = await UsageScan.uses(of: name, declaration: origin, roots: scanRoots, client: client)
+		struct Key: Hashable { var path: String; var line: Int; var name: String }
+		var grouped: [Key: (kind: Int, sites: [Int])] = [:]
+		var symbolsByFile: [String: [SymbolNode]] = [:]
+		for use in scan.uses {
+			if URL(fileURLWithPath: use.path).absoluteString == origin.uri, use.line - 1 == origin.range.start.line { continue }
+			if symbolsByFile[use.path] == nil {
+				symbolsByFile[use.path] = (try? await client.documentSymbol(use.path)).map(toSymbolTree) ?? []
+			}
+			guard let owner = UsageScan.enclosing(line: use.line, in: symbolsByFile[use.path] ?? []) else { continue }
+			let key = Key(path: use.path, line: owner.line, name: owner.name)
+			grouped[key, default: (owner.kind, [])].sites.append(use.line)
+		}
+		let lines = grouped.sorted { ($0.key.path, $0.key.line) < ($1.key.path, $1.key.line) }.map { key, value in
+			let place = relative(URL(fileURLWithPath: key.path).absoluteString)
+			let sites = Set(value.sites).sorted().map { "L\($0)" }.joined(separator: ", ")
+			return "\(key.name)  [\(SymbolKind.label(value.kind))]  (\(place):\(key.line)) calls at \(sites)"
+		}
+		var text = lines.joined(separator: "\n")
+		if scan.truncated { text += "\n(text scan stopped after \(UsageScan.maxCandidates) candidates; callers may be incomplete)" }
+		return (text, lines.count)
 	}
 
 	/// Locations as text: the project's own first (SDK headers last), capped, with the remainder counted.
@@ -266,13 +334,14 @@ public actor SwiftNavigator {
 		example: String, filePath: String?, line: Int?, column: Int?, symbol: String?
 	) async throws -> Target {
 		if let line, column != nil || symbol != nil {
-			guard let filePath else { throw ToolInputError("Pass `file_path` together with `line` and `column`/`symbol`.") }
-			try checkSwiftFile(filePath)
+			guard let given = filePath else { throw ToolInputError("Pass `file_path` together with `line` and `column`/`symbol`.") }
+			let filePath = try checkSwiftFile(given)
 			return try await resolvePosition(client, filePath: filePath, line: line, column: column, symbol: symbol)
 		}
 		if symbol != nil || column != nil {
 			throw ToolInputError("`column` and `symbol` need `line` and `file_path`: pass the line the identifier is on.")
 		}
+		let filePath = filePath.map { DependencyRoots.expand($0, extra: dependencyCheckoutDirectories()) }
 		var named: KeyValuePairs<String, String?> = ["name": name, "query": query]
 		if !aliases.isEmpty { named = aliases }
 		let wanted = try resolveNameQuery(preferred: "name", example: example, named)
@@ -377,7 +446,7 @@ public actor SwiftNavigator {
 	public func hover(filePath: String, line: Int, column: Int?, symbol: String? = nil) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			try checkSwiftFile(filePath)
+			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			var text = try await client.hover(filePath, line: line, column: column)
@@ -389,7 +458,7 @@ public actor SwiftNavigator {
 	public func definition(filePath: String, line: Int, column: Int?, symbol: String? = nil) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			try checkSwiftFile(filePath)
+			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			let locations = try await client.definition(filePath, line: line, column: column)
@@ -403,7 +472,7 @@ public actor SwiftNavigator {
 	) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			try checkSwiftFile(filePath)
+			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			await awaitIndex(client)
@@ -420,7 +489,7 @@ public actor SwiftNavigator {
 	public func typeAt(filePath: String, line: Int, column: Int?, symbol: String? = nil) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			try checkSwiftFile(filePath)
+			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
 			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
 			let text = try await client.hover(filePath, line: line, column: column)
@@ -481,7 +550,7 @@ public actor SwiftNavigator {
 	public func diagnostics(filePath: String) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			try checkSwiftFile(filePath)
+			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
 			return formatDiagnostics(try await client.diagnostics(filePath))
 		}
@@ -544,7 +613,7 @@ public actor SwiftNavigator {
 	public func outline(filePath: String) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			try checkSwiftFile(filePath)
+			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
 			return formatOutline(try await client.documentSymbol(filePath))
 		}
@@ -563,13 +632,37 @@ public actor SwiftNavigator {
 			let file = try path(of: resolved.uri)
 			await awaitIndex(client)
 			let items = try await client.prepareCallHierarchy(file, line: resolved.line + 1, column: resolved.column + 1)
-			guard let item = items.first else {
-				return "\(resolved.name) has no call hierarchy entry at that position (it may not be a callable)."
+			var calls: [IncomingCall] = []
+			if let item = items.first { calls = try await client.incomingCalls(item) }
+			let prefix = target.note.map { $0 + "\n" } ?? ""
+			if !calls.isEmpty, !isOutsideWorkspace(resolved.uri) {
+				return prefix + formatCallers(calls, workspaceRoot: workspaceRoot)
 			}
-			let calls = try await client.incomingCalls(item)
-			let text = formatCallers(calls, workspaceRoot: workspaceRoot)
-			return (target.note.map { $0 + "\n" } ?? "") + text + (calls.isEmpty ? await emptyResultHint(client) : "")
+			// No call hierarchy (a dependency's method) or nothing from it: find the calls by scanning.
+			let origin = LSPLocation(
+				uri: resolved.uri,
+				range: LSPRange(
+					start: LSPPosition(line: resolved.line, character: resolved.column),
+					end: LSPPosition(line: resolved.line, character: resolved.column)))
+			let scanned = await scannedCallers(client, name: PositionResolver.baseName(of: resolved.name), origin: origin)
+			if scanned.count > 0 {
+				let fromIndex = calls.isEmpty ? "" : formatCallers(calls, workspaceRoot: workspaceRoot) + "\n"
+				return prefix + (calls.isEmpty ? scanned.text : mergeCallerText(fromIndex, scanned.text))
+			}
+			if items.isEmpty {
+				return prefix + "\(resolved.name) has no call hierarchy entry at that position (it may not be a callable), and no calls to it were found in the sources."
+			}
+			return prefix + formatCallers(calls, workspaceRoot: workspaceRoot) + (calls.isEmpty ? await emptyResultHint(client) : "")
 		}
+	}
+
+	/// Index callers followed by scan callers not already listed (matched by caller line).
+	private func mergeCallerText(_ index: String, _ scanned: String) -> String {
+		let known = Set(index.split(separator: "\n").map(String.init))
+		let extra = scanned.split(separator: "\n").map(String.init).filter { line in
+			!known.contains { $0.hasPrefix(line.components(separatedBy: " calls at ").first ?? line) }
+		}
+		return (index.split(separator: "\n").map(String.init) + extra).joined(separator: "\n")
 	}
 
 	/// Types that conform to a protocol / inherit from a class (transitively, through refining
@@ -612,6 +705,7 @@ public actor SwiftNavigator {
 			var text: String
 		}
 		var entries: [Entry] = []
+		var unverifiedNote = ""
 		var seen: Set<String> = []
 		var visited = 0
 		let roots = try await client.prepareTypeHierarchy(file, line: line, column: column)
@@ -637,6 +731,40 @@ public actor SwiftNavigator {
 		}
 
 		let verb = resolved.kind == SymbolKind.protocol ? "conform to or refine" : "inherit from"
+		if resolved.kind == SymbolKind.protocol {
+			// The type hierarchy misses retroactive conformances (`extension Dep.Type: Proto`): the protocol's
+			// name on a type or extension header line that resolves to it is a conformance site too.
+			let known = Set(entries.map(\.text))
+			let origin = LSPLocation(
+				uri: resolved.uri,
+				range: LSPRange(
+					start: LSPPosition(line: resolved.line, character: resolved.column),
+					end: LSPPosition(line: resolved.line, character: resolved.column)))
+			let scan = await UsageScan.uses(of: resolved.name, declaration: origin, roots: scanRoots, client: client)
+			var symbolsByFile: [String: [SymbolNode]] = [:]
+			var added = Set<String>()
+			var unverified = false
+			for (use, verified) in scan.uses.map({ ($0, true) }) + scan.unresolved.map({ ($0, false) }) {
+				if verified, use.path == uriToPath(resolved.uri), use.line - 1 == resolved.line { continue }
+				if symbolsByFile[use.path] == nil {
+					symbolsByFile[use.path] = (try? await client.documentSymbol(use.path)).map(toSymbolTree) ?? []
+				}
+				guard let owner = UsageScan.enclosing(line: use.line, in: symbolsByFile[use.path] ?? []), owner.isHeader
+				else { continue }
+				let position = "\(relative(URL(fileURLWithPath: use.path).absoluteString)):\(owner.line):\(use.column)"
+				let isExtension = owner.kind == SymbolKind.extensionKind
+				let kind = isExtension ? "conformance in extension" : SymbolKind.label(owner.kind)
+				let text = "\(owner.name)  [\(kind)\(verified ? "" : ", unverified")]  (\(position))"
+				let alreadyListed = known.contains { $0.contains("(\(position.components(separatedBy: ":").dropLast().joined(separator: ":"))") }
+				if !alreadyListed, added.insert(text).inserted {
+					entries.append(Entry(depth: 0, text: text))
+					if !verified { unverified = true }
+				}
+			}
+			if unverified {
+				unverifiedNote = "\n(unverified: the language server couldn't resolve the name there, usually because that file's build settings are unknown, so these are matched by name only)"
+			}
+		}
 		if entries.isEmpty {
 			// Without a type hierarchy the conformance sites are still known.
 			let sites = try await client.implementation(file, line: line, column: column)
@@ -652,7 +780,7 @@ public actor SwiftNavigator {
 		}
 		let list = entries.map { String(repeating: "  ", count: $0.depth) + $0.text }
 		let note = visited >= Self.maxSubtypesVisited ? "\n… stopped after \(Self.maxSubtypesVisited) types" : ""
-		return "\(entries.count) type(s) \(verb) \(resolved.qualifiedName):\n" + list.joined(separator: "\n") + note
+		return "\(entries.count) type(s) \(verb) \(resolved.qualifiedName):\n" + list.joined(separator: "\n") + note + unverifiedNote
 	}
 
 	/// sourcekit-lsp reports `extension Foo: Bar` conformances as a hierarchy item named `Foo: Bar`

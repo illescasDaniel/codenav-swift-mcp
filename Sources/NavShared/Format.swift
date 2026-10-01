@@ -52,6 +52,36 @@ public func uriToPath(_ uri: String) -> String? {
 /// Workspace-relative path for a URI; `../sibling/...` for a nearby local package; absolute otherwise.
 /// Interfaces that sourcekit-lsp generates for SDK/stdlib symbols live in a temp directory, which is
 /// noise: they're shown as `<generated> Swift.String.swiftinterface`.
+/// How files of a dependency checkout are displayed: `<dependency> DIC/Sources/DIC/File.swift`.
+public let dependencyPrefix = "<dependency> "
+
+/// The `.../checkouts/` directories seen in results, so a displayed `<dependency> Pkg/...` path can be
+/// turned back into a real one when an agent passes it as `file_path`.
+public enum DependencyRoots {
+	private static let lock = NSLock()
+	nonisolated(unsafe) private static var roots: [String] = []
+
+	static func register(_ root: String) {
+		lock.lock()
+		defer { lock.unlock() }
+		if !roots.contains(root) { roots.append(root) }
+	}
+
+	/// The real path for a `<dependency> Pkg/...` spelling (looked up in `extra` candidates too), else the input.
+	public static func expand(_ path: String, extra: [String] = []) -> String {
+		guard path.hasPrefix(dependencyPrefix) else { return path }
+		let rest = String(path.dropFirst(dependencyPrefix.count))
+		lock.lock()
+		let known = roots
+		lock.unlock()
+		for root in known + extra {
+			let candidate = root.hasSuffix("/") ? root + rest : root + "/" + rest
+			if FileManager.default.fileExists(atPath: candidate) { return candidate }
+		}
+		return path
+	}
+}
+
 public func uriToRelative(_ uri: String, workspaceRoot: URL) -> String {
 	guard let path = uriToPath(uri) else { return uri }
 	if path.contains("/sourcekit-lsp/GeneratedInterfaces/") {
@@ -61,7 +91,8 @@ public func uriToRelative(_ uri: String, workspaceRoot: URL) -> String {
 	// A SwiftPM/Xcode dependency checkout: `<dependency> DIC/Sources/DIC/File.swift` instead of a
 	// path through DerivedData or `.build`.
 	if let range = path.range(of: "/checkouts/") {
-		return "<dependency> " + path[range.upperBound...]
+		DependencyRoots.register(String(path[..<range.upperBound]))
+		return dependencyPrefix + path[range.upperBound...]
 	}
 	return displayPathOutside(path, root: workspaceRoot)
 }
