@@ -447,6 +447,8 @@ public func formatReferencesGrouped(
 	_ locations: [LSPLocation], workspaceRoot: URL, fileLimit: Int = defaultReferenceFileLimit, withColumns: Bool = false
 ) -> String {
 	guard !locations.isEmpty else { return "No references found." }
+	let (locations, interfaceCount) = withoutInterfaceFiles(locations)
+	if locations.isEmpty { return "\(interfaceCount) reference(s) only in SDK/module interface files (omitted)." }
 	struct Spot: Hashable, Comparable {
 		var line: Int
 		var column: Int
@@ -466,7 +468,15 @@ public func formatReferencesGrouped(
 		lines.append("\(path): " + tags.joined(separator: ", "))
 	}
 	if files.count > shown.count { lines.append("… and \(files.count - shown.count) more file(s)") }
+	if interfaceCount > 0 { lines.append("(\(interfaceCount) more in SDK/module interface files, omitted)") }
 	return lines.joined(separator: "\n")
+}
+
+/// Generated `.swiftinterface` files of the SDK and of prebuilt modules: a reference there is the interface
+/// restating the symbol, never a use the agent can act on, and its path is long.
+private func withoutInterfaceFiles(_ locations: [LSPLocation]) -> ([LSPLocation], Int) {
+	let kept = locations.filter { !$0.uri.hasSuffix(".swiftinterface") }
+	return (kept, locations.count - kept.count)
 }
 
 /// Full per-location snippets for a small number of hits; above `snippetLimit`, the compact grouped
@@ -475,6 +485,10 @@ public func formatReferences(
 	_ locations: [LSPLocation], workspaceRoot: URL, snippetLimit: Int = defaultReferencesSnippetLimit
 ) -> String {
 	guard !locations.isEmpty else { return "No references found at that position." }
+	// Interface-file hits are dropped (and counted) by the grouped listing, so any of them forces it.
+	if locations.contains(where: { $0.uri.hasSuffix(".swiftinterface") }) {
+		return formatReferencesGrouped(locations, workspaceRoot: workspaceRoot, withColumns: true)
+	}
 	if locations.count <= snippetLimit {
 		return sortedLocations(locations).map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n")
 	}

@@ -1,127 +1,300 @@
 # codenav-swift-mcp
 
-Code navigation for Swift codebases as an [MCP](https://modelcontextprotocol.io) server, backed by
-[sourcekit-lsp](https://github.com/swiftlang/sourcekit-lsp). A Swift port of `codenav-mcp`: the same
-tools, with type-checker-accurate answers (overloads, protocol witnesses, extensions, inferred types)
-instead of text matching.
+Compiler-accurate code navigation for Swift codebases, as an [MCP](https://modelcontextprotocol.io) server.
+
+AI coding agents usually find their way around a codebase with `grep`. That works until it doesn't: in
+Swift, `save` matches every `save` in the project, an overload hides behind identical text, protocol witnesses
+live in extensions in other files, and a `let user = try await service.create(...)` never spells out its type.
+**codenav-swift-mcp** gives the agent the same engine Xcode uses,
+[sourcekit-lsp](https://github.com/swiftlang/sourcekit-lsp), behind a handful of tools that take a **symbol
+name** instead of a hand-counted line and column. Answers come from the type checker, so they cover overloads,
+protocol witnesses, extensions and inferred types.
+
+* **Ask by name.** `symbol_info(name: "UserService.create(name:)")` returns the signature, docs, definition and every
+  reference, grouped by file, in one call. Argument labels pick an overload.
+* **Ask by line.** Every position tool also takes `symbol`, the identifier's text on that line, so the agent
+  never counts columns.
+* **Who conforms, who overrides, who calls.** Protocol conformances (including ones declared in extensions),
+  subclass trees, overriding methods and real call sites, not text matches.
+* **Works past the index.** Symbols from sibling packages and dependency checkouts are verified with a
+  *scan + verify* pass, and calls that cross the Swift/Objective-C boundary are followed in both directions.
+* **Says what's wrong with your setup.** A stale `buildServer.json`, a relink-only build, a failed background build,
+  or a workspace with no Swift project are reported with the command that fixes them.
+* **Read-only.** Every tool is annotated `readOnlyHint`: it never edits your code.
+
+## What it looks like
+
+Real output from the bundled [`Fixtures/SamplePackage`](Fixtures/SamplePackage).
+
+**"What is this method and where is it used?"**: one call instead of search → hover → definition → references:
+
+```text
+> symbol_info(name: "UserService.create(name:)")
+
+UserService.create(name:)  [Method]  (Sources/SampleKit/UserService.swift:10:14)
+
+    public func create(name: String) async throws -> User
+
+Creates a user and saves it.
+
+Definition:
+Sources/SampleKit/UserService.swift:10:14
+    9 | 	/// Creates a user and saves it.
+   10 | 	public func create(name: String) async throws -> User {
+   11 | 		let user = User(id: name.count, name: name)
+
+References:
+3 reference(s) in 3 file(s):
+Sources/SampleApp/main.swift: L4
+Sources/SampleKit/UserService.swift: L10
+Tests/SampleKitTests/UserServiceTests.swift: L11
+```
+
+**"Who conforms to this protocol?"**: including the conformance written in an extension, and types that conform
+through a refining protocol:
+
+```text
+> implementations(name: "Greeter")
+
+3 type(s) conform to or refine Greeter:
+PoliteGreeter  [conformance in extension]  (Sources/SampleKit/Stores.swift:19:11)
+Refined  [Protocol]  (Sources/SampleKit/Models.swift:34:17)
+  Shouter  [Struct]  (Sources/SampleKit/Models.swift:35:15)
+```
+
+**"Who actually calls this requirement?"**: calls through `any UserStore`, attributed to the calling method:
+
+```text
+> callers(name: "UserStore.save(_:)")
+
+UserService.create(name:)  [Method]  (Sources/SampleKit/UserService.swift:10) calls at L12
+UserService.rename(_:to:)  [Method]  (Sources/SampleKit/UserService.swift:22) calls at L25
+```
+
+**"What type is this inferred `let`?"**: no column counting, just the identifier's text on the line:
+
+```text
+> type_at(file_path: "Sources/SampleApp/main.swift", line: 4, symbol: "user")
+
+@MainActor let user: User
+Type defined at Sources/SampleKit/Models.swift:1:15
+  public struct User: Identifiable, Equatable, Sendable {
+```
+
+**Ambiguity is reported, not guessed.** A bare name that matches several overloads lists them, so the agent can pick one:
+
+```text
+> callers(name: "greet(_:)")
+
+3 symbols match 'greet(_:)'; qualify with the type (`Type.member`) or pass file_path to disambiguate:
+Shouter.greet(_:)  [Method]  (Sources/SampleKit/Models.swift:37:14)
+Greeter.greet(_:)  [Method]  (Sources/SampleKit/Ports.swift:8:7)
+PoliteGreeter.greet(_:)  [Method]  (Sources/SampleKit/Stores.swift:20:14)
+```
+
+**Across languages.** In a mixed project, an Objective-C class hierarchy is navigable from Swift and back
+(`Fixtures/MixedPackage`):
+
+```text
+> implementations(name: "Counter")
+
+1 type(s) inherit from Counter:
+Doubler  [Class]  (Sources/Bridge/Doubler.m:6:17)
+```
 
 ## Tools
 
-| Tool | What it does |
+| Tool | What it answers |
 | --- | --- |
-| `workspace` | Which directory is navigated and why; project kind; language server |
-| `symbol_info` | One-call summary for a name or a position: hover, definition, conformances, grouped references |
-| `type_at` | The type of the value/declaration at a position, and where that type is defined |
-| `outline` | Indented outline of a file (types, extensions, members, line numbers) |
-| `search_symbol` | Workspace symbol search with `kind`/`path`/`scope` filters; production code ranks before tests, and only the first 10 dependency hits are listed unless `scope=dependencies` or `all` |
-| `hover`, `definition` | Position-based (1-indexed line, UTF-16 column, or `symbol` = the identifier's text on that line) |
-| `references` | By position as above, or by `name` like `symbol_info` (`references(name="UserService.create(name:)")`) |
-| `callers` | Actual call sites of a function (call hierarchy) |
-| `implementations` | Conforming types of a protocol (incl. extension conformances), subclasses, overrides |
-| `diagnostics` | Compiler errors/warnings for a file |
+| `symbol_info` | *What is X and where is it used?* Hover, definition, conformances and references grouped by file, by name or by position |
+| `references` | Every usage of a symbol, by position or by `name` (`references(name: "UserService.create(name:)")`) |
+| `callers` | Actual call sites of a function, attributed to the calling function (call hierarchy) |
+| `implementations` | Conforming types of a protocol (incl. extension conformances), subclasses, overriding/witnessing members |
+| `type_at` | The type of the value or declaration at a position, and where that type is defined |
+| `outline` | Indented outline of a file: types, extensions, members, line ranges |
+| `search_symbol` | Workspace symbol search with `kind`, `path` and `scope` filters; production code ranks before tests |
+| `hover`, `definition` | Position-based: 1-indexed `line`, plus a UTF-16 `column` or `symbol` (the identifier's text on that line) |
+| `diagnostics` | Compiler errors and warnings for a file, with a hint when they look like missing build settings |
+| `workspace` | Which directory is navigated and why, the project kind, index state and build-settings health |
 
-Swift specifics: symbol names carry argument labels (`create(name:)`); a bare `create` works unless
-overloads make it ambiguous, then the candidates are listed. `Type.member` and `Outer.Inner.member` are accepted.
-
-Every tool that takes a `column` also takes `symbol` instead, and `symbol_info`, `callers` and `implementations`
-accept `file_path` + `line` + `symbol` (or `column`) in place of a name, which resolves locals, overloads that
-share labels, and SDK types such as `String` through the type checker. `file_path` may be relative, `../Sibling/...`
-or absolute. Failures (bad input, ambiguous or unknown names, server errors) are returned with MCP `isError` set.
+Names carry Swift argument labels (`create(name:)`). A bare `create` works unless overloads make it ambiguous;
+`Type.member` and `Outer.Inner.member` are accepted, and so are Objective-C selectors (`incrementBy:` finds
+`increment(by:)`). `symbol_info`, `callers` and `implementations` also accept `file_path` + `line` + `symbol` in place
+of a name, which resolves locals, overloads that share labels, and SDK types such as `String` through the type
+checker. `file_path` may be relative to the workspace, `../Sibling/...` or absolute. Failures (bad input, ambiguous
+or unknown names, server errors) are returned with MCP `isError` set.
 
 ## Requirements
 
-* macOS 13+, Swift 6.1 toolchain (Xcode 16.4+ or swift.org), which ships `sourcekit-lsp`.
-* SwiftPM packages work out of the box. **Xcode projects** need a `buildServer.json`:
+* macOS 13 or later.
+* A Swift 6.1 toolchain (Xcode 16.4+ or one from [swift.org](https://www.swift.org/install/)). It ships `sourcekit-lsp`,
+  which codenav finds with `xcrun`, then `PATH`, then the usual install locations.
+* Swift packages work out of the box. Xcode projects need a `buildServer.json`; see [Xcode projects](#xcode-projects).
 
-  ```bash
-  brew install xcode-build-server
-  xcode-build-server config -project App.xcodeproj -scheme App
-  ```
+## Installation
 
-  Also build the project once in Xcode so the index store exists.
-
-  Put `buildServer.json` in a directory that **contains every local package** the project uses
-  (`XCLocalSwiftPackageReference`), e.g. the repository root for `src/App/App.xcodeproj` plus `src/Lib`:
-  `xcode-build-server config -project src/App/App.xcodeproj -scheme App` run from the root. xcode-build-server only
-  serves files below the directory that holds `buildServer.json`; for a package outside it, sourcekit-lsp has no build
-  settings and hover, definition and references on its declarations come back empty. `workspace` flags this and prints
-  the command to run.
-
-## Build and register
+Build the server once:
 
 ```bash
-swift build -c release
-claude mcp add codenav-swift -- "$PWD/.build/release/codenav-swift-mcp"
+git clone https://github.com/illescasDaniel/codenav-swift-mcp.git
 ```
 
-The workspace is chosen from `CODENAV_SWIFT_WORKSPACE`, then the MCP client's roots (same git repo),
-then `CLAUDE_PROJECT_DIR`, then the current directory. When that directory is not a Swift project (a host
-that launches servers in `$HOME`), the client's roots are used; if no Swift project can be found the tools say
-so and list projects found below the directory instead of indexing the wrong tree.
+```bash
+cd codenav-swift-mcp && swift build -c release
+```
 
-## Keeping it working
+The binary is `.build/release/codenav-swift-mcp`. Keep that absolute path handy for the client configuration below.
+`pwd` inside the clone prints the directory to put in front of it.
 
-* **Restart the MCP client** (Claude Code, etc.) after rebuilding `codenav-swift-mcp` itself with `swift build -c release`:
-  the client launches the binary once per session and only loads tools at startup.
-* **Re-run `xcode-build-server config -project|-workspace <name> -scheme <Scheme>`** after a scheme or project layout change
-  (a new scheme, a moved project, a new local package), then build the scheme once in Xcode so the index store is current.
-  The `workspace` tool repeats this tip and reports when `buildServer.json` or its build root has gone stale.
+### Claude Code
 
-## Environment
+Register it for every project (`--scope user`):
+
+```bash
+claude mcp add codenav-swift --scope user -- /absolute/path/to/codenav-swift-mcp/.build/release/codenav-swift-mcp
+```
+
+Claude Code starts the server in your project directory and also sets `CLAUDE_PROJECT_DIR`, so no further
+configuration is needed. Run `/mcp` inside Claude Code to check that `codenav-swift` is connected.
+
+To share the server with a team through the repository instead, add it to the project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "codenav-swift": {
+      "command": "/absolute/path/to/codenav-swift-mcp/.build/release/codenav-swift-mcp"
+    }
+  }
+}
+```
+
+### Cursor
+
+Add the server to `~/.cursor/mcp.json` (all projects) or to `.cursor/mcp.json` in a project:
+
+```json
+{
+  "mcpServers": {
+    "codenav-swift": {
+      "command": "/absolute/path/to/codenav-swift-mcp/.build/release/codenav-swift-mcp",
+      "env": {
+        "CODENAV_SWIFT_WORKSPACE": "${workspaceFolder}"
+      }
+    }
+  }
+}
+```
+
+Cursor may start MCP servers in your home directory, so `CODENAV_SWIFT_WORKSPACE` points the server at the open
+project. Without it, codenav falls back to the client's workspace roots, then lists any Swift projects it finds
+instead of indexing the wrong tree. Enable the server under **Cursor Settings → MCP**.
+
+### Other MCP clients
+
+codenav-swift-mcp is a plain stdio server with no arguments. The workspace is chosen from `CODENAV_SWIFT_WORKSPACE`,
+then the client's MCP roots (when they are the same git repository), then `CLAUDE_PROJECT_DIR`, then the current
+directory. When that directory is not a Swift project, the client's roots are used. The `workspace` tool says
+which directory was picked and why.
+
+## Xcode projects
+
+sourcekit-lsp can't read an `.xcodeproj` by itself; [xcode-build-server](https://github.com/SolaWing/xcode-build-server)
+bridges the two:
+
+```bash
+brew install xcode-build-server
+```
+
+```bash
+xcode-build-server config -project App.xcodeproj -scheme App
+```
+
+Then **build the scheme once in Xcode** so the index store exists. The `workspace` tool reports
+`build settings: ok`, or lists what is wrong and the command to fix it.
+
+* Put `buildServer.json` in a directory that **contains every local package** the project uses. For
+  `src/App/App.xcodeproj` plus `src/Lib`, run `xcode-build-server config -project src/App/App.xcodeproj -scheme App`
+  from the repository root. xcode-build-server only serves files below the directory that holds `buildServer.json`;
+  for a package outside it, hover, definition and references come back empty. `workspace` flags this.
+* Re-run `xcode-build-server config` after a scheme or project-layout change (a new scheme, a moved project, a new
+  local package), then build once in Xcode. codenav restarts sourcekit-lsp when `buildServer.json` changes.
+* A build that only relinked records no Swift compile commands; files then get fallback arguments and bogus
+  "No such module" errors. `workspace` and `diagnostics` detect this; touch a Swift file and build again.
+
+## Configuration
+
+All optional.
 
 | Variable | Meaning |
 | --- | --- |
-| `CODENAV_SWIFT_WORKSPACE` | Pin the workspace directory |
+| `CODENAV_SWIFT_WORKSPACE` | Pin the workspace directory (absolute path); client roots are then ignored |
 | `CODENAV_SWIFT_LSP` | Path to a specific `sourcekit-lsp` |
-| `CODENAV_SWIFT_LSP_ARGS` | Extra arguments for it |
-| `CODENAV_SWIFT_INDEX_TIMEOUT` | Seconds to wait for background indexing (a notice is appended if it's still running) |
+| `CODENAV_SWIFT_LSP_ARGS` | Extra arguments for it, whitespace-separated |
+| `CODENAV_SWIFT_INDEX_TIMEOUT` | Seconds to wait for background indexing before answering (default 30); a notice says when results may be partial |
 | `CODENAV_SWIFT_REQUEST_TIMEOUT` | Seconds an individual language-server request may take (default 60) |
-| `CODENAV_SWIFT_LOCAL_PACKAGE_FOLDERS` | `1` registers local sibling packages as extra language-server workspace folders. Off by default: sourcekit-lsp then builds and indexes each package on its own (slow, large `.build`). |
+| `CODENAV_SWIFT_LOCAL_PACKAGE_FOLDERS` | `1` registers local sibling packages as extra language-server workspace folders. Off by default: sourcekit-lsp then builds and indexes each package on its own (slow, large `.build`) |
 
-## Notes
+## How it works
 
-* sourcekit-lsp builds into `.build` of the workspace on first use; the first query can be slow on large projects.
-* Type aliases are not returned by `workspace/symbol`; use `outline` or a position lookup for those.
-* A failed background build (visible in `workspace`) leaves results empty or partial; empty answers mention it.
+codenav runs one sourcekit-lsp process per workspace and starts it as soon as the MCP client connects, so indexing
+is underway before the first question. Before each call it stats the workspace and tells the server about files
+created, changed or deleted on disk, so answers keep up with the agent's own edits. Workspace-wide answers wait
+for background indexing, up to `CODENAV_SWIFT_INDEX_TIMEOUT`.
 
-## Tests
+### Cross-package and dependency symbols
+
+The index is thin for declarations in a sibling package or a dependency checkout. For those, `references`,
+`symbol_info`, `callers` and `implementations` complete the answer with a *scan + verify* pass: every whole-word
+occurrence of the name in the project and its local packages is checked with the server's `definition`, and only
+those that lead back to the declaration are kept.
+
+* A Swift file is only scanned if it imports the declaring module, or a module that re-exports it with
+  `@_exported import`, or lives in that module's own `Sources/<Target>/`. This skips most candidates in large projects.
+* Conformances written as `extension Dep.Type: Proto` are found the same way.
+* Names the server can't resolve in a file (the file isn't part of any build target, or sits in an inactive
+  `#if` branch) are listed separately under `Unverified`, never mixed into the verified results.
+* Scans stop after 600 candidates, with a note. `<dependency> Pkg/...` paths shown in results are accepted as `file_path`.
+
+### Mixed Swift / Objective-C / C++ projects
+
+`.m`, `.mm`, `.h`, `.c` and `.cpp` files are opened with their own language id, so sourcekit-lsp's built-in clangd
+serves them (with the same build settings as Swift). Calls, references and subclasses cross the language boundary
+in both directions. Objective-C selectors fold to their Swift spelling (`incrementBy:` finds `increment(by:)`; a full
+selector such as `loadImageWithURL:options:progress:completed:` picks an overload). For Swift methods called from
+Objective-C the scan searches the `@objc(selector:)` name when there is one, else the usual `base`+`Label` spellings.
+`definition` lists a header declaration before its implementation.
+
+## Troubleshooting
+
+* **Empty or partial results.** Run `workspace`: it shows the chosen directory, whether indexing is still running,
+  recent background-build errors (a project that doesn't compile leaves results empty), and build-settings problems
+  for Xcode projects. Empty answers repeat the relevant part.
+* **The first query is slow.** sourcekit-lsp builds into the workspace's `.build` on first use; on a large project
+  that takes a while. Later queries are fast.
+* **Wrong project.** Set `CODENAV_SWIFT_WORKSPACE` to the package or project root.
+* **Rebuilt codenav-swift-mcp?** Restart the MCP client: it launches the binary once per session. codenav notices
+  when its own binary changed and says so on every call until then.
+* **Type aliases** are not returned by `workspace/symbol`; use `outline` or a position lookup for those.
+
+## Development
+
+```bash
+swift build
+```
 
 ```bash
 swift test
 ```
 
-The integration test runs a real sourcekit-lsp against `Fixtures/SamplePackage` and is skipped if none is installed.
+The integration tests run a real sourcekit-lsp against [`Fixtures/SamplePackage`](Fixtures/SamplePackage) and
+[`Fixtures/MixedPackage`](Fixtures/MixedPackage), and are skipped when none is installed.
 
-## Cross-package and dependency symbols
+## Author
 
-The index is thin for declarations in a sibling package or a dependency checkout. For those, `references`,
-`symbol_info`, `callers` and `implementations` complete the answer with a *scan + verify* pass: every whole-word
-occurrence of the name in the project and its local packages is checked with the server's `definition`, and only
-those leading back to the declaration are kept. Conformances written as `extension Dep.Type: Proto` are found
-the same way (marked `unverified` when the server can't resolve the name in that file). Results over 600 candidates
-are truncated with a note. `<dependency> Pkg/...` paths shown in results are accepted as `file_path`.
+Created by **Daniel Illescas Romero** ([contact@daniel-ir.eu](mailto:contact@daniel-ir.eu)).
+Bug reports and pull requests are welcome on [GitHub](https://github.com/illescasDaniel/codenav-swift-mcp/issues).
 
-## Mixed Swift / Objective-C / C++ projects
+## License
 
-`.m`, `.mm`, `.h`, `.c` and `.cpp` files are opened with their own language id, so sourcekit-lsp's built-in clangd
-serves them (it needs the same build index as Swift). Calls, references and subclasses cross the language boundary
-in both directions. Objective-C selectors fold to their Swift spelling (`incrementBy:` finds `increment(by:)`; a full
-selector such as `loadImageWithURL:options:progress:completed:` picks an overload), `definition` lists a header
-declaration before its implementation, and the text scan used for dependencies also covers Objective-C/C sources.
-
-## Setup checks
-
-For an Xcode project with a `buildServer.json`, `workspace` reports `build settings: ok` or lists what is wrong: the
-`build_root` is gone, it has no index store, no Swift was ever compiled in it (a relink-only build records nothing, so
-files get fallback arguments and bogus "No such module" errors), or the project changed after the last build. The same
-findings are appended to empty results and to `diagnostics` output, and posted once when the server starts.
-
-## Scan details
-
-- A Swift file is only scanned for a dependency's symbol if it imports that module, or a module that re-exports it with
-  `@_exported import` (an app importing only `Octopus`, which re-exports `DIC`, still uses DIC types), or lives in the
-  module's own `Sources/<Target>/`, which skips most candidates in large projects. The module is taken from the `Sources/<Target>/` directory, so a package without that layout isn't prefiltered.
-- Names the language server can't resolve in a file (the file isn't part of any build target, e.g. a dependency's tests)
-  are listed separately under `Unverified` in `references` and `symbol_info`, never mixed into the verified list.
-- For Swift methods called from Objective-C the scan searches the `@objc(selector:)` name when there is one, else the
-  usual `base`+`Label` spellings. `Type.increment(by:)` also finds the Objective-C `incrementBy:`.
+[MIT](LICENSE) © 2026 Daniel Illescas Romero

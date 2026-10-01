@@ -412,3 +412,30 @@ struct MixedLanguageIntegrationTests {
 		#expect(bad.isError)
 	}
 }
+
+@Suite struct ReleaseFixesTests {
+	@Test func longHoverIsCutAtAParagraphAndKeepsFencesBalanced() {
+		let long = "```swift\nstruct S\n```\n\n" + (1...200).map { "Paragraph \($0) of documentation." }.joined(separator: "\n\n")
+		let cut = SwiftNavigator.truncatedHover(long)
+		#expect(cut.count < long.count)
+		#expect(cut.hasPrefix("```swift\nstruct S\n```"))
+		#expect(cut.contains("documentation truncated"))
+		#expect(SwiftNavigator.truncatedHover("short") == "short")
+	}
+
+	@Test func sourceLinesSplitOnlyOnRealLineBreaks() {
+		#expect(PositionResolver.sourceLines("a\u{0C}b\u{2028}c\nd\r\ne\rf") == ["a\u{0C}b\u{2028}c", "d", "e", "f"])
+	}
+
+	@Test func swiftinterfaceReferencesAreCountedNotListed() {
+		func location(_ uri: String) -> LSPLocation {
+			LSPLocation(uri: uri, range: LSPRange(start: LSPPosition(line: 0, character: 0), end: LSPPosition(line: 0, character: 1)))
+		}
+		let root = URL(fileURLWithPath: "/work/app", isDirectory: true)
+		let text = formatReferences(
+			[location("file:///work/app/A.swift"), location("file:///sdk/Swift.swiftinterface")], workspaceRoot: root)
+		#expect(!text.contains("swiftinterface"))
+		#expect(text.contains("A.swift"))
+		#expect(text.contains("1 more in SDK/module interface files"))
+	}
+}

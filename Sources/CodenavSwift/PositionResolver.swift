@@ -10,7 +10,8 @@ enum PositionResolver {
 	}
 
 	static func sourceLines(_ text: String) -> [String] {
-		text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
+		// Only the line breaks sourcekit-lsp counts: `isNewline` would also split on form feed, U+2028 and friends.
+		text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" || $0 == "\r" }).map(String.init)
 	}
 
 	/// The 1-indexed UTF-16 column of `symbol` on `line` (1-indexed) of `text`, whole-word.

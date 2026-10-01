@@ -532,7 +532,7 @@ public actor SwiftNavigator {
 					)
 				}
 			} else {
-				lines.append("language server: not started yet (it starts on the first navigation call)")
+				lines.append("index: not started yet (the language server starts on the first navigation call)")
 			}
 			return lines.joined(separator: "\n")
 		}
@@ -720,7 +720,7 @@ public actor SwiftNavigator {
 			let header = "\(resolved.qualifiedName)  [\(SymbolKind.label(resolved.kind))]  (\(relativePath):\(line):\(column))"
 			var parts = [header]
 			if let note = target.note { parts.append(note) }
-			parts += ["", hoverText.isEmpty ? "No hover information." : hoverText]
+			parts += ["", hoverText.isEmpty ? "No hover information." : Self.truncatedHover(hoverText)]
 			if SymbolKind.types.contains(resolved.kind), let supers = try? await supertypeLine(client, file: file, line: line, column: column) {
 				parts += ["", supers]
 			}
@@ -736,6 +736,19 @@ public actor SwiftNavigator {
 			}
 			return parts.joined(separator: "\n")
 		}
+	}
+
+	static let maxHoverCharacters = 1500
+
+	/// SDK types carry pages of documentation (`String` is ~300 lines); keep the declaration and the opening
+	/// paragraphs, cut at a paragraph break, and point at `hover` for the rest.
+	static func truncatedHover(_ text: String) -> String {
+		guard text.count > maxHoverCharacters else { return text }
+		let head = String(text.prefix(maxHoverCharacters))
+		let cut = head.range(of: "\n\n", options: .backwards).map { String(head[..<$0.lowerBound]) } ?? head
+		// A cut inside a code fence would leave it open.
+		let fenced = cut.components(separatedBy: "```").count % 2 == 0
+		return cut + (fenced ? "\n```" : "") + "\n\n… documentation truncated (\(text.count) characters); `hover` shows all of it."
 	}
 
 	/// `Inherits / conforms to: Identifiable, Equatable, Sendable` for a type; nil when it has none

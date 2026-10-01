@@ -301,7 +301,7 @@ public actor LSPClient {
 			for await chunk in server.output {
 				await self?.consume(chunk)
 			}
-			await self?.serverClosed()
+			await self?.serverClosed(server)
 		}
 		stderrTask = Task { [weak self] in
 			var partial = Data()
@@ -403,9 +403,11 @@ public actor LSPClient {
 		return message
 	}
 
-	private func serverClosed() async {
+	private func serverClosed(_ server: ServerProcess) async {
 		// stdout closing usually means the process died; its last words are on stderr.
 		try? await Task.sleep(nanoseconds: 300_000_000)
+		// After a restart the old reader finishes late: its requests are gone, the new server's are not its to fail.
+		guard process === server else { return }
 		failPending(LanguageServerExitedError(message: exitMessage()))
 	}
 
@@ -949,7 +951,7 @@ public actor LSPClient {
 	/// `Null`; the declaration line says what they really are.
 	private static func refiningNullKind(_ symbol: WorkspaceSymbol) -> WorkspaceSymbol {
 		guard symbol.kind == 21, let line = symbol.location.range?.start.line,
-			let text = readLines(of: symbol.location.uri).flatMap { $0.indices.contains(line) ? $0[line] : nil }, let kind = SymbolKind.infer(fromDeclaration: text)
+			let text = readLines(of: symbol.location.uri).flatMap({ $0.indices.contains(line) ? $0[line] : nil }), let kind = SymbolKind.infer(fromDeclaration: text)
 		else { return symbol }
 		var refined = symbol
 		refined.kind = kind

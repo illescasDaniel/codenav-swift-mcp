@@ -75,7 +75,7 @@ public enum ToolCatalog {
 		"Code navigation for this Swift codebase, backed by sourcekit-lsp (the same engine as Xcode's index). "
 		+ "Prefer this over grepping for symbol definitions/usages: it resolves through the type checker "
 		+ "(overloads, protocol witnesses, extensions, inferred types), not just text matching. "
-		+ "Swift files only (.swift). Symbol names carry argument labels, e.g. `create(name:)`; a bare `create` "
+		+ "Swift files, plus the Objective-C/C/C++ sources of a mixed project (.m, .mm, .h, .c, .cpp). Symbol names carry argument labels, e.g. `create(name:)`; a bare `create` "
 		+ "works unless overloads make it ambiguous, in which case the candidates are listed. "
 		+ "Start with symbol_info (what is X, where is it used) or outline (what's in this file) rather than "
 		+ "chaining search_symbol → hover → definition → references by hand; drop to the position tools once "
@@ -91,7 +91,7 @@ public enum ToolCatalog {
 		.init(name: name, kind: kind, description: description, required: required)
 	}
 
-	private static let filePath = p("file_path", .string, "Path to the Swift file, relative to the workspace root (or absolute).", required: true)
+	private static let filePath = p("file_path", .string, "Path to the source file (.swift, or .m/.mm/.h/.c/.cpp in a mixed project), relative to the workspace root (or absolute).", required: true)
 	private static let line = p("line", .integer, "1-indexed line.", required: true)
 	private static let column = p(
 		"column", .integer, "1-indexed UTF-16 column. Optional when `symbol` is given.")
@@ -148,7 +148,7 @@ public enum ToolCatalog {
 			]),
 		ToolSpec(
 			name: "diagnostics",
-			description: "Compiler errors and warnings for a Swift file.",
+			description: "Compiler errors and warnings for a source file.",
 			parameters: [filePath]),
 		ToolSpec(
 			name: "symbol_info",
@@ -165,7 +165,7 @@ public enum ToolCatalog {
 		ToolSpec(
 			name: "outline",
 			description:
-				"What's in this file? Indented outline (types, extensions, methods, properties, with line numbers) of a Swift file. "
+				"What's in this file? Indented outline (types, extensions, methods, properties, with line numbers) of a source file. "
 				+ "Follow up with hover/definition/references at a listed line, or symbol_info by name.",
 			parameters: [filePath]),
 		ToolSpec(
