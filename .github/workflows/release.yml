@@ -17,6 +17,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Select Xcode 26.6
         run: sudo xcode-select -s /Applications/Xcode_26.6.app
+      - name: Check the tag matches the version in the source
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          grep -q "let serverVersion = \"$VERSION\"" Sources/codenav-swift-mcp/main.swift \
+            || { echo "Tag $GITHUB_REF_NAME does not match serverVersion in Sources/codenav-swift-mcp/main.swift"; exit 1; }
       - name: Build
         run: swift build -c release --arch ${{ matrix.arch }}
       - name: Package

@@ -308,6 +308,35 @@ swift test
 The integration tests run a real sourcekit-lsp against [`Fixtures/SamplePackage`](Fixtures/SamplePackage) and
 [`Fixtures/MixedPackage`](Fixtures/MixedPackage), and are skipped when none is installed.
 
+## Releasing
+
+Releases are built by GitHub Actions; the formula in the Homebrew tap is bumped by hand.
+
+1. Set `serverVersion` in [`Sources/codenav-swift-mcp/main.swift`](Sources/codenav-swift-mcp/main.swift) and add a
+   section for the version to [`CHANGELOG.md`](CHANGELOG.md). The release notes are taken from that section.
+2. Commit, push, then tag and push the tag:
+
+   ```bash
+   git tag -a v0.1.2 -m "0.1.2" && git push origin v0.1.2
+   ```
+
+   The [Release workflow](.github/workflows/release.yml) checks that the tag matches `serverVersion`, builds arm64 and
+   x86_64 binaries on macOS, smoke-tests each one on a matching runner, and publishes a GitHub release with the
+   tarballs and their `.sha256` files.
+3. Bump the formula in [illescasDaniel/homebrew-tap](https://github.com/illescasDaniel/homebrew-tap). In
+   `Formula/codenav-swift-mcp.rb`, update the version in both `url`s and replace both `sha256` values with the contents
+   of the release's `.sha256` files (`gh release download v0.1.2 -p '*.sha256'`). Then check and push:
+
+   ```bash
+   brew audit --strict illescasDaniel/tap/codenav-swift-mcp && brew reinstall illescasDaniel/tap/codenav-swift-mcp && brew test codenav-swift-mcp
+   ```
+
+   Users get the new version with `brew upgrade codenav-swift-mcp`. If the tap clone on your machine is stale, run
+   `git -C "$(brew --repository illescasDaniel/tap)" pull` first.
+
+The release builds with the Xcode version pinned in the workflow (`xcode-select` step); update it when GitHub's
+`macos-*` images drop that Xcode. Hosted runners may lag behind the Swift version you develop with.
+
 ## Author
 
 Created by **Daniel Illescas Romero** ([contact@daniel-ir.eu](mailto:contact@daniel-ir.eu)).
