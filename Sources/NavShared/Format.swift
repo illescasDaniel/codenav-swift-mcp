@@ -30,6 +30,44 @@ public enum SymbolKind {
 		"interface": 11, "enummember": 22, "typeparameter": 26, "constructor": 9, "init": 9, "namespace": 3,
 	]
 
+	static let modifierWords: Set<String> = [
+		"public", "internal", "private", "fileprivate", "open", "package", "static", "final", "lazy", "weak",
+		"unowned", "nonisolated", "override", "mutating", "nonmutating", "indirect", "required", "convenience",
+		"dynamic", "distributed", "@MainActor", "@objc", "@discardableResult", "@inlinable", "@available",
+	]
+
+	static let keywordKinds: [String: Int] = [
+		"class": SymbolKind.class, "actor": SymbolKind.class, "struct": SymbolKind.structure,
+		"enum": SymbolKind.enumeration, "protocol": SymbolKind.protocol, "typealias": 26, "associatedtype": 26,
+		"func": SymbolKind.function, "init": SymbolKind.initializer, "subscript": SymbolKind.method,
+		"case": SymbolKind.enumCase, "var": SymbolKind.variable, "let": SymbolKind.constant,
+	]
+
+	/// What a declaration line says the symbol is: `struct User` -> struct, `func f()` -> function,
+	/// `typealias Id = UUID` -> type alias. Nil when the hover isn't a declaration.
+	public static func infer(fromDeclaration text: String) -> Int? {
+		let cleaned = text.replacingOccurrences(of: "```swift", with: "").replacingOccurrences(of: "```", with: "")
+		for rawLine in cleaned.split(separator: "\n") {
+			let tokens = rawLine.split(whereSeparator: { " (<:{=".contains($0) }).map(String.init)
+			var index = 0
+			while index < tokens.count {
+				let token = tokens[index]
+				if modifierWords.contains(token) || token.hasPrefix("@") {
+					index += 1
+					continue
+				}
+				if token == "class", index + 1 < tokens.count, keywordKinds[tokens[index + 1]] != nil {
+					index += 1  // `class func`, `class var`
+					continue
+				}
+				break
+			}
+			guard index < tokens.count, let kind = keywordKinds[tokens[index]] else { continue }
+			return kind
+		}
+		return nil
+	}
+
 	public static func label(_ kind: Int?) -> String {
 		guard let kind else { return "?" }
 		return labels[kind] ?? "Kind\(kind)"

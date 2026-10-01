@@ -336,15 +336,35 @@ public actor SwiftNavigator {
 
 	static let maxUnverifiedListed = 15
 
-	/// Name-only matches as a compact section, or empty when there are none.
+	/// Name-only matches as compact sections, or empty when there are none. Matches inside `#if` blocks get
+	/// their own section: there the likely cause is an inactive branch rather than missing build settings.
 	private func formatUnverified(_ locations: [LSPLocation]) -> String {
 		guard !locations.isEmpty else { return "" }
-		let shown = locations.prefix(Self.maxUnverifiedListed).map { location in
-			"\(relative(location.uri)):\(location.range.start.line + 1):\(location.range.start.character + 1)"
+		let conditional = locations.filter { Self.isInConditionalBlock(line: $0.range.start.line, in: readLines(of: $0.uri) ?? []) }
+		let conditionalSet = Set(conditional.map { "\($0.uri)#\($0.range.start.line)#\($0.range.start.character)" })
+		let plain = locations.filter { !conditionalSet.contains("\($0.uri)#\($0.range.start.line)#\($0.range.start.character)") }
+		func section(_ items: [LSPLocation], reason: String) -> String {
+			guard !items.isEmpty else { return "" }
+			let shown = items.prefix(Self.maxUnverifiedListed).map { location in
+				"\(relative(location.uri)):\(location.range.start.line + 1):\(location.range.start.character + 1)"
+			}
+			let more = items.count > shown.count ? " … and \(items.count - shown.count) more" : ""
+			return "\n\nUnverified (same name, but \(reason), so they are matched by name only):\n" + shown.joined(separator: "\n") + more
 		}
-		let more = locations.count > shown.count ? " … and \(locations.count - shown.count) more" : ""
-		return "\n\nUnverified (same name, but the language server has no build settings for these files, so they are matched by name only):\n"
-			+ shown.joined(separator: "\n") + more
+		return section(plain, reason: "the language server has no build settings for these files")
+			+ section(
+				conditional,
+				reason: "these sit inside #if/#else and the language server could not resolve them, probably an inactive branch of the current build configuration or missing build settings")
+	}
+
+	/// Whether a 0-indexed line sits inside an `#if` / `#elseif` / `#else` block (nesting-aware).
+	static func isInConditionalBlock(line: Int, in lines: [String]) -> Bool {
+		var depth = 0
+		for text in lines.prefix(line + 1) {
+			let trimmed = text.trimmingCharacters(in: .whitespaces)
+			if trimmed.hasPrefix("#if") { depth += 1 } else if trimmed.hasPrefix("#endif") { depth = max(0, depth - 1) }
+		}
+		return depth > 0
 	}
 
 	/// Callers found by scan: each use of the name that resolves to the declaration, attributed to the

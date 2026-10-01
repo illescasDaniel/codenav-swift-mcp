@@ -941,7 +941,19 @@ public actor LSPClient {
 	}
 
 	public func workspaceSymbol(_ query: String) async throws -> [WorkspaceSymbol] {
-		try await request("workspace/symbol", params: ["query": .string(query)], as: [WorkspaceSymbol].self) ?? []
+		let symbols = try await request("workspace/symbol", params: ["query": .string(query)], as: [WorkspaceSymbol].self) ?? []
+		return symbols.map(Self.refiningNullKind)
+	}
+
+	/// The index reports some declarations (typealiases from a dependency, for one) with the placeholder kind
+	/// `Null`; the declaration line says what they really are.
+	private static func refiningNullKind(_ symbol: WorkspaceSymbol) -> WorkspaceSymbol {
+		guard symbol.kind == 21, let line = symbol.location.range?.start.line,
+			let text = readLines(of: symbol.location.uri).flatMap { $0.indices.contains(line) ? $0[line] : nil }, let kind = SymbolKind.infer(fromDeclaration: text)
+		else { return symbol }
+		var refined = symbol
+		refined.kind = kind
+		return refined
 	}
 
 	public func documentSymbol(_ filePath: String) async throws -> [DocumentSymbol] {
