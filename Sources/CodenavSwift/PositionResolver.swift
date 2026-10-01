@@ -112,7 +112,7 @@ enum PositionResolver {
 	/// language server which hits really are the symbol", for names the index can't answer for.
 	static func occurrences(
 		of name: String, under roots: [URL], limit: Int, perFile: Bool = false, fileLimit: Int = 4000,
-		includeClang: Bool = false
+		includeClang: Bool = false, requiringImport module: String? = nil
 	) -> (hits: [Occurrence], truncated: Bool) {
 		guard name.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil,
 			let pattern = identifierPattern(name)
@@ -135,6 +135,8 @@ enum PositionResolver {
 				if visited > fileLimit { return (found, true) }
 				guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8), text.contains(name)
 				else { continue }
+				// A Swift file can only use a declaration from another module if it imports that module.
+				if let module, isSwift, !url.path.contains("/Sources/\(module)/"), !importsModule(text, module) { continue }
 				for (offset, line) in sourceLines(text).enumerated() {
 					let trimmed = line.trimmingCharacters(in: .whitespaces)
 					if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ")
@@ -153,6 +155,49 @@ enum PositionResolver {
 			}
 		}
 		return (found, false)
+	}
+
+	/// `import M`, `@testable import M`, `import struct M.Type` (not a mention in a comment or string).
+	static func importsModule(_ text: String, _ module: String) -> Bool {
+		let pattern = "(?m)^\\s*(?:@\\w+(?:\\([^)]*\\))?\\s+)*import\\s+(?:(?:struct|class|enum|protocol|func|var|let|typealias)\\s+)?"
+			+ NSRegularExpression.escapedPattern(for: module) + "(?![A-Za-z0-9_])"
+		return text.range(of: pattern, options: .regularExpression) != nil
+	}
+
+	/// The SwiftPM target a source path belongs to (`.../Sources/<Target>/...`), when it has that layout.
+	static func moduleName(ofPath path: String) -> String? {
+		guard let range = path.range(of: "/Sources/", options: .backwards) else { return nil }
+		let rest = path[range.upperBound...].split(separator: "/", omittingEmptySubsequences: true)
+		guard rest.count >= 2 else { return nil }  // a file directly in Sources/ has no target directory
+		return String(rest[0])
+	}
+
+	/// Objective-C spellings of the Swift declaration on `lines[index]`: the selector an explicit
+	/// `@objc(selector:)` names (on that line or the one above), else the usual `base`+`Label` guesses.
+	static func objcAliases(declaredAt index: Int, in lines: [String], word: String) -> [String] {
+		guard index >= 0, index < lines.count else { return [] }
+		for candidate in [lines[index]] + (index > 0 ? [lines[index - 1]] : []) {
+			if let range = candidate.range(of: #"@objc\(\s*([A-Za-z_][A-Za-z0-9_]*)"#, options: .regularExpression) {
+				let name = candidate[range].drop(while: { $0 != "(" }).dropFirst().trimmingCharacters(in: .whitespaces)
+				if name != word { return [name] }
+			}
+		}
+		guard let name = swiftName(declaredOn: lines[index], word: word) else { return [] }
+		return objcSpellings(ofSwiftName: name)
+	}
+
+	/// `func increment(by amount: Int)` -> `increment(by:)`.
+	static func swiftName(declaredOn line: String, word: String) -> String? {
+		let pattern = "\\bfunc\\s+" + NSRegularExpression.escapedPattern(for: word) + "\\s*(?:<[^>]*>)?\\s*\\(([^)]*)\\)"
+		guard let regex = try? NSRegularExpression(pattern: pattern),
+			let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+			let range = Range(match.range(at: 1), in: line)
+		else { return nil }
+		let parameters = line[range].split(separator: ",").map { parameter -> String in
+			let label = parameter.split(whereSeparator: { $0 == " " || $0 == ":" }).first.map(String.init) ?? "_"
+			return label + ":"
+		}
+		return word + "(" + parameters.joined() + ")"
 	}
 
 	static func isClangFile(_ fileName: String) -> Bool {

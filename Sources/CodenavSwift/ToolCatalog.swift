@@ -122,8 +122,15 @@ public enum ToolCatalog {
 			parameters: [filePath, line, column, symbolOnLine]),
 		ToolSpec(
 			name: "references",
-			description: "Find all usages of the symbol at a position across the workspace. " + positionNote,
-			parameters: [filePath, line, column, symbolOnLine, p("include_declaration", .boolean, "Include the declaration itself (default true).")]),
+			description:
+				"Find all usages of a symbol across the workspace (and, for dependency symbols, the packages that use them). "
+				+ "Give a position (`file_path` + `line` + `column`/`symbol`) or just a `name` like symbol_info does "
+				+ "(`references(name=\"UserService.create(name:)\")`). " + positionNote,
+			parameters: [
+				optionalFile, optionalLine, column, symbolOnLine,
+				p("name", .string, "Symbol name, or dotted `Type.member`; an alternative to a position."), p("query", .string, "Alias for name."),
+				p("include_declaration", .boolean, "Include the declaration itself (default true)."),
+			]),
 		ToolSpec(
 			name: "search_symbol",
 			description:
@@ -137,6 +144,7 @@ public enum ToolCatalog {
 				p("query", .string, "Symbol name to search for."), p("name", .string, "Alias for query."),
 				p("kind", .string, "Comma-separated SymbolKind labels."), p("path", .string, "Path prefix or glob filter."),
 				p("fuzzy", .boolean, "List loose fuzzy matches too."),
+				p("scope", .string, "`project` (own code only), `dependencies` (pods, package checkouts, SDK headers only) or `all`. Default: project code first, then at most 10 dependency hits."),
 			]),
 		ToolSpec(
 			name: "diagnostics",
@@ -204,8 +212,8 @@ public enum ToolCatalog {
 					column: try optionalColumn(), symbol: arguments.string("symbol"))
 			case "references":
 				return await navigator.references(
-					filePath: try arguments.requiredString("file_path"), line: try arguments.int("line"),
-					column: try optionalColumn(), symbol: arguments.string("symbol"),
+					name: arguments.string("name"), query: arguments.string("query"), filePath: arguments.string("file_path"),
+					line: try arguments.optionalInt("line"), column: try optionalColumn(), symbol: arguments.string("symbol"),
 					includeDeclaration: arguments.bool("include_declaration", default: true))
 			case "type_at":
 				return await navigator.typeAt(
@@ -214,7 +222,8 @@ public enum ToolCatalog {
 			case "search_symbol":
 				return await navigator.searchSymbol(
 					query: arguments.string("query"), name: arguments.string("name"), kind: arguments.string("kind"),
-					path: arguments.string("path"), fuzzy: arguments.bool("fuzzy", default: false))
+					path: arguments.string("path"), fuzzy: arguments.bool("fuzzy", default: false),
+					scope: arguments.string("scope"))
 			case "diagnostics":
 				return await navigator.diagnostics(filePath: try arguments.requiredString("file_path"))
 			case "symbol_info":

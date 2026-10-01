@@ -13,8 +13,9 @@ instead of text matching.
 | `symbol_info` | One-call summary for a name or a position: hover, definition, conformances, grouped references |
 | `type_at` | The type of the value/declaration at a position, and where that type is defined |
 | `outline` | Indented outline of a file (types, extensions, members, line numbers) |
-| `search_symbol` | Workspace symbol search with `kind`/`path` filters; production code ranks before tests |
-| `hover`, `definition`, `references` | Position-based (1-indexed line, UTF-16 column, or `symbol` = the identifier's text on that line) |
+| `search_symbol` | Workspace symbol search with `kind`/`path`/`scope` filters; production code ranks before tests, and only the first 10 dependency hits are listed unless `scope=dependencies` or `all` |
+| `hover`, `definition` | Position-based (1-indexed line, UTF-16 column, or `symbol` = the identifier's text on that line) |
+| `references` | By position as above, or by `name` like `symbol_info` (`references(name="UserService.create(name:)")`) |
 | `callers` | Actual call sites of a function (call hierarchy) |
 | `implementations` | Conforming types of a protocol (incl. extension conformances), subclasses, overrides |
 | `diagnostics` | Compiler errors/warnings for a file |
@@ -92,3 +93,19 @@ serves them (it needs the same build index as Swift). Calls, references and subc
 in both directions. Objective-C selectors fold to their Swift spelling (`incrementBy:` finds `increment(by:)`; a full
 selector such as `loadImageWithURL:options:progress:completed:` picks an overload), `definition` lists a header
 declaration before its implementation, and the text scan used for dependencies also covers Objective-C/C sources.
+
+## Setup checks
+
+For an Xcode project with a `buildServer.json`, `workspace` reports `build settings: ok` or lists what is wrong: the
+`build_root` is gone, it has no index store, no Swift was ever compiled in it (a relink-only build records nothing, so
+files get fallback arguments and bogus "No such module" errors), or the project changed after the last build. The same
+findings are appended to empty results and to `diagnostics` output, and posted once when the server starts.
+
+## Scan details
+
+- A Swift file is only scanned for a dependency's symbol if it imports that module (or lives in the module's own
+  `Sources/<Target>/`), which skips most candidates in large projects. The module is taken from the `Sources/<Target>/` directory, so a package without that layout isn't prefiltered.
+- Names the language server can't resolve in a file (the file isn't part of any build target, e.g. a dependency's tests)
+  are listed separately under `Unverified` in `references` and `symbol_info`, never mixed into the verified list.
+- For Swift methods called from Objective-C the scan searches the `@objc(selector:)` name when there is one, else the
+  usual `base`+`Label` spellings. `Type.increment(by:)` also finds the Objective-C `incrementBy:`.

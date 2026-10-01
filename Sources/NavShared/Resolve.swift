@@ -156,7 +156,11 @@ public func resolveSymbol(
 	let caseExact = exact.filter { $0.baseName == parsed.base }
 	if !caseExact.isEmpty { exact = caseExact }
 	if let signature = parsed.signature {
-		exact = exact.filter { $0.name == parsed.base + signature }
+		// An Objective-C method has no labels in its name: `increment(by:)` finds `incrementBy:`.
+		let full = parsed.base + signature
+		let squashedFull = squashed(full)
+		let objc = ranked.filter { !$0.name.contains("(") && $0.name.contains(":") && squashed($0.name) == squashedFull }
+		exact = exact.filter { $0.name == full } + objc.filter { candidate in !exact.contains { $0.name == candidate.name && $0.location.uri == candidate.location.uri } }
 	}
 	if let selector = parsed.selector {
 		let spelled = exact.filter { $0.name == selector }

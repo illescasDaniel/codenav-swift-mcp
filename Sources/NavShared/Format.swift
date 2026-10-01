@@ -329,10 +329,11 @@ public func filterSymbols(
 /// real match the fuzzy hits stay (abbreviations like `UsrSvc`).
 public func formatWorkspaceSymbols(
 	_ symbols: [WorkspaceSymbol], workspaceRoot: URL, query: String = "", limit: Int = defaultSearchSymbolLimit,
-	fuzzy: Bool = false
+	fuzzy: Bool = false, dependencyLimit: Int? = nil
 ) -> String {
 	guard !symbols.isEmpty else { return "" }
 	var ranked = filterWorkspaceSymbols(rankWorkspaceSymbols(symbols, query: query))
+	var hiddenDependencies = 0
 	var hiddenFuzzy = 0
 	var onlyFuzzy = false
 	if !query.isEmpty {
@@ -344,6 +345,17 @@ public func formatWorkspaceSymbols(
 			ranked = real
 		}
 	}
+	if let dependencyLimit {
+		// Dependencies (pods, checkouts, SDK headers) can match hundreds of names; they rank after the
+		// project's own symbols, so keeping the first few loses nothing the project itself has.
+		var kept = 0
+		ranked = ranked.filter { symbol in
+			guard isDependencyPath(symbol.location.uri) else { return true }
+			kept += 1
+			if kept > dependencyLimit { hiddenDependencies += 1; return false }
+			return true
+		}
+	}
 	let shown = Array(ranked.prefix(max(0, limit)))
 	var lines = shown.map { formatWorkspaceSymbol($0, workspaceRoot: workspaceRoot) }
 	if onlyFuzzy {
@@ -353,6 +365,9 @@ public func formatWorkspaceSymbols(
 	let omitted = ranked.count - shown.count
 	if omitted > 0 {
 		lines.append("… and \(omitted) more (showing first \(shown.count)); narrow with kind=… or path=…")
+	}
+	if hiddenDependencies > 0 {
+		lines.append("(\(hiddenDependencies) more match(es) in dependencies hidden; pass scope=dependencies to list them, or scope=all for everything)")
 	}
 	if hiddenFuzzy > 0 {
 		lines.append(

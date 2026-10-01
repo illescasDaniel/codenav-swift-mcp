@@ -179,3 +179,23 @@ import Testing
 		#expect(ParsedQuery("Greeter.greet:").container == ["Greeter"])
 	}
 }
+
+@Suite struct DependencyCapTests {
+	private func symbol(_ name: String, _ path: String) -> WorkspaceSymbol {
+		WorkspaceSymbol(
+			name: name, kind: 5, uri: "file://\(path)",
+			range: LSPRange(start: LSPPosition(line: 1, character: 0), end: LSPPosition(line: 1, character: 1)))
+	}
+
+	@Test func dependencyHitsAreCappedAfterProjectOnes() {
+		let root = URL(fileURLWithPath: "/work/App")
+		let symbols = [symbol("Tensor", "/work/App/Sources/Tensor.swift")]
+			+ (0..<5).map { symbol("Tensor\($0)", "/work/App/Pods/Torch/T\($0).h") }
+		let capped = formatWorkspaceSymbols(symbols, workspaceRoot: root, query: "Tensor", dependencyLimit: 2)
+		#expect(capped.contains("Sources/Tensor.swift"))
+		#expect(capped.components(separatedBy: "Pods/").count - 1 == 2)
+		#expect(capped.contains("3 more match(es) in dependencies hidden"))
+		let all = formatWorkspaceSymbols(symbols, workspaceRoot: root, query: "Tensor")
+		#expect(all.components(separatedBy: "Pods/").count - 1 == 5)
+	}
+}

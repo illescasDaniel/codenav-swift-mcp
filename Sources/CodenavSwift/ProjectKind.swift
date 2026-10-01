@@ -129,6 +129,58 @@ public enum ProjectKind: Equatable, Sendable {
 		}
 	}
 
+	/// Why an Xcode project's `buildServer.json` may give sourcekit-lsp no usable build settings: the build
+	/// root it points at is gone, never compiled any Swift (a relink-only build records nothing), has no index
+	/// store, or predates the project's last change. Empty when it looks healthy or the project isn't one.
+	public static func buildSettingsProblems(in root: URL) -> [String] {
+		let fileManager = FileManager.default
+		let configURL = root.appendingPathComponent("buildServer.json")
+		guard !fileManager.fileExists(atPath: root.appendingPathComponent("Package.swift").path),
+			let data = try? Data(contentsOf: configURL)
+		else { return [] }
+		guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+			return ["buildServer.json isn't valid JSON; regenerate it with `xcode-build-server config`."]
+		}
+		guard let buildRoot = json["build_root"] as? String else { return [] }  // not an xcode-build-server file
+		let regenerate = "Build the scheme fully in Xcode (or `xcodebuild build`), then regenerate with `xcode-build-server config -project|-workspace <name> -scheme <Scheme>`."
+		var isDirectory: ObjCBool = false
+		guard fileManager.fileExists(atPath: buildRoot, isDirectory: &isDirectory), isDirectory.boolValue else {
+			return ["buildServer.json points at build_root \(buildRoot), which doesn't exist (DerivedData was cleaned or the project moved). " + regenerate]
+		}
+		var problems: [String] = []
+		if !fileManager.fileExists(atPath: buildRoot + "/Index.noindex/DataStore") {
+			problems.append("the build root has no index store (Index.noindex/DataStore): references, callers and implementations will be empty until the scheme is built in Xcode.")
+		}
+		if !hasSwiftCompilation(under: buildRoot + "/Build/Intermediates.noindex") {
+			problems.append("no Swift compilation was recorded in the build root, so files get fallback arguments (bogus \"No such module\" errors). A relink-only build leaves nothing: run a full build. " + regenerate)
+		}
+		let logs = buildRoot + "/Logs/Build"
+		let lastBuild = ((try? fileManager.contentsOfDirectory(atPath: logs)) ?? []).filter { $0.hasSuffix(".xcactivitylog") }
+			.compactMap { (try? fileManager.attributesOfItem(atPath: logs + "/" + $0))?[.modificationDate] as? Date }.max()
+		if let lastBuild, let project = projectModificationDate(in: root), project > lastBuild.addingTimeInterval(1) {
+			problems.append("the project file changed after the last build (files or targets may have been added since). Rebuild so the build settings cover them.")
+		}
+		return problems
+	}
+
+	private static func hasSwiftCompilation(under directory: String) -> Bool {
+		guard let enumerator = FileManager.default.enumerator(atPath: directory) else { return false }
+		var visited = 0
+		for case let entry as String in enumerator {
+			visited += 1
+			if visited > 20000 { return true }  // a large tree has certainly compiled something
+			if entry.hasSuffix(".SwiftFileList") { return true }
+		}
+		return false
+	}
+
+	private static func projectModificationDate(in root: URL) -> Date? {
+		let entries = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+		return entries.filter { $0.hasSuffix(".xcodeproj") }.compactMap { entry in
+			(try? FileManager.default.attributesOfItem(atPath: root.path + "/" + entry + "/project.pbxproj"))?[.modificationDate] as? Date
+		}.max()
+	}
+
 	/// Local packages the project depends on that live outside `root`: `XCLocalSwiftPackageReference`
 	/// entries of an Xcode project and `.package(path:)` dependencies of a Package.swift. sourcekit-lsp
 	/// only builds a proper index view of directories registered as workspace folders.

@@ -192,3 +192,136 @@ struct IntegrationTests {
 		#expect(hits.map(\.line) == [2])
 	}
 }
+
+@Suite struct ScanPrefilterTests {
+	@Test func importDetection() {
+		#expect(PositionResolver.importsModule("import DIC\n", "DIC"))
+		#expect(PositionResolver.importsModule("@testable import DIC\n", "DIC"))
+		#expect(PositionResolver.importsModule("  import struct DIC.Box\n", "DIC"))
+		#expect(!PositionResolver.importsModule("import DICKit\n", "DIC"))
+		#expect(!PositionResolver.importsModule("// import DIC\nlet x = 1\n", "DIC"))
+	}
+
+	@Test func moduleFromSourcesLayout() {
+		#expect(PositionResolver.moduleName(ofPath: "/a/checkouts/DIC/Sources/DIC/Box.swift") == "DIC")
+		#expect(PositionResolver.moduleName(ofPath: "/a/Sources/Main.swift") == nil)
+		#expect(PositionResolver.moduleName(ofPath: "/a/App/Box.swift") == nil)
+	}
+
+	@Test func scanSkipsFilesThatCannotSeeTheModule() throws {
+		let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("prefilter-\(UUID().uuidString)")
+		try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: dir) }
+		try "import Lib\nrun()\n".write(to: dir.appendingPathComponent("a.swift"), atomically: true, encoding: .utf8)
+		try "func run() {}\nrun()\n".write(to: dir.appendingPathComponent("b.swift"), atomically: true, encoding: .utf8)
+		let all = PositionResolver.occurrences(of: "run", under: [dir], limit: 10).hits
+		let filtered = PositionResolver.occurrences(of: "run", under: [dir], limit: 10, requiringImport: "Lib").hits
+		#expect(all.count == 3)
+		#expect(filtered.map { ($0.path as NSString).lastPathComponent } == ["a.swift"])
+	}
+}
+
+@Suite struct ObjectiveCAliasTests {
+	@Test func swiftNameFromDeclarationLine() {
+		#expect(PositionResolver.swiftName(declaredOn: "\tpublic func increment(by amount: Int) {", word: "increment") == "increment(by:)")
+		#expect(PositionResolver.swiftName(declaredOn: "func move(_ x: Int, to y: Int)", word: "move") == "move(_:to:)")
+		#expect(PositionResolver.swiftName(declaredOn: "func reset()", word: "reset") == "reset()")
+		#expect(PositionResolver.swiftName(declaredOn: "let reset = 1", word: "reset") == nil)
+	}
+
+	@Test func explicitObjcSelectorWins() {
+		let lines = ["\t@objc(bumpCounter:)", "\tfunc increment(by amount: Int) {}"]
+		#expect(PositionResolver.objcAliases(declaredAt: 1, in: lines, word: "increment") == ["bumpCounter"])
+		#expect(PositionResolver.objcAliases(declaredAt: 0, in: ["func increment(by x: Int) {}"], word: "increment")
+			== ["incrementBy", "incrementWithBy"])
+	}
+}
+
+@Suite struct BuildSettingsHealthTests {
+	private func project(buildRoot: String?) throws -> URL {
+		let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("health-\(UUID().uuidString)")
+		try FileManager.default.createDirectory(at: root.appendingPathComponent("App.xcodeproj"), withIntermediateDirectories: true)
+		try "".write(to: root.appendingPathComponent("App.xcodeproj/project.pbxproj"), atomically: true, encoding: .utf8)
+		let config = buildRoot.map { "{\"build_root\": \"\($0)\", \"name\": \"xcode build server\"}" } ?? "{}"
+		try config.write(to: root.appendingPathComponent("buildServer.json"), atomically: true, encoding: .utf8)
+		return root
+	}
+
+	@Test func missingBuildRootIsReported() throws {
+		let root = try project(buildRoot: "/nonexistent/DerivedData/App-abc")
+		defer { try? FileManager.default.removeItem(at: root) }
+		let problems = ProjectKind.buildSettingsProblems(in: root)
+		#expect(problems.count == 1)
+		#expect(problems[0].contains("doesn't exist"))
+	}
+
+	@Test func relinkOnlyBuildRootIsReportedAndFullOneIsClean() throws {
+		let derived = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("derived-\(UUID().uuidString)")
+		let root = try project(buildRoot: derived.path)
+		defer {
+			try? FileManager.default.removeItem(at: root)
+			try? FileManager.default.removeItem(at: derived)
+		}
+		try FileManager.default.createDirectory(at: derived.appendingPathComponent("Index.noindex/DataStore"), withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: derived.appendingPathComponent("Build/Intermediates.noindex/App"), withIntermediateDirectories: true)
+		let relink = ProjectKind.buildSettingsProblems(in: root)
+		#expect(relink.count == 1)
+		#expect(relink[0].contains("relink-only"))
+		try "".write(
+			to: derived.appendingPathComponent("Build/Intermediates.noindex/App/App.SwiftFileList"), atomically: true, encoding: .utf8)
+		#expect(ProjectKind.buildSettingsProblems(in: root).isEmpty)
+	}
+
+	@Test func swiftPackagesAndForeignConfigsAreNotChecked() throws {
+		let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+			.appendingPathComponent("Fixtures/SamplePackage")
+		#expect(ProjectKind.buildSettingsProblems(in: fixture).isEmpty)
+		let root = try project(buildRoot: nil)
+		defer { try? FileManager.default.removeItem(at: root) }
+		#expect(ProjectKind.buildSettingsProblems(in: root).isEmpty)  // no build_root: not an xcode-build-server file
+	}
+}
+
+/// A SwiftPM package with an Objective-C target and a Swift caller, through the real language server.
+@Suite(.enabled(if: (try? SourceKitLSPLocator.command()) != nil))
+struct MixedLanguageIntegrationTests {
+	static let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+		.appendingPathComponent("Fixtures/MixedPackage")
+
+	private func navigator() -> SwiftNavigator {
+		var environment = ProcessInfo.processInfo.environment
+		environment["CODENAV_SWIFT_WORKSPACE"] = Self.fixture.path
+		return SwiftNavigator(environment: environment, currentDirectory: Self.fixture)
+	}
+
+	@Test func objectiveCSymbolsAreNavigableFromSwiftAndBack() async {
+		let navigator = navigator()
+		let outline = await navigator.outline(filePath: "Sources/Bridge/Counter.m")
+		#expect(outline.contains("-incrementBy:"))
+		// A Swift spelling finds the Objective-C selector.
+		let callers = await navigator.callers(name: "Counter.increment(by:)", query: nil, filePath: nil)
+		#expect(callers.contains("bump(_:)"))
+		#expect(callers.contains("Doubler"))
+		let impls = await navigator.implementations(name: "Resettable", query: nil, portName: nil, filePath: nil)
+		#expect(impls.contains("Doubler"))
+		let definition = await navigator.definition(filePath: "Sources/App/main.swift", line: 4, column: nil, symbol: "increment")
+		#expect(definition.contains("incrementBy:"))
+	}
+
+	@Test func referencesAcceptAName() async {
+		let navigator = navigator()
+		let byName = await navigator.references(name: "Counter", filePath: nil)
+		#expect(byName.contains("Sources/App/main.swift"))
+		#expect(byName.contains("Doubler.m"))
+		let noTarget = await navigator.references(filePath: nil)
+		#expect(noTarget.isError)
+	}
+
+	@Test func searchScopeIsValidated() async {
+		let navigator = navigator()
+		let project = await navigator.searchSymbol(query: "Counter", name: nil, kind: nil, path: nil, scope: "project")
+		#expect(project.contains("Counter.h"))
+		let bad = await navigator.searchSymbol(query: "Counter", name: nil, kind: nil, path: nil, scope: "nope")
+		#expect(bad.isError)
+	}
+}

@@ -15,6 +15,7 @@ public actor SwiftNavigator {
 	static let defaultRequestTimeout: TimeInterval = 60
 	static let defaultIndexTimeout: TimeInterval = 30
 	static let maxTypeLocations = 3
+	static let defaultDependencyHits = 10
 	static let maxSubtypesVisited = 300
 
 	public nonisolated let notices: NoticeBoard
@@ -126,6 +127,8 @@ public actor SwiftNavigator {
 			client = started
 			startingClient = nil
 			if let advice = projectKind.advice(in: root) { notices.post(advice) }
+			let setup = ProjectKind.buildSettingsProblems(in: root)
+			if !setup.isEmpty { notices.post("build settings look incomplete: " + setup.joined(separator: " ")) }
 			try await started.refresh()
 			return started
 		} catch {
@@ -240,6 +243,8 @@ public actor SwiftNavigator {
 			)
 		}
 		if projectKind == .none, let advice = projectKind.advice(in: workspaceRoot) { parts.append(advice) }
+		let setup = ProjectKind.buildSettingsProblems(in: workspaceRoot)
+		if !setup.isEmpty { parts.append("Build settings look incomplete: " + setup.joined(separator: " ")) }
 		return parts.isEmpty ? "" : "\n\n" + parts.joined(separator: "\n")
 	}
 
@@ -271,20 +276,43 @@ public actor SwiftNavigator {
 		try? await client.definition(file, line: line, column: column).first
 	}
 
+	/// References for a symbol, plus occurrences matched by name only (`unverified`).
+	struct References {
+		var locations: [LSPLocation]
+		var unverified: [LSPLocation] = []
+	}
+
+	/// Where an occurrence's module comes from, when the declaration sits in a package's `Sources/<Target>/`:
+	/// a Swift file elsewhere can only use it by importing that module, which cheaply drops most candidates.
+	private func moduleToRequire(forDeclarationAt uri: String) -> String? {
+		guard isOutsideWorkspace(uri) || isDependencyPath(uri),
+			let path = uriToPath(uri)
+		else { return nil }
+		return PositionResolver.moduleName(ofPath: path)
+	}
+
+	/// Objective-C spellings of the Swift method declared at `origin` (an `@objc(selector:)` or the usual guesses).
+	private func objcAliases(declaredAt origin: LSPLocation, word: String) -> [String] {
+		guard let lines = readLines(of: origin.uri) else { return [] }
+		return PositionResolver.objcAliases(declaredAt: origin.range.start.line, in: lines, word: word)
+	}
+
 	/// References for the symbol at a position. The index is complete for what the project itself compiles,
 	/// but thin for a declaration in a sibling package or a dependency checkout (it sometimes reports only the
 	/// declaration). In those cases the answer is completed by scanning the sources for the name and asking
 	/// the server which occurrences resolve to this declaration (`UsageScan`).
 	private func referencesWithUsageFallback(
 		_ client: LSPClient, file: String, line: Int, column: Int, includeDeclaration: Bool = true
-	) async throws -> [LSPLocation] {
+	) async throws -> References {
 		let direct = try await client.references(file, line: line, column: column, includeDeclaration: includeDeclaration)
 		guard let text = try? readTextFile(URL(fileURLWithPath: file)),
 			let word = PositionResolver.word(at: column, onLine: line, in: text),
 			let origin = await declaration(client, file: file, line: line, column: column),
 			direct.count <= 1 || isOutsideWorkspace(origin.uri)
-		else { return direct }
-		let scan = await UsageScan.uses(of: word, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
+		else { return References(locations: direct) }
+		let scan = await UsageScan.uses(
+			of: word, aliases: objcAliases(declaredAt: origin, word: word), declaration: origin,
+			roots: scanRoots(declaredIn: origin.uri), client: client, module: moduleToRequire(forDeclarationAt: origin.uri))
 		var merged = direct
 		var seen = Set(direct.map { "\($0.uri)#\($0.range.start.line)#\($0.range.start.character)" })
 		for use in scan.uses {
@@ -293,10 +321,30 @@ public actor SwiftNavigator {
 			if !includeDeclaration, location.uri == origin.uri, location.range.start.line == origin.range.start.line { continue }
 			merged.append(location)
 		}
+		// Names the server couldn't resolve (no build settings for that file): listed apart, never merged in.
+		var unverified: [LSPLocation] = []
+		for use in scan.unresolved {
+			let location = UsageScan.location(use, name: word)
+			guard seen.insert("\(location.uri)#\(location.range.start.line)#\(location.range.start.character)").inserted else { continue }
+			unverified.append(location)
+		}
 		if scan.truncated {
 			notices.post("'\(word)' occurs in more than \(UsageScan.maxCandidates) places; the text scan stopped early, so references may be incomplete.")
 		}
-		return merged
+		return References(locations: merged, unverified: unverified)
+	}
+
+	static let maxUnverifiedListed = 15
+
+	/// Name-only matches as a compact section, or empty when there are none.
+	private func formatUnverified(_ locations: [LSPLocation]) -> String {
+		guard !locations.isEmpty else { return "" }
+		let shown = locations.prefix(Self.maxUnverifiedListed).map { location in
+			"\(relative(location.uri)):\(location.range.start.line + 1):\(location.range.start.character + 1)"
+		}
+		let more = locations.count > shown.count ? " … and \(locations.count - shown.count) more" : ""
+		return "\n\nUnverified (same name, but the language server has no build settings for these files, so they are matched by name only):\n"
+			+ shown.joined(separator: "\n") + more
 	}
 
 	/// Callers found by scan: each use of the name that resolves to the declaration, attributed to the
@@ -304,7 +352,9 @@ public actor SwiftNavigator {
 	private func scannedCallers(
 		_ client: LSPClient, name: String, aliases: [String] = [], origin: LSPLocation
 	) async -> (text: String, count: Int) {
-		let scan = await UsageScan.uses(of: name, aliases: aliases, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
+		let scan = await UsageScan.uses(
+			of: name, aliases: aliases, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client,
+			module: moduleToRequire(forDeclarationAt: origin.uri))
 		struct Key: Hashable { var path: String; var line: Int; var name: String }
 		var grouped: [Key: (kind: Int, sites: [Int])] = [:]
 		var symbolsByFile: [String: [SymbolNode]] = [:]
@@ -432,6 +482,11 @@ public actor SwiftNavigator {
 			if let advice = projectKind.advice(in: workspaceRoot), projectKind == .none || !projectKind.isNavigable {
 				lines.append(advice)
 			}
+			let setupProblems = ProjectKind.buildSettingsProblems(in: workspaceRoot)
+			if projectKind == .buildServer {
+				lines.append(setupProblems.isEmpty ? "build settings: ok (buildServer.json, build root with a Swift compilation and an index store)" : "build settings: PROBLEMS")
+				lines += setupProblems.map { "  - \($0)" }
+			}
 			if let command = try? commandOverride ?? SourceKitLSPLocator.command(environment: environment) {
 				lines.append("language server: \(command.joined(separator: " "))")
 			}
@@ -484,19 +539,36 @@ public actor SwiftNavigator {
 	}
 
 	public func references(
-		filePath: String, line: Int, column: Int?, symbol: String? = nil, includeDeclaration: Bool = true
+		name: String? = nil, query: String? = nil, filePath: String?, line: Int? = nil, column: Int? = nil,
+		symbol: String? = nil, includeDeclaration: Bool = true
 	) async -> ToolResult {
 		await run {
 			await useWorkspace()
-			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
-			let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
+			let file: String
+			let targetLine: Int
+			let targetColumn: Int
+			var prefix = ""
+			if let line, column != nil || symbol != nil, let given = filePath {
+				// A use site or declaration the caller points at.
+				let checked = try checkSwiftFile(given)
+				targetColumn = try await resolveColumn(client, filePath: checked, line: line, column: column, symbol: symbol)
+				file = await client.resolve(checked).path
+				targetLine = line
+			} else {
+				let target = try await resolveTarget(
+					client, name: name, query: query, example: "UserService.create(name:)", filePath: filePath, line: line,
+					column: column, symbol: symbol)
+				file = try path(of: target.symbol.uri)
+				targetLine = target.symbol.line + 1
+				targetColumn = target.symbol.column + 1
+				prefix = target.note.map { $0 + "\n" } ?? ""
+			}
 			await awaitIndex(client)
-			let locations = try await referencesWithUsageFallback(
-				client, file: await client.resolve(filePath).path, line: line, column: column,
-				includeDeclaration: includeDeclaration)
-			let text = formatReferences(locations, workspaceRoot: workspaceRoot)
-			return locations.isEmpty ? text + (await emptyResultHint(client)) : text
+			let found = try await referencesWithUsageFallback(
+				client, file: file, line: targetLine, column: targetColumn, includeDeclaration: includeDeclaration)
+			let text = formatReferences(found.locations, workspaceRoot: workspaceRoot) + formatUnverified(found.unverified)
+			return prefix + (found.locations.isEmpty && found.unverified.isEmpty ? text + (await emptyResultHint(client)) : text)
 		}
 	}
 
@@ -526,7 +598,7 @@ public actor SwiftNavigator {
 	}
 
 	public func searchSymbol(
-		query: String?, name: String?, kind: String?, path: String?, fuzzy: Bool = false
+		query: String?, name: String?, kind: String?, path: String?, fuzzy: Bool = false, scope: String? = nil
 	) async -> ToolResult {
 		await run {
 			await useWorkspace()
@@ -545,14 +617,27 @@ public actor SwiftNavigator {
 				}
 			}
 			if symbols.isEmpty { return "No symbols matching '\(query)'." + (await emptyResultHint(client)) }
-			let matching = filterSymbols(symbols, workspaceRoot: workspaceRoot, kinds: kinds, path: path)
+			let scopeName = (scope ?? "default").lowercased()
+			guard ["default", "project", "dependencies", "all"].contains(scopeName) else {
+				throw ToolInputError("`scope` must be project, dependencies or all (default: project code first, a few dependency hits after).")
+			}
+			let scoped = symbols.filter { symbol in
+				switch scopeName {
+				case "project": return !isDependencyPath(symbol.location.uri)
+				case "dependencies": return isDependencyPath(symbol.location.uri)
+				default: return true
+				}
+			}
+			let matching = filterSymbols(scoped, workspaceRoot: workspaceRoot, kinds: kinds, path: path)
 			if matching.isEmpty {
 				let filters = [("kind", kind), ("path", path)].compactMap { key, value in
 					value.map { "\(key)='\($0)'" }
 				}.joined(separator: ", ")
 				return "No symbols matching '\(query)' with \(filters) (\(symbols.count) without the filters)."
 			}
-			let listing = formatWorkspaceSymbols(matching, workspaceRoot: workspaceRoot, query: parsed.name, fuzzy: fuzzy)
+			let listing = formatWorkspaceSymbols(
+				matching, workspaceRoot: workspaceRoot, query: parsed.name, fuzzy: fuzzy,
+				dependencyLimit: scopeName == "default" ? Self.defaultDependencyHits : nil)
 			return listing.isEmpty ? "No symbols matching '\(query)'." : listing
 		}
 	}
@@ -575,6 +660,8 @@ public actor SwiftNavigator {
 				text += "\n\nThese look like missing build settings for this file rather than real errors (the file is analyzed "
 					+ "without its target's SDK and module search paths). With an Xcode project, run a full build and regenerate "
 					+ "buildServer.json (`xcode-build-server config`): a build that only relinked doesn't record Swift compile commands."
+				let setup = ProjectKind.buildSettingsProblems(in: workspaceRoot)
+				if !setup.isEmpty { text += "\nWhat `workspace` found: " + setup.joined(separator: " ") }
 			}
 			return text
 		}
@@ -597,11 +684,12 @@ public actor SwiftNavigator {
 			let column = resolved.column + 1
 			let hoverText = try await client.hover(file, line: line, column: column)
 			let definitions = try await client.definition(file, line: line, column: column)
-			var references: [LSPLocation] = []
+			var found = References(locations: [])
 			if includeReferences {
 				await awaitIndex(client)
-				references = try await referencesWithUsageFallback(client, file: file, line: line, column: column)
+				found = try await referencesWithUsageFallback(client, file: file, line: line, column: column)
 			}
+			let references = found.locations
 			let header = "\(resolved.qualifiedName)  [\(SymbolKind.label(resolved.kind))]  (\(relativePath):\(line):\(column))"
 			var parts = [header]
 			if let note = target.note { parts.append(note) }
@@ -616,7 +704,7 @@ public actor SwiftNavigator {
 					: definitions.map { formatLocation($0, workspaceRoot: workspaceRoot) }.joined(separator: "\n\n"),
 			]
 			if includeReferences {
-				parts += ["", "References:", formatReferencesGrouped(references, workspaceRoot: workspaceRoot)]
+				parts += ["", "References:", formatReferencesGrouped(references, workspaceRoot: workspaceRoot) + formatUnverified(found.unverified)]
 				if references.isEmpty { parts.append(await emptyResultHint(client)) }
 			}
 			return parts.joined(separator: "\n")
@@ -668,7 +756,7 @@ public actor SwiftNavigator {
 				range: LSPRange(
 					start: LSPPosition(line: resolved.line, character: resolved.column),
 					end: LSPPosition(line: resolved.line, character: resolved.column)))
-			let scanned = await scannedCallers(client, name: PositionResolver.baseName(of: resolved.name), aliases: PositionResolver.objcSpellings(ofSwiftName: resolved.name), origin: origin)
+			let scanned = await scannedCallers(client, name: PositionResolver.baseName(of: resolved.name), aliases: objcAliases(declaredAt: origin, word: PositionResolver.baseName(of: resolved.name)) + PositionResolver.objcSpellings(ofSwiftName: resolved.name), origin: origin)
 			if scanned.count > 0 {
 				let fromIndex = calls.isEmpty ? "" : formatCallers(calls, workspaceRoot: workspaceRoot) + "\n"
 				return prefix + (calls.isEmpty ? scanned.text : mergeCallerText(fromIndex, scanned.text))
@@ -768,7 +856,9 @@ public actor SwiftNavigator {
 				range: LSPRange(
 					start: LSPPosition(line: resolved.line, character: resolved.column),
 					end: LSPPosition(line: resolved.line, character: resolved.column)))
-			let scan = await UsageScan.uses(of: resolved.name, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client)
+			let scan = await UsageScan.uses(
+				of: resolved.name, declaration: origin, roots: scanRoots(declaredIn: origin.uri), client: client,
+				module: moduleToRequire(forDeclarationAt: origin.uri))
 			var symbolsByFile: [String: [SymbolNode]] = [:]
 			var added = Set<String>()
 			var unverified = false

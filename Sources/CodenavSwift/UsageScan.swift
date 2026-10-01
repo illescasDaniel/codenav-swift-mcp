@@ -21,14 +21,16 @@ struct UsageScan {
 
 	/// Occurrences of `name` whose definition is `declaration` (same file, same line).
 	static func uses(
-		of name: String, aliases: [String] = [], declaration: LSPLocation, roots: [URL], client: LSPClient
+		of name: String, aliases: [String] = [], declaration: LSPLocation, roots: [URL], client: LSPClient,
+		module: String? = nil
 	) async -> Result {
 		// Objective-C and C sources are scanned too: they can use a Swift declaration (spelled `aliases`).
 		var candidates: [PositionResolver.Occurrence] = []
 		var truncated = false
 		for spelling in [name] + aliases {
 			let found = PositionResolver.occurrences(
-				of: spelling, under: roots, limit: maxCandidates - candidates.count, includeClang: true)
+				of: spelling, under: roots, limit: maxCandidates - candidates.count, includeClang: true,
+				requiringImport: module)
 			candidates += found.hits
 			truncated = truncated || found.truncated
 			if candidates.count >= maxCandidates { truncated = true; break }
