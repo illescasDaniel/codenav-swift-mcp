@@ -119,6 +119,10 @@ public struct LSPDiagnostic: Decodable, Sendable {
 	public var severity: Int?
 	public var code: JSONValue?
 	public var message: String
+	/// Quick fixes sourcekit-lsp attaches to the diagnostic (`Insert ', overwrite: '`, `Add missing case`, ...).
+	public var fixes: [LSPCodeAction] = []
+	/// The diagnostic exactly as the server sent it, to hand back in a `codeAction` request's context.
+	public var raw: JSONValue?
 
 	public var codeText: String? {
 		switch code {
@@ -126,6 +130,81 @@ public struct LSPDiagnostic: Decodable, Sendable {
 		case .int(let value): return String(value)
 		default: return nil
 		}
+	}
+
+	public var isError: Bool { severity == nil || severity == 1 }
+	public var isWarning: Bool { severity == 2 }
+
+	private enum CodingKeys: String, CodingKey { case range, severity, code, message, codeActions }
+
+	public init(range: LSPRange, severity: Int?, message: String, code: JSONValue? = nil, fixes: [LSPCodeAction] = []) {
+		self.range = range
+		self.severity = severity
+		self.message = message
+		self.code = code
+		self.fixes = fixes
+	}
+
+	public init(from decoder: Decoder) throws {
+		let container = try decoder.container(keyedBy: CodingKeys.self)
+		range = try container.decode(LSPRange.self, forKey: .range)
+		severity = try container.decodeIfPresent(Int.self, forKey: .severity)
+		code = try container.decodeIfPresent(JSONValue.self, forKey: .code)
+		message = try container.decode(String.self, forKey: .message)
+		fixes = (try? container.decodeIfPresent([LSPCodeAction].self, forKey: .codeActions)) ?? []
+		raw = try? decoder.singleValueContainer().decode(JSONValue.self)
+	}
+}
+
+/// A `CodeAction`: an edit to apply, or a server command to execute (which answers with edits).
+public struct LSPCodeAction: Decodable, Sendable {
+	public struct Command: Codable, Sendable, Hashable {
+		public var title: String?
+		public var command: String
+		public var arguments: [JSONValue]?
+	}
+
+	public var title: String
+	public var kind: String?
+	public var edit: LSPWorkspaceEdit?
+	public var command: Command?
+
+	public init(title: String, kind: String? = nil, edit: LSPWorkspaceEdit? = nil, command: Command? = nil) {
+		self.title = title
+		self.kind = kind
+		self.edit = edit
+		self.command = command
+	}
+
+	private enum CodingKeys: String, CodingKey { case title, kind, edit, command }
+
+	public init(from decoder: Decoder) throws {
+		let container = try decoder.container(keyedBy: CodingKeys.self)
+		title = try container.decode(String.self, forKey: .title)
+		kind = try container.decodeIfPresent(String.self, forKey: .kind)
+		edit = try container.decodeIfPresent(LSPWorkspaceEdit.self, forKey: .edit)
+		// `command` is a Command object on an action and a bare string on a bare Command.
+		command = try? container.decodeIfPresent(Command.self, forKey: .command)
+	}
+}
+
+/// Answer to `textDocument/prepareRename`: `Range | { range, placeholder } | { defaultBehavior }`.
+public struct PrepareRenameResult: Decodable, Sendable {
+	public var range: LSPRange?
+	public var placeholder: String?
+
+	private enum CodingKeys: String, CodingKey { case range, placeholder, start, end }
+
+	public init(from decoder: Decoder) throws {
+		let container = try decoder.container(keyedBy: CodingKeys.self)
+		if let range = try container.decodeIfPresent(LSPRange.self, forKey: .range) {
+			self.range = range
+		} else if let start = try container.decodeIfPresent(LSPPosition.self, forKey: .start),
+			let end = try container.decodeIfPresent(LSPPosition.self, forKey: .end)
+		{
+			range = LSPRange(start: start, end: end)
+		}
+		placeholder = try container.decodeIfPresent(String.self, forKey: .placeholder)
 	}
 }
 

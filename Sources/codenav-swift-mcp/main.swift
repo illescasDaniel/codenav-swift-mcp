@@ -32,10 +32,12 @@ if commandLineArguments.contains(where: { $0 == "--help" || $0 == "-h" }) {
 func inputSchema(for tool: ToolSpec) -> Value {
 	var properties: [String: Value] = [:]
 	for parameter in tool.parameters {
-		properties[parameter.name] = .object([
+		var property: [String: Value] = [
 			"type": .string(parameter.kind.rawValue),
 			"description": .string(parameter.description),
-		])
+		]
+		if parameter.kind == .array { property["items"] = .object(["type": .string("object")]) }
+		properties[parameter.name] = .object(property)
 	}
 	var schema: [String: Value] = ["type": "object", "properties": .object(properties)]
 	let required = tool.parameters.filter(\.required).map { Value.string($0.name) }
@@ -52,10 +54,13 @@ func convert(_ arguments: [String: Value]?) -> ToolArguments {
 	return ToolArguments(decoded)
 }
 
+// Tools that change files are opt-in: the server has always been read-only, so upgrading must not change that.
+let writesEnabled = ["1", "true", "yes"].contains(ProcessInfo.processInfo.environment[ToolCatalog.writeEnvironmentKey]?.lowercased() ?? "")
+
 let server = Server(
 	name: "codenav-swift",
 	version: serverVersion,
-	instructions: ToolCatalog.instructions,
+	instructions: ToolCatalog.instructions + (writesEnabled ? " " + ToolCatalog.writeInstructions : ""),
 	capabilities: .init(tools: .init(listChanged: false))
 )
 
@@ -75,13 +80,22 @@ let navigator = SwiftNavigator(
 	}
 )
 
-let toolList = ToolCatalog.tools.map {
-	Tool(name: $0.name, description: $0.description, inputSchema: inputSchema(for: $0), annotations: .init(readOnlyHint: true))
+let toolList = (writesEnabled ? ToolCatalog.tools : ToolCatalog.readTools + ToolCatalog.analysisTools).map { spec -> Tool in
+	let annotations: Tool.Annotations
+	if ToolCatalog.writeToolNames.contains(spec.name) {
+		annotations = .init(readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false)
+	} else if ToolCatalog.analysisToolNames.contains(spec.name) {
+		annotations = .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
+	} else {
+		annotations = .init(readOnlyHint: true)
+	}
+	return Tool(name: spec.name, description: spec.description, inputSchema: inputSchema(for: spec), annotations: annotations)
 }
 
 await server.withMethodHandler(ListTools.self) { _ in .init(tools: toolList) }
 await server.withMethodHandler(CallTool.self) { params in
-	let result = await ToolCatalog.call(params.name, arguments: convert(params.arguments), navigator: navigator)
+	let result = await ToolCatalog.call(
+		params.name, arguments: convert(params.arguments), navigator: navigator, writesEnabled: writesEnabled)
 	return .init(content: [.text(text: result.text, annotations: nil, _meta: nil)], isError: result.isError)
 }
 

@@ -253,6 +253,11 @@ public actor LSPClient {
 	private var dependencyFailures = 0
 
 	private var openFiles: [String: OpenFile] = [:]
+	/// Documents whose text lives only in memory (a proposed edit being checked): `ensureOpen` and
+	/// `refresh` leave them alone instead of re-reading the disk.
+	private var overlays: Set<String> = []
+	/// Collects the edits a server asks us to apply (`workspace/applyEdit`) while a command runs.
+	private var capturedEdits: LSPWorkspaceEdit?
 	private var pushedDiagnostics: [String: [LSPDiagnostic]] = [:]
 	private var diagnosticWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 	private var diagnosticsArrived: Set<String> = []
@@ -327,8 +332,18 @@ public actor LSPClient {
 				"definition": ["linkSupport": true],
 				"hover": ["contentFormat": ["markdown", "plaintext"]],
 				"diagnostic": ["dynamicRegistration": false],
+				"codeAction": [
+					"codeActionLiteralSupport": [
+						"codeActionKind": [
+							"valueSet": ["quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source"]
+						]
+					]
+				],
+				"rename": ["prepareSupport": true],
 			],
 			"workspace": [
+				"applyEdit": true,
+				"workspaceEdit": ["documentChanges": true],
 				"workspaceFolders": true,
 				"didChangeWatchedFiles": ["dynamicRegistration": true],
 				"symbol": [:],
@@ -472,6 +487,13 @@ public actor LSPClient {
 				lastActivity = Date()
 			}
 			reply.result = .null
+		case "workspace/applyEdit":
+			if capturedEdits != nil, let json = params?["edit"], let edit = try? JSONValue.decode(LSPWorkspaceEdit.self, from: json) {
+				capturedEdits?.merge(edit)
+				reply.result = ["applied": .bool(true)]
+			} else {
+				reply.result = ["applied": .bool(false)]
+			}
 		case "client/registerCapability", "client/unregisterCapability", "workspace/diagnostic/refresh",
 			"workspace/semanticTokens/refresh", "workspace/inlayHint/refresh", "workspace/codeLens/refresh",
 			"workspace/tests/refresh", "workspace/playgrounds/refresh", "window/showMessageRequest":
@@ -681,14 +703,14 @@ public actor LSPClient {
 	// MARK: - Document sync
 
 	public func resolve(_ filePath: String) -> URL {
-		let url = URL(fileURLWithPath: filePath, relativeTo: configuration.workspaceRoot)
-		return url.realPath
+		canonicalFileURL(filePath, relativeTo: configuration.workspaceRoot)
 	}
 
 	@discardableResult
 	public func ensureOpen(_ filePath: String) async throws -> String {
 		let url = resolve(filePath)
 		let uri = url.absoluteString
+		if overlays.contains(uri) { return uri }
 		let stamp = try Self.stamp(of: url)
 		if let known = openFiles[uri], known.modified == stamp.modified, known.size == stamp.size { return uri }
 		let text = try readTextFile(url)
@@ -841,7 +863,7 @@ public actor LSPClient {
 			notify("workspace/didChangeWatchedFiles", params: ["changes": .array(changes)])
 		}
 		for (uri, _) in openFiles {
-			guard let url = URL(string: uri) else { continue }
+			guard !overlays.contains(uri), let url = URL(string: uri) else { continue }
 			if FileManager.default.fileExists(atPath: url.path) {
 				try await ensureOpen(url.path)
 			} else {
@@ -852,6 +874,72 @@ public actor LSPClient {
 
 	private static func change(_ url: URL, _ type: FileChange) -> JSONValue {
 		["uri": .string(url.absoluteString), "type": .int(type.rawValue)]
+	}
+
+	// MARK: - In-memory documents
+
+	/// Shows the server `text` for a file without touching the disk, so diagnostics, hover and
+	/// references answer for the proposed version. Pair with `clearOverlay`.
+	public func setOverlay(_ filePath: String, text: String) {
+		let uri = resolve(filePath).absoluteString
+		diagnosticsArrived.remove(uri)
+		pushedDiagnostics.removeValue(forKey: uri)
+		lastActivity = Date()
+		if let known = openFiles[uri] {
+			let version = known.version + 1
+			notify(
+				"textDocument/didChange",
+				params: ["textDocument": ["uri": .string(uri), "version": .int(version)], "contentChanges": [["text": .string(text)]]])
+			openFiles[uri] = OpenFile(version: version, modified: known.modified, size: known.size, text: text)
+		} else {
+			notify(
+				"textDocument/didOpen",
+				params: [
+					"textDocument": [
+						"uri": .string(uri), "languageId": .string(Self.languageID(for: URL(string: uri) ?? resolve(filePath), default: configuration.languageID)),
+						"version": 1, "text": .string(text),
+					]
+				])
+			openFiles[uri] = OpenFile(version: 1, modified: .distantPast, size: -1, text: text)
+		}
+		overlays.insert(uri)
+	}
+
+	/// Goes back to the on-disk text (or closes the document when the file doesn't exist).
+	public func clearOverlay(_ filePath: String) async throws {
+		let url = resolve(filePath)
+		let uri = url.absoluteString
+		guard overlays.remove(uri) != nil else { return }
+		if FileManager.default.fileExists(atPath: url.path) {
+			openFiles[uri]?.modified = .distantPast
+			openFiles[uri]?.size = -1
+			try await ensureOpen(url.path)
+		} else {
+			closeDocument(uri)
+		}
+	}
+
+	public func clearAllOverlays() async {
+		for uri in overlays {
+			if let url = URL(string: uri) { try? await clearOverlay(url.path) }
+		}
+	}
+
+	/// Asks for the diagnostics of files and drops the answer. sourcekit-lsp only folds a changed document
+	/// into what other files see once something has been requested of that document, so after changing or
+	/// reverting documents this is what makes the other files' answers current instead of cached.
+	public func touch(_ filePaths: [String]) async {
+		for path in filePaths { _ = try? await diagnostics(path) }
+	}
+
+	public func hasOverlay(_ filePath: String) -> Bool {
+		overlays.contains(resolve(filePath).absoluteString)
+	}
+
+	/// The text the server currently holds for a file, when it is an in-memory version.
+	public func overlayText(_ filePath: String) -> String? {
+		let uri = resolve(filePath).absoluteString
+		return overlays.contains(uri) ? openFiles[uri]?.text : nil
 	}
 
 	// MARK: - LSP calls used by the tools
@@ -999,6 +1087,40 @@ public actor LSPClient {
 	public func subtypes(_ item: HierarchyItem) async throws -> [HierarchyItem] {
 		try await request("typeHierarchy/subtypes", params: ["item": try JSONValue.encode(item)], as: [HierarchyItem].self)
 			?? []
+	}
+
+	/// Quick fixes and refactorings offered for a range. `diagnostics` are the ones the range is about.
+	public func codeActions(
+		_ filePath: String, range: LSPRange, diagnostics: [LSPDiagnostic] = [], only: [String]? = nil
+	) async throws -> [LSPCodeAction] {
+		let uri = try await ensureOpen(filePath)
+		var context: [String: JSONValue] = ["diagnostics": .array(diagnostics.compactMap(\.raw))]
+		if let only { context["only"] = .array(only.map { .string($0) }) }
+		return try await request(
+			"textDocument/codeAction",
+			params: ["textDocument": ["uri": .string(uri)], "range": try JSONValue.encode(range), "context": .object(context)],
+			as: [LSPCodeAction].self) ?? []
+	}
+
+	/// Runs a server command (a refactoring) and returns the edits it asks the client to apply.
+	public func executeCommand(_ command: LSPCodeAction.Command) async throws -> LSPWorkspaceEdit {
+		capturedEdits = LSPWorkspaceEdit()
+		defer { capturedEdits = nil }
+		_ = try await request(
+			"workspace/executeCommand",
+			params: ["command": .string(command.command), "arguments": .array(command.arguments ?? [])], as: JSONValue.self)
+		return capturedEdits ?? LSPWorkspaceEdit()
+	}
+
+	public func prepareRename(_ filePath: String, line: Int, column: Int) async throws -> PrepareRenameResult? {
+		try await positional("textDocument/prepareRename", filePath, line: line, column: column, as: PrepareRenameResult.self)
+	}
+
+	/// The edits renaming the symbol at a position to `newName` (`make(named:)` renames argument labels too).
+	public func rename(_ filePath: String, line: Int, column: Int, newName: String) async throws -> LSPWorkspaceEdit {
+		try await positional(
+			"textDocument/rename", filePath, line: line, column: column, extra: ["newName": .string(newName)],
+			as: LSPWorkspaceEdit.self) ?? LSPWorkspaceEdit()
 	}
 
 	public func diagnostics(_ filePath: String) async throws -> [LSPDiagnostic] {

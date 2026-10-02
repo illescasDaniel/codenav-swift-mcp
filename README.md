@@ -20,7 +20,8 @@ protocol witnesses, extensions and inferred types.
   *scan + verify* pass, and calls that cross the Swift/Objective-C boundary are followed in both directions.
 * **Says what's wrong with your setup.** A stale `buildServer.json`, a relink-only build, a failed background build,
   or a workspace with no Swift project are reported with the command that fixes them.
-* **Read-only.** Every tool is annotated `readOnlyHint`: it never edits your code.
+* **Read-only by default.** The navigation tools never edit your code. [Compiler-checked editing tools](#editing-opt-in)
+  (rename, change a signature, edit a symbol, ...) exist too, and are off until you set `CODENAV_SWIFT_WRITE=1`.
 
 ## What it looks like
 
@@ -115,7 +116,9 @@ Doubler  [Class]  (Sources/Bridge/Doubler.m:6:17)
 | `search_symbol` | Workspace symbol search with `kind`, `path` and `scope` filters; production code ranks before tests |
 | `hover`, `definition` | Position-based: 1-indexed `line`, plus a UTF-16 `column` or `symbol` (the identifier's text on that line) |
 | `diagnostics` | Compiler errors and warnings for a file, with a hint when they look like missing build settings |
-| `workspace` | Which directory is navigated and why, the project kind, index state and build-settings health |
+| `workspace` | Which directory is navigated and why, the project kind, index state, build-settings health and whether the write tools are on |
+| `verify` | *Does it build?* Runs `swift build --build-tests` (and, with `tests`, `swift test`) and reports errors with file and line |
+| `affected_tests` | *Which tests exercise this?* Test functions that use a symbol or reach it through calls, and the `swift test --filter` for them |
 
 Names carry Swift argument labels (`create(name:)`). A bare `create` works unless overloads make it ambiguous;
 `Type.member` and `Outer.Inner.member` are accepted, and so are Objective-C selectors (`incrementBy:` finds
@@ -123,6 +126,86 @@ Names carry Swift argument labels (`create(name:)`). A bare `create` works unles
 of a name, which resolves locals, overloads that share labels, and SDK types such as `String` through the type
 checker. `file_path` may be relative to the workspace, `../Sibling/...` or absolute. Failures (bad input, ambiguous
 or unknown names, server errors) are returned with MCP `isError` set.
+
+## Editing (opt-in)
+
+An agent that edits with text replacement finds out what it broke later. These tools turn an edit into something the
+compiler has already looked at: the change is shown to sourcekit-lsp **in memory**, compiled, compared with the
+diagnostics from before, and written only if it introduces no new errors. Off by default; enable them with
+`CODENAV_SWIFT_WRITE=1` in the server's environment (`claude mcp add codenav-swift --scope user -e CODENAV_SWIFT_WRITE=1 -- codenav-swift-mcp`).
+
+| Tool | What it does |
+| --- | --- |
+| `rename_symbol` | Renames through the type checker (overloads, witnesses, overrides, labels). Rejects keywords, wrong label counts and collisions, then lists what a rename can't follow: the name left in comments and strings, Codable keys that would change, Objective-C exposure. `keep_deprecated_alias` leaves a forwarding function |
+| `change_signature` | Adds, removes, reorders, retypes or re-defaults parameters **and rewrites every call site**; overrides and protocol witnesses change with it, and a witness pulls in the requirement it implements |
+| `edit_symbol` | Replaces a declaration, or only its body, addressed by name: no text to quote, no wrong overload |
+| `insert_member` | Adds a member to a type or extension (`first`, `last`, `after:x`, `before:x`), or a top-level declaration, indented like its neighbours |
+| `delete_symbol`, `move_symbol` | Delete refuses while anything still uses the symbol and lists the usages; move carries the doc comment and imports to another file |
+| `add_conformance` | `extension T: P` (or inline) with the compiler's stubs, re-indented, returning stubs as `fatalError` so it compiles |
+| `fix_diagnostics` | Applies the compiler's own fix-its in a file, re-checking between rounds |
+| `refactor` | sourcekit-lsp's Extract Method / Expression, Convert to Async, Memberwise Init... with tidy indentation and your name for the result |
+| `apply_edit`, `check_edit` | General text edits (replace, line ranges, create, delete; several files at once, all or nothing). `check_edit` is the dry run |
+| `undo_edit` | Puts back what an earlier edit changed (refuses if the files were edited since, unless `force`) |
+
+Every one of them takes `dry_run`, `require` (`no_new_errors` by default, or `none`) and `verify` (`auto`, `build`, `none`).
+
+```text
+> rename_symbol(name: "UserStore.save(_:)", new_name: "persist")
+
+rename_symbol UserStore.save(_:) → persist(_:): applied as e2 (4 file(s) written).
+  Sources/SampleKit/Ports.swift: +1 −1
+  Sources/SampleKit/Stores.swift: +1 −1
+  Sources/SampleKit/UserService.swift: +2 −2
+  Tests/SampleKitTests/UserServiceTests.swift: +1 −1
+Compile check (sourcekit-lsp, in memory, 3 file(s)): ✓ no new errors
+Not checked in memory: 1 file(s) in modules that depend on a changed module (Tests/SampleKitTests/UserServiceTests.swift): ...
+Note: it is a protocol requirement: conforming types' implementations were renamed with it
+Build (swift build --build-tests, 1.3s): ✓ succeeded
+Undo with undo_edit(id: "e2").
+```
+
+A change that breaks something is refused, with the errors and their fix-its, and nothing is written:
+
+```text
+> change_signature(name: "UserStore.save(_:)", operations: [{op: "add", param: "overwrite: Bool"}])
+
+Can't change the signature: parameter 'overwrite' has no default value, so give `call_value` ...
+
+> apply_edit(file_path: "Sources/SampleKit/Ports.swift", old_text: "func save(_ user: User) async throws",
+             new_text: "func save(_ user: User, overwrite: Bool) async throws")
+
+apply_edit: NOT applied. The change introduces 3 compile error(s); no file was modified.
+Compile check (sourcekit-lsp, in memory, 3 file(s)): ✗ 3 new error(s)
+  Sources/SampleKit/Stores.swift:1:14 error: Type 'InMemoryUserStore' does not conform to protocol 'UserStore'
+  Sources/SampleKit/UserService.swift:12:28 error: Missing argument for parameter 'overwrite' in call
+      fix-it: Insert ', overwrite: '
+```
+
+### What "checked" means
+
+The check has two tiers, and every result says which ones ran:
+
+1. **In memory (sourcekit-lsp).** The edited files and every file in the same module that mentions a changed
+   declaration are compiled with the proposal in place, before and after; only *new* errors count. On the fixtures it
+   takes a fraction of a second to a couple of seconds once the server is warm. A new file can't be judged until it exists, so it is written and checked right after, and
+   the whole change is rolled back if it has errors.
+2. **A real build.** sourcekit-lsp cannot see an in-memory change across module boundaries, so files in modules that
+   depend on a changed one (the app, the tests) are *not* judged in memory; instead the package is built after
+   writing (`verify=auto`). If the build adds errors, every file is put back. Errors that were already there are
+   recognised and don't block. `check_edit verify=build` does the same in a temporary write that is always undone.
+
+Limits worth knowing:
+
+* The build tier needs a SwiftPM package (it reads the target graph from `swift package describe`). For an Xcode
+  project the in-memory tier still runs, but module boundaries are unknown, and the result says that files in other
+  targets were not compiled: build the project to be sure.
+* While a file has type errors, the Swift compiler skips flow analysis (missing returns, uninitialized variables), so
+  a check on a file that already had errors may be incomplete; the result says so.
+* If the language server can't analyze a file at all (broken build settings), the change is reported **not verified**
+  and refused rather than waved through. `workspace` shows why.
+* `undo_edit` history lives in the server's memory for the session; git remains the safety net across restarts.
+* Edits are limited to the workspace and its local packages; dependency checkouts and build products are refused.
+* File modes and `\r\n` line endings are preserved.
 
 ## Requirements
 
@@ -251,6 +334,8 @@ All optional.
 | `CODENAV_SWIFT_LSP_ARGS` | Extra arguments for it, whitespace-separated |
 | `CODENAV_SWIFT_INDEX_TIMEOUT` | Seconds to wait for background indexing before answering (default 30); a notice says when results may be partial |
 | `CODENAV_SWIFT_REQUEST_TIMEOUT` | Seconds an individual language-server request may take (default 60) |
+| `CODENAV_SWIFT_WRITE` | `1` enables the [editing tools](#editing-opt-in). Off by default |
+| `CODENAV_SWIFT_BUILD_TIMEOUT` | Seconds a `swift build` / `swift test` run by `verify` or an edit may take (default 600); the whole process tree is killed after that |
 | `CODENAV_SWIFT_LOCAL_PACKAGE_FOLDERS` | `1` registers local sibling packages as extra language-server workspace folders. Off by default: sourcekit-lsp then builds and indexes each package on its own (slow, large `.build`) |
 
 ## How it works

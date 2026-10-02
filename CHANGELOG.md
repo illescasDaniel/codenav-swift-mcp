@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+* **Compiler-checked editing tools**, off unless `CODENAV_SWIFT_WRITE=1`: `rename_symbol`, `change_signature`, `edit_symbol`,
+  `insert_member`, `delete_symbol`, `move_symbol`, `add_conformance`, `fix_diagnostics`, `refactor`, `apply_edit`,
+  `check_edit` and `undo_edit`. A change is compiled in memory by sourcekit-lsp (diagnostics before vs after, in the edited
+  files and every file that uses a changed name), written atomically only when it adds no errors, and journaled for undo.
+* Files in modules that depend on a changed module are checked with a real `swift build --build-tests` after writing
+  (SwiftPM target graph from `swift package describe`); a build that adds errors puts every file back.
+* `verify` (build, and optionally run the tests) and `affected_tests` (the tests that use or reach a symbol, with the
+  `swift test --filter` for them) are always available.
+* `workspace` reports whether the write tools are on.
+* `CODENAV_SWIFT_BUILD_TIMEOUT` bounds builds and test runs.
+
 ## 0.1.3
 
 * `--version` and `--help` print and exit instead of waiting for MCP input on stdin.

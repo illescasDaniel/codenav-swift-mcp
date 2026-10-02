@@ -1,0 +1,478 @@
+import Foundation
+import Testing
+
+@testable import CodenavSwift
+@testable import NavShared
+
+private func symbol(
+	_ name: String, kind: Int, lines: ClosedRange<Int>, startColumn: Int = 0, endColumn: Int = 1, children: [DocumentSymbol] = []
+) throws -> DocumentSymbol {
+	DocumentSymbol(
+		name: name, detail: nil, kind: kind,
+		range: LSPRange(start: LSPPosition(line: lines.lowerBound, character: startColumn), end: LSPPosition(line: lines.upperBound, character: endColumn)),
+		selectionRange: LSPRange(
+			start: LSPPosition(line: lines.lowerBound, character: startColumn),
+			end: LSPPosition(line: lines.lowerBound, character: startColumn + name.utf16.count)),
+		children: children)
+}
+
+@Suite struct StagingTests {
+	private func makeRoot() throws -> URL {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("staging-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: root.appendingPathComponent("Sources/App"), withIntermediateDirectories: true)
+		return root.realPath
+	}
+
+	@Test func stagesEditsAcrossStepsAndReportsOnlyRealChanges() throws {
+		let root = try makeRoot()
+		defer { try? FileManager.default.removeItem(at: root) }
+		try "let a = 1\n".write(to: root.appendingPathComponent("Sources/App/A.swift"), atomically: true, encoding: .utf8)
+		var staging = Staging(root: root, allowedRoots: [root])
+		try staging.apply([TextEdit(line: 0, column: 8, endLine: 0, endColumn: 9, newText: "2")], to: "Sources/App/A.swift")
+		try staging.apply([TextEdit(line: 0, column: 4, endLine: 0, endColumn: 5, newText: "b")], to: "Sources/App/A.swift")
+		#expect(try staging.read("Sources/App/A.swift") == "let b = 2\n")
+		// Putting the text back is no change at all.
+		try staging.write("let a = 1\n", to: "Sources/App/A.swift")
+		#expect(staging.plan().isEmpty)
+	}
+
+	@Test func createsAndDeletesFiles() throws {
+		let root = try makeRoot()
+		defer { try? FileManager.default.removeItem(at: root) }
+		try "x\n".write(to: root.appendingPathComponent("Sources/App/Old.swift"), atomically: true, encoding: .utf8)
+		var staging = Staging(root: root, allowedRoots: [root])
+		try staging.write("new\n", to: "Sources/App/New.swift")
+		try staging.write(nil, to: "Sources/App/Old.swift")
+		let plan = staging.plan()
+		#expect(plan.changes.count == 2)
+		#expect(plan.changes.first(where: { $0.path.hasSuffix("New.swift") })?.isCreation == true)
+		#expect(plan.changes.first(where: { $0.path.hasSuffix("Old.swift") })?.isDeletion == true)
+	}
+
+	@Test func refusesDependencyCheckoutsBuildProductsAndOutsidePaths() throws {
+		let root = try makeRoot()
+		defer { try? FileManager.default.removeItem(at: root) }
+		var staging = Staging(root: root, allowedRoots: [root])
+		#expect(throws: ToolInputError.self) { try staging.write("x", to: ".build/checkouts/Dep/Sources/Dep/D.swift") }
+		#expect(throws: ToolInputError.self) { try staging.write("x", to: "../outside.swift") }
+		#expect(throws: ToolInputError.self) { try staging.write("x", to: "/etc/passwd") }
+	}
+
+	@Test func refusesEditsToFileOperationsAndMissingFiles() throws {
+		let root = try makeRoot()
+		defer { try? FileManager.default.removeItem(at: root) }
+		var staging = Staging(root: root, allowedRoots: [root])
+		var edit = LSPWorkspaceEdit()
+		edit.resourceOperations = ["rename file:///a"]
+		#expect(throws: ToolInputError.self) { try staging.apply(edit) }
+		#expect(throws: ToolInputError.self) { try staging.apply([TextEdit(line: 0, column: 0, endLine: 0, endColumn: 0, newText: "x")], to: "Sources/App/Missing.swift") }
+	}
+
+	@Test func windowsLineEndingsStayWindows() {
+		let original = "a\r\nb\r\n"
+		#expect(Staging.matchingLineEndings("a\nb\nc\n", like: original) == "a\r\nb\r\nc\r\n")
+		#expect(Staging.matchingLineEndings("a\r\nb\n", like: original) == "a\r\nb\r\n")
+		// A file with unix endings, or mixed ones, is left alone.
+		#expect(Staging.matchingLineEndings("a\nb\n", like: "x\ny\n") == "a\nb\n")
+		#expect(Staging.matchingLineEndings("a\nb\n", like: "x\r\ny\n") == "a\nb\n")
+	}
+
+	@Test func commitIsAtomicRefusesStaleFilesAndRestores() async throws {
+		let root = try makeRoot()
+		defer { try? FileManager.default.removeItem(at: root) }
+		let a = root.appendingPathComponent("Sources/App/A.swift")
+		let b = root.appendingPathComponent("Sources/App/B.swift")
+		try "a\n".write(to: a, atomically: true, encoding: .utf8)
+		try "b\n".write(to: b, atomically: true, encoding: .utf8)
+		let engine = EditEngine(client: LSPClient(configuration: .init(workspaceRoot: root, command: ["/nonexistent"], languageID: "swift")), root: root)
+		var staging = Staging(root: root, allowedRoots: [root])
+		try staging.write("a2\n", to: "Sources/App/A.swift")
+		try staging.write("b2\n", to: "Sources/App/B.swift")
+		let plan = staging.plan()
+
+		// Someone edits B after the plan was made: nothing is written, not even A.
+		try "b-changed\n".write(to: b, atomically: true, encoding: .utf8)
+		#expect(throws: ToolInputError.self) { try engine.commit(plan) }
+		#expect(try String(contentsOf: a, encoding: .utf8) == "a\n")
+
+		try "b\n".write(to: b, atomically: true, encoding: .utf8)
+		try engine.commit(plan)
+		#expect(try String(contentsOf: a, encoding: .utf8) == "a2\n")
+		#expect(try String(contentsOf: b, encoding: .utf8) == "b2\n")
+
+		// Restoring is refused while a file holds something the plan didn't write.
+		try "b3\n".write(to: b, atomically: true, encoding: .utf8)
+		#expect(throws: ToolInputError.self) { try engine.restore(plan) }
+		try engine.restore(plan, force: true)
+		#expect(try String(contentsOf: b, encoding: .utf8) == "b\n")
+	}
+
+	@Test func writingKeepsTheFileMode() throws {
+		let root = try makeRoot()
+		defer { try? FileManager.default.removeItem(at: root) }
+		let script = root.appendingPathComponent("Sources/App/run.swift")
+		try "x\n".write(to: script, atomically: true, encoding: .utf8)
+		try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+		let engine = EditEngine(client: LSPClient(configuration: .init(workspaceRoot: root, command: ["/nonexistent"], languageID: "swift")), root: root)
+		var staging = Staging(root: root, allowedRoots: [root])
+		try staging.write("y\n", to: "Sources/App/run.swift")
+		try engine.commit(staging.plan())
+		let mode = try FileManager.default.attributesOfItem(atPath: script.path)[.posixPermissions] as? NSNumber
+		#expect(mode?.intValue == 0o755)
+	}
+}
+
+@Suite struct FileEditSpecTests {
+	@Test func parsesEveryEditKindAndTheSingleEditShorthand() throws {
+		let edits = try FileEditSpec.parse(ToolArguments([
+			"edits": .array([
+				["file_path": "a.swift", "old_text": "x", "new_text": "y", "replace_all": true],
+				["file_path": "a.swift", "start_line": .int(3), "end_line": .int(4), "new_text": "z"],
+				["file_path": "a.swift", "insert_after_line": .int(0), "new_text": "import Foundation"],
+				["file_path": "b.swift", "content": "struct B {}"],
+				["file_path": "c.swift", "delete": true],
+			])
+		]))
+		#expect(edits.count == 5)
+		let single = try FileEditSpec.parse(ToolArguments(["file_path": "a.swift", "old_text": "x", "new_text": "y"]))
+		#expect(single.count == 1)
+		// Some clients send nested values as a JSON string.
+		let stringly = try FileEditSpec.parse(ToolArguments(["edits": .string(#"[{"file_path":"a.swift","old_text":"x","new_text":"y"}]"#)]))
+		#expect(stringly.count == 1)
+		#expect(throws: ToolInputError.self) { try FileEditSpec.parse(ToolArguments([:])) }
+		#expect(throws: ToolInputError.self) { try FileEditSpec.parse(ToolArguments(["file_path": "a.swift"])) }
+		#expect(throws: ToolInputError.self) { try FileEditSpec.parse(ToolArguments(["file_path": "a.swift", "old_text": "x"])) }
+	}
+
+	private func apply(_ spec: FileEditSpec, to text: String) throws -> String {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("spec-\(UUID().uuidString)", isDirectory: true).realPath
+		try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: root) }
+		try text.write(to: root.appendingPathComponent("f.swift"), atomically: true, encoding: .utf8)
+		var staging = Staging(root: root, allowedRoots: [root])
+		_ = try spec.apply(to: &staging)
+		return try staging.read("f.swift") ?? ""
+	}
+
+	@Test func replaceTextNeedsOneMatchUnlessAll() throws {
+		#expect(try apply(.replaceText(path: "f.swift", old: "b", new: "B", all: false), to: "a b c\n") == "a B c\n")
+		#expect(throws: ToolInputError.self) { try apply(.replaceText(path: "f.swift", old: "a", new: "A", all: false), to: "a a\n") }
+		#expect(try apply(.replaceText(path: "f.swift", old: "a", new: "A", all: true), to: "a a\n") == "A A\n")
+		#expect(throws: ToolInputError.self) { try apply(.replaceText(path: "f.swift", old: "zzz", new: "A", all: false), to: "a a\n") }
+	}
+
+	@Test func indentationDifferencesAreToleratedWhenTheMatchIsUnique() throws {
+		let text = "struct S {\n\tfunc f() {\n\t\tprint(1)\n\t}\n}\n"
+		// The agent quoted it with spaces; the file uses tabs.
+		let result = try apply(
+			.replaceText(path: "f.swift", old: "    func f() {\n        print(1)\n    }", new: "    func f() {\n        print(2)\n    }", all: false), to: text)
+		#expect(result == "struct S {\n\tfunc f() {\n\t\tprint(2)\n\t}\n}\n")
+	}
+
+	@Test func theErrorSaysWhereTheFirstLineAppears() {
+		let text = "func a() {}\nfunc b() {}\n"
+		do {
+			_ = try apply(.replaceText(path: "f.swift", old: "func b() {\n}", new: "x", all: false), to: text)
+			Issue.record("expected an error")
+		} catch let error as ToolInputError {
+			#expect(error.message.contains("line(s) 2"))
+		} catch {
+			Issue.record("unexpected \(error)")
+		}
+	}
+
+	@Test func lineEditsReplaceInsertAndDelete() throws {
+		let text = "one\ntwo\nthree\n"
+		#expect(try apply(.replaceLines(path: "f.swift", start: 2, end: 2, new: "TWO"), to: text) == "one\nTWO\nthree\n")
+		#expect(try apply(.replaceLines(path: "f.swift", start: 2, end: 3, new: ""), to: text) == "one\n")
+		#expect(try apply(.replaceLines(path: "f.swift", start: 2, end: 1, new: "inserted"), to: text) == "one\ninserted\ntwo\nthree\n")
+		#expect(try apply(.insertAfterLine(path: "f.swift", line: 0, new: "top"), to: text) == "top\none\ntwo\nthree\n")
+		#expect(try apply(.insertAfterLine(path: "f.swift", line: 3, new: "end"), to: text) == "one\ntwo\nthree\nend\n")
+		#expect(try apply(.insertAfterLine(path: "f.swift", line: 2, new: "end"), to: "one\ntwo") == "one\ntwo\nend\n")
+		#expect(throws: ToolInputError.self) { try apply(.replaceLines(path: "f.swift", start: 9, end: 9, new: "x"), to: text) }
+		#expect(throws: ToolInputError.self) { try apply(.insertAfterLine(path: "f.swift", line: 9, new: "x"), to: text) }
+	}
+
+	@Test func createRefusesToOverwriteWithoutSayingSo() throws {
+		#expect(throws: ToolInputError.self) { try apply(.create(path: "f.swift", content: "x", overwrite: false), to: "old\n") }
+		#expect(try apply(.create(path: "f.swift", content: "x", overwrite: true), to: "old\n") == "x\n")
+	}
+}
+
+@Suite struct RenameNameTests {
+	@Test func parsesBaseNamesAndLabels() throws {
+		#expect(try RenameName.parse("make") == RenameName(base: "make", labels: nil))
+		#expect(try RenameName.parse("make(named:)") == RenameName(base: "make", labels: ["named"]))
+		#expect(try RenameName.parse("make(_:to:)") == RenameName(base: "make", labels: ["_", "to"]))
+		#expect(try RenameName.parse("make()") == RenameName(base: "make", labels: []))
+		#expect(try RenameName.parse("`class`") == RenameName(base: "`class`", labels: nil))
+	}
+
+	@Test func rejectsKeywordsAndNonIdentifiers() {
+		#expect(throws: ToolInputError.self) { try RenameName.parse("class") }
+		#expect(throws: ToolInputError.self) { try RenameName.parse("1abc") }
+		#expect(throws: ToolInputError.self) { try RenameName.parse("a b") }
+		#expect(throws: ToolInputError.self) { try RenameName.parse("") }
+		#expect(throws: ToolInputError.self) { try RenameName.parse("make(named)") }
+		#expect(throws: ToolInputError.self) { try RenameName.parse("make(1x:)") }
+	}
+
+	@Test func keepsTheOldLabelsOrChecksTheirNumber() throws {
+		let old = ParsedQuery("create(name:)")
+		#expect(try RenameName.parse("make").full(replacing: old) == "make(name:)")
+		#expect(try RenameName.parse("make(named:)").full(replacing: old) == "make(named:)")
+		#expect(throws: ToolInputError.self) { try RenameName.parse("make(a:b:)").full(replacing: old) }
+		#expect(throws: ToolInputError.self) { try RenameName.parse("make()").full(replacing: old) }
+		// A property or type has no labels to give.
+		#expect(try RenameName.parse("title").full(replacing: ParsedQuery("name")) == "title")
+		#expect(throws: ToolInputError.self) { try RenameName.parse("title(x:)").full(replacing: ParsedQuery("name")) }
+	}
+}
+
+@Suite struct MemberInsertionTests {
+	static let text = "struct S {\n\tvar a = 1\n\tvar b = 2\n\n\tfunc f() {\n\t\tprint(1)\n\t}\n}\n"
+
+	private func container(text: String = Self.text) throws -> SwiftNavigator.MemberContainer {
+		let scan = SwiftScan(text)
+		let open = (text as NSString).range(of: "{").location
+		let close = try #require(scan.matching(openAt: open))
+		let children = [
+			try symbol("a", kind: SymbolKind.property, lines: 1...1, startColumn: 1, endColumn: 10),
+			try symbol("b", kind: SymbolKind.property, lines: 2...2, startColumn: 1, endColumn: 10),
+			try symbol("f()", kind: SymbolKind.method, lines: 4...6, startColumn: 1, endColumn: 2),
+		]
+		return SwiftNavigator.MemberContainer(children: children, body: (open, close), baseIndent: "", isFile: false)
+	}
+
+	private func insert(_ code: String, at position: String, text: String = Self.text) throws -> String {
+		let edit = try SwiftNavigator.memberInsertion(
+			code, container: try container(text: text), position: position, text: text, index: TextIndex(text), unit: .tab)
+		return try TextEditing.apply([edit], to: text)
+	}
+
+	@Test func lastGoesBeforeTheClosingBraceWithABlankLine() throws {
+		#expect(try insert("func g() {}", at: "last") == "struct S {\n\tvar a = 1\n\tvar b = 2\n\n\tfunc f() {\n\t\tprint(1)\n\t}\n\n\tfunc g() {}\n}\n")
+	}
+
+	@Test func aPropertyAfterAPropertyNeedsNoBlankLine() throws {
+		#expect(try insert("var a2 = 0", at: "after:a") == "struct S {\n\tvar a = 1\n\tvar a2 = 0\n\tvar b = 2\n\n\tfunc f() {\n\t\tprint(1)\n\t}\n}\n")
+	}
+
+	@Test func firstGoesRightAfterTheOpeningBrace() throws {
+		#expect(try insert("var z = 0", at: "first") == "struct S {\n\tvar z = 0\n\tvar a = 1\n\tvar b = 2\n\n\tfunc f() {\n\t\tprint(1)\n\t}\n}\n")
+	}
+
+	@Test func beforeAMethodGetsABlankLineAfterIt() throws {
+		let result = try insert("func e() {}", at: "before:f")
+		#expect(result == "struct S {\n\tvar a = 1\n\tvar b = 2\n\n\tfunc e() {}\n\n\tfunc f() {\n\t\tprint(1)\n\t}\n}\n")
+	}
+
+	@Test func multilineCodeIsIndentedToTheMembers() throws {
+		let result = try insert("func g() {\n    if x {\n        y()\n    }\n}", at: "last")
+		#expect(result.contains("\n\tfunc g() {\n\t\tif x {\n\t\t\ty()\n\t\t}\n\t}\n}\n"))
+	}
+
+	@Test func anEmptyOneLineContainerIsExpanded() throws {
+		let text = "struct E {}\n"
+		let scan = SwiftScan(text)
+		let container = SwiftNavigator.MemberContainer(children: [], body: (9, try #require(scan.matching(openAt: 9))), baseIndent: "", isFile: false)
+		let edit = try SwiftNavigator.memberInsertion("var x = 1", container: container, position: "last", text: text, index: TextIndex(text), unit: .tab)
+		#expect(try TextEditing.apply([edit], to: text) == "struct E {\n\tvar x = 1\n}\n")
+	}
+
+	@Test func unknownOrAmbiguousAnchorsAreErrors() throws {
+		#expect(throws: ToolInputError.self) { try insert("var x = 1", at: "after:nope") }
+		#expect(throws: ToolInputError.self) { try insert("var x = 1", at: "sideways") }
+		#expect(throws: ToolInputError.self) { try insert("var x = 1", at: "after") }
+	}
+
+	@Test func topLevelAppendAndFirstAfterImports() throws {
+		let text = "import Foundation\nimport OSLog\n\nstruct A {}\n"
+		let file = SwiftNavigator.MemberContainer(children: [try symbol("A", kind: SymbolKind.structure, lines: 3...3, endColumn: 12)], body: nil, baseIndent: "", isFile: true)
+		let last = try SwiftNavigator.memberInsertion("struct B {}", container: file, position: "last", text: text, index: TextIndex(text), unit: .tab)
+		#expect(try TextEditing.apply([last], to: text) == "import Foundation\nimport OSLog\n\nstruct A {}\n\nstruct B {}\n")
+		let first = try SwiftNavigator.memberInsertion("struct Z {}", container: file, position: "first", text: text, index: TextIndex(text), unit: .tab)
+		#expect(try TextEditing.apply([first], to: text) == "import Foundation\nimport OSLog\n\nstruct Z {}\n\nstruct A {}\n")
+		let noTrailingNewline = "struct A {}"
+		let appended = try SwiftNavigator.memberInsertion("struct B {}", container: file, position: "last", text: noTrailingNewline, index: TextIndex(noTrailingNewline), unit: .tab)
+		#expect(try TextEditing.apply([appended], to: noTrailingNewline) == "struct A {}\n\nstruct B {}\n")
+	}
+}
+
+@Suite struct DeclarationLookupTests {
+	@Test func findsTheSymbolWhoseNameIsAtAPosition() throws {
+		let method = try symbol("run()", kind: SymbolKind.method, lines: 3...5, startColumn: 1, endColumn: 2)
+		let type = try symbol("S", kind: SymbolKind.structure, lines: 0...6, startColumn: 0, endColumn: 1, children: [method])
+		let found = DeclarationLookup.find(in: [type], at: LSPPosition(line: 3, character: 2))
+		#expect(found?.symbol.name == "run()")
+		#expect(found?.parents.map(\.name) == ["S"])
+		#expect(DeclarationLookup.find(in: [type], at: LSPPosition(line: 0, character: 0))?.symbol.name == "S")
+		#expect(DeclarationLookup.find(in: [type], at: LSPPosition(line: 4, character: 5)) == nil)
+	}
+
+	@Test func changedNamesComeFromDeclarationHeaders() throws {
+		let before = "struct S {\n\tfunc f(a: Int) { print(a) }\n\tfunc g() {}\n}\n"
+		let bodyOnly = "struct S {\n\tfunc f(a: Int) { print(a + 1) }\n\tfunc g() {}\n}\n"
+		let signature = "struct S {\n\tfunc f(a: Int, b: Int) { print(a) }\n\tfunc g() {}\n}\n"
+		func symbols(_ text: String) throws -> [DocumentSymbol] {
+			let lines = text.components(separatedBy: "\n")
+			let f = try symbol(lines[1].contains("b: Int") ? "f(a:b:)" : "f(a:)", kind: SymbolKind.method, lines: 1...1, startColumn: 1, endColumn: lines[1].utf16.count)
+			let g = try symbol("g()", kind: SymbolKind.method, lines: 2...2, startColumn: 1, endColumn: lines[2].utf16.count)
+			return [try symbol("S", kind: SymbolKind.structure, lines: 0...3, endColumn: 1, children: [f, g])]
+		}
+		#expect(ChangedNames.compute(before: try symbols(before), beforeText: before, after: try symbols(bodyOnly), afterText: bodyOnly).isEmpty)
+		#expect(ChangedNames.compute(before: try symbols(before), beforeText: before, after: try symbols(signature), afterText: signature) == ["f"])
+	}
+}
+
+@Suite struct GeneratedCodeTests {
+	@Test func flatExtractedCodeIsRebuiltFromItsBraces() {
+		let text = "struct S {\n\tfunc f() {\n\t\tlet x = 1\n\t}\n}\n"
+		let edit = TextEdit(line: 1, column: 1, endLine: 1, endColumn: 1, newText: "fileprivate func extracted() -> Int {\nreturn 1\n}\n\n")
+		let result = GeneratedCode.normalize([edit], in: text, unit: .tab)
+		#expect(result[0].newText == "fileprivate func extracted() -> Int {\n\t\treturn 1\n\t}\n\n\t")
+	}
+
+	@Test func spaceIndentedStubsBecomeTabsInATabFile() {
+		let text = "extension S: P {\n}\n"
+		let stub = "\n    func f() -> Int {\n        \n    }\n"
+		let edit = TextEdit(line: 0, column: 16, endLine: 0, endColumn: 16, newText: stub)
+		let tidy = GeneratedCode.normalize([edit], in: text, unit: .tab)[0].newText
+		#expect(tidy == "\n\tfunc f() -> Int {\n        \n\t}\n")
+	}
+
+	@Test func emptyBodiesThatMustReturnGetAFatalError() {
+		let stub = "\n\tfunc f() -> Int {\n        \n\t}\n\n\tfunc g() {\n\t}\n\n\tvar x: Int {\n\n\t}\n"
+		let filled = GeneratedCode.fillStubBodies(stub, unit: .tab)
+		#expect(filled.contains("func f() -> Int {\n\t\tfatalError(\"Not implemented\")\n\t}"))
+		#expect(filled.contains("func g() {\n\t}"))  // returns nothing: an empty body compiles
+		#expect(filled.contains("var x: Int {\n\t\tfatalError(\"Not implemented\")\n\t}"))
+	}
+
+	@Test func aDoubledBlankLineAtTheEndOfAnInsertionIsTrimmed() {
+		let text = "switch r {\ncase .a: break\n}\n"
+		let blankEnd = TextEdit(line: 2, column: 0, endLine: 2, endColumn: 0, newText: "case .b:\n\n")
+		#expect(GeneratedCode.trimTrailingBlankLine([blankEnd], in: text)[0].newText == "case .b:\n")
+		let beforeNewline = TextEdit(line: 0, column: 10, endLine: 0, endColumn: 10, newText: "\n\tx\n")
+		#expect(GeneratedCode.trimTrailingBlankLine([beforeNewline], in: text)[0].newText == "\n\tx")
+	}
+
+	@Test func extractedNamesAreReplacedConsistently() {
+		let text = "func extractedFunc(_ a: Int) -> Int { a }\nlet x = extractedFunc(1)"
+		#expect(SwiftNavigator.renameGenerated(text, to: "make") == "func make(_ a: Int) -> Int { a }\nlet x = make(1)")
+		#expect(SwiftNavigator.renameGenerated("let extractedExpr = 1", to: "value") == "let value = 1")
+		#expect(SwiftNavigator.renameGenerated("let extractor = 1", to: "value") == "let extractor = 1")
+	}
+}
+
+@Suite struct BuildSupportTests {
+	@Test func parsesCompilerDiagnosticsOnceEvenWhenPrintedTwice() {
+		let output = """
+			Building for debugging...
+			/tmp/p/Sources/App/main.swift:4:48: error: missing argument for parameter 'admin' in call
+			2 |
+			  |                                                `- error: missing argument for parameter 'admin' in call
+			/tmp/p/Sources/App/main.swift:4:48: error: missing argument for parameter 'admin' in call
+			/tmp/p/Sources/Lib/L.swift:10:5: warning: variable 'x' was never used
+			error: fatalError
+			"""
+		let parsed = BuildRunner.parse(output)
+		#expect(parsed.count == 2)
+		#expect(parsed[0].line == 4 && parsed[0].column == 48 && parsed[0].severity == "error")
+		#expect(parsed[1].severity == "warning")
+	}
+
+	@Test func newErrorsIgnoreLineShiftsButCountRepeats() {
+		func error(_ file: String, _ line: Int, _ message: String) -> BuildDiagnostic {
+			BuildDiagnostic(path: "/p/\(file)", line: line, column: 1, severity: "error", message: message)
+		}
+		func result(_ errors: [BuildDiagnostic]) -> BuildResult {
+			BuildResult(command: "swift build", status: 1, timedOut: false, seconds: 1, errors: errors, warnings: 0, tail: "")
+		}
+		let baseline = result([error("A.swift", 3, "boom")])
+		let after = result([error("A.swift", 30, "boom"), error("A.swift", 31, "boom"), error("B.swift", 1, "new")])
+		let fresh = SwiftNavigator.newErrors(after, comparedTo: baseline)
+		#expect(fresh.count == 2)
+		#expect(fresh.contains { $0.message == "new" })
+	}
+
+	@Test func readsTheTargetGraphFromSwiftPMDescribe() throws {
+		let json = """
+			{"name":"P","path":"/p","targets":[
+			 {"name":"Lib","path":"Sources/Lib","type":"library"},
+			 {"name":"App","path":"Sources/App","type":"executable","target_dependencies":["Lib"]},
+			 {"name":"LibTests","path":"Tests/LibTests","type":"test","target_dependencies":["Lib"]},
+			 {"name":"Tool","path":"Sources/Tool","type":"executable","target_dependencies":["App"]}]}
+			"""
+		let graph = try #require(PackageGraph.parse(json: Data(json.utf8), root: URL(fileURLWithPath: "/p")))
+		#expect(graph.target(ofPath: "/p/Sources/Lib/A.swift")?.name == "Lib")
+		#expect(graph.target(ofPath: "/p/Sources/Lib") ==  graph.targets.first { $0.name == "Lib" })
+		#expect(graph.target(ofPath: "/p/Sources/Libx/A.swift") == nil)
+		#expect(graph.upstream(of: "Tool") == ["App", "Lib"])
+		#expect(graph.upstream(of: "Lib").isEmpty)
+		#expect(PackageGraph.parse(json: Data("{}".utf8), root: URL(fileURLWithPath: "/p")) == nil)
+	}
+
+	@Test func theSwiftDriverIsFoundNextToTheLanguageServer() throws {
+		let directory = FileManager.default.temporaryDirectory.appendingPathComponent("tc-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: directory) }
+		let swift = directory.appendingPathComponent("swift")
+		try "#!/bin/sh\n".write(to: swift, atomically: true, encoding: .utf8)
+		try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: swift.path)
+		#expect(ToolProcess.swiftExecutable(environment: [:], languageServer: [directory.appendingPathComponent("sourcekit-lsp").path]) == swift.path)
+	}
+
+	@Test func theProcessRunnerCapturesOutputExitCodeAndTimeouts() async {
+		let ok = await ToolProcess.run("/bin/sh", arguments: ["-c", "echo out; echo err 1>&2; exit 3"], directory: URL(fileURLWithPath: "/"), timeout: 10)
+		#expect(ok.stdout == "out\n" && ok.stderr == "err\n" && ok.status == 3 && !ok.timedOut)
+		let slow = await ToolProcess.run("/bin/sh", arguments: ["-c", "sleep 30"], directory: URL(fileURLWithPath: "/"), timeout: 0.3)
+		#expect(slow.timedOut)
+		#expect(slow.seconds < 10)
+	}
+}
+
+@Suite struct CheckReportFormattingTests {
+	@Test func aCleanReportSaysSoAndAnUnverifiedOneDoesNot() {
+		let root = URL(fileURLWithPath: "/p")
+		var report = CheckReport()
+		report.checkedFiles = ["/p/A.swift"]
+		#expect(EditFormat.check(report, root: root).contains("✓ no new errors"))
+		report.analysisFailures = ["/p/A.swift"]
+		let text = EditFormat.check(report, root: root)
+		#expect(text.contains("NOT VERIFIED"))
+		#expect(!text.contains("✓"))
+	}
+
+	@Test func newErrorsAreListedWithTheirLineAndFixIts() {
+		let root = URL(fileURLWithPath: "/p")
+		var report = CheckReport()
+		report.checkedFiles = ["/p/A.swift"]
+		report.newErrors = [
+			DiagnosticEntry(path: "/p/A.swift", line: 12, column: 3, severity: 1, message: "Missing argument\nsecond line", lineText: "\t\tcall()", fixTitles: ["Insert ', x: '"])
+		]
+		report.crossModule = ["/p/Tests/T.swift"]
+		report.existingErrors = 2
+		let text = EditFormat.check(report, root: root)
+		#expect(text.contains("A.swift:12:3 error: Missing argument"))
+		#expect(!text.contains("second line"))
+		#expect(text.contains("12 | call()"))
+		#expect(text.contains("fix-it: Insert ', x: '"))
+		#expect(text.contains("Tests/T.swift"))
+		#expect(text.contains("2 error(s) were already there"))
+	}
+
+	@Test func diffsAreCappedAndSummariesCountLines() {
+		let root = URL(fileURLWithPath: "/p")
+		let old = (1...300).map { "line \($0)" }.joined(separator: "\n") + "\n"
+		let new = (1...300).map { "LINE \($0)" }.joined(separator: "\n") + "\n"
+		var plan = EditPlan()
+		plan.changes = [FileChange(path: "/p/A.swift", before: old, after: new), FileChange(path: "/p/B.swift", before: nil, after: "x\ny\n"), FileChange(path: "/p/C.swift", before: "c\n", after: nil)]
+		let diff = EditFormat.diff(plan, root: root, limit: 20)
+		#expect(diff.contains("diff truncated"))
+		let summary = EditFormat.summary(plan, root: root)
+		#expect(summary.contains("A.swift: +300 −300"))
+		#expect(summary.contains("B.swift: new file (+2 lines)"))
+		#expect(summary.contains("C.swift: deleted"))
+	}
+}

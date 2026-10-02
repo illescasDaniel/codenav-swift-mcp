@@ -53,7 +53,7 @@ public func relativePath(_ path: String, in root: URL) -> String? {
 /// How a file outside the workspace is shown. A sibling checkout or a local package a couple of
 /// levels up (`../Octopus/Sources/...`) is far easier to read, and to pass back as `file_path`,
 /// than a long absolute path; anything further away stays absolute.
-func displayPathOutside(_ path: String, root: URL) -> String {
+public func displayPathOutside(_ path: String, root: URL) -> String {
 	let rootComponents = root.realPath.pathComponents
 	let components = URL(fileURLWithPath: path).pathComponents
 	var common = 0
@@ -62,4 +62,13 @@ func displayPathOutside(_ path: String, root: URL) -> String {
 	// Sharing only `/` or `/Users` says nothing about the two being related.
 	guard common >= 3, up >= 1, up <= 2 else { return path }
 	return (Array(repeating: "..", count: up) + components[common...]).joined(separator: "/")
+}
+
+/// The canonical file URL for a path as an agent writes it: relative to `root` or absolute, symlinks
+/// resolved the way the kernel does. A file that doesn't exist yet resolves its directory instead, so a
+/// proposed new file gets the same URL it will have once written.
+public func canonicalFileURL(_ filePath: String, relativeTo root: URL) -> URL {
+	let url = URL(fileURLWithPath: filePath, relativeTo: root).standardizedFileURL
+	if FileManager.default.fileExists(atPath: url.path) { return url.realPath }
+	return url.deletingLastPathComponent().realPath.appendingPathComponent(url.lastPathComponent)
 }

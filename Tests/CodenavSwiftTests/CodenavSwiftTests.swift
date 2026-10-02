@@ -33,7 +33,7 @@ import Testing
 
 @Suite struct CatalogTests {
 	@Test func exposesAllTools() {
-		#expect(ToolCatalog.tools.map(\.name) == [
+		#expect(ToolCatalog.readTools.map(\.name) == [
 			"workspace", "hover", "definition", "references", "search_symbol", "diagnostics", "symbol_info", "outline",
 			"callers", "implementations", "type_at",
 		])

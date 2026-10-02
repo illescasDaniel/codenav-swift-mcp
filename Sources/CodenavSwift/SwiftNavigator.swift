@@ -19,18 +19,26 @@ public actor SwiftNavigator {
 	static let maxSubtypesVisited = 300
 
 	public nonisolated let notices: NoticeBoard
-	private let environment: [String: String]
+	let environment: [String: String]
 	private let selector: WorkspaceSelector
 	private let rootsProvider: RootsProvider?
-	private let indexTimeout: TimeInterval
-	private let requestTimeout: TimeInterval
-	private let commandOverride: [String]?
+	let indexTimeout: TimeInterval
+	let requestTimeout: TimeInterval
+	let commandOverride: [String]?
 
-	private var workspaceRoot: URL
+	var workspaceRoot: URL
 	private var workspaceSource: String
-	private var projectKind: ProjectKind
-	private var client: LSPClient?
+	var projectKind: ProjectKind
+	var client: LSPClient?
 	private var startingClient: Task<LSPClient, Error>?
+
+	// Write tools: applied changes that can be undone, and a lock so two edits never interleave their
+	// in-memory documents. Used by the `SwiftNavigator+Editing` extensions.
+	var editJournal: [JournalEntry] = []
+	var nextEditNumber = 1
+	var writeLockHeld = false
+	var writeWaiters: [CheckedContinuation<Void, Never>] = []
+	var packageGraphCache: (stamp: Date, graph: PackageGraph?)?
 
 	public init(
 		environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -66,7 +74,7 @@ public actor SwiftNavigator {
 
 	/// Called first by every tool: re-targets the server when the client reports another
 	/// checkout/worktree of the same repository.
-	private func useWorkspace() async {
+	func useWorkspace() async {
 		let roots = selector.pinned ? [] : await (rootsProvider?() ?? [])
 		let selection = selector.select(clientRootURIs: roots, isProject: { ProjectKind.detect(in: $0).isNavigable })
 		guard selection.root != workspaceRoot else { return }
@@ -76,6 +84,11 @@ public actor SwiftNavigator {
 		projectKind = ProjectKind.detect(in: selection.root)
 	}
 
+	/// Stops the language server (the next tool call starts a new one).
+	public func shutdown() async {
+		await stopClient()
+	}
+
 	private func stopClient() async {
 		startingClient?.cancel()
 		startingClient = nil
@@ -83,7 +96,7 @@ public actor SwiftNavigator {
 		client = nil
 	}
 
-	private func liveClient() async throws -> LSPClient {
+	func liveClient() async throws -> LSPClient {
 		if let existing = client {
 			if await existing.isAlive {
 				try await existing.refresh()
@@ -139,7 +152,7 @@ public actor SwiftNavigator {
 
 	/// Starting sourcekit-lsp in `$HOME` or a folder with no Swift in it would index the wrong tree for
 	/// minutes and answer nothing useful: say what to do instead.
-	private func requireProject() throws {
+	func requireProject() throws {
 		guard projectKind == .none else { return }
 		let looseSwift = !WorkspaceSelector.isHomeOrRoot(workspaceRoot) && ProjectKind.hasLooseSwiftFiles(in: workspaceRoot)
 		if looseSwift { return }
@@ -152,7 +165,7 @@ public actor SwiftNavigator {
 
 	/// Waits for background indexing so references/callers/implementations are complete; says so
 	/// when it is still running after the timeout, since those answers are then silently partial.
-	private func awaitIndex(_ client: LSPClient) async {
+	func awaitIndex(_ client: LSPClient) async {
 		let status = await client.waitForIndex(timeout: indexTimeout)
 		guard !status.isReady else { return }
 		let detail = status.detail.map { " (\($0))" } ?? ""
@@ -163,13 +176,13 @@ public actor SwiftNavigator {
 
 	/// Name lookups (`workspace/symbol`) answer from the index too, so a query right after startup or
 	/// after files changed on disk would otherwise return stale or empty results.
-	private func awaitIndexIfBusy(_ client: LSPClient) async {
+	func awaitIndexIfBusy(_ client: LSPClient) async {
 		await awaitIndex(client)
 	}
 
 	/// Validates the extension and turns a displayed `<dependency> Pkg/...` spelling back into a real path.
 	@discardableResult
-	private func checkSwiftFile(_ filePath: String) throws -> String {
+	func checkSwiftFile(_ filePath: String) throws -> String {
 		let ext = (filePath as NSString).pathExtension.lowercased()
 		guard ext == "swift" || Self.clangExtensions.contains(ext) else {
 			throw ToolInputError(
@@ -181,7 +194,7 @@ public actor SwiftNavigator {
 
 	/// Where dependency checkouts can live for this workspace, for resolving `<dependency> ...` paths
 	/// before any result has shown one: SwiftPM's `.build/checkouts`, and an Xcode build root's `SourcePackages`.
-	private func dependencyCheckoutDirectories() -> [String] {
+	func dependencyCheckoutDirectories() -> [String] {
 		var directories = [workspaceRoot.appendingPathComponent(".build/checkouts").path]
 		if let data = try? Data(contentsOf: workspaceRoot.appendingPathComponent("buildServer.json")),
 			let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -195,7 +208,7 @@ public actor SwiftNavigator {
 	/// Directories whose sources a text scan covers: the project and its local sibling packages.
 	/// For a symbol declared in a dependency checkout, the checkout's own package is scanned too: the
 	/// index doesn't know how that package uses its own declarations (its types conforming to its protocols).
-	private func scanRoots(declaredIn uri: String) -> [URL] {
+	func scanRoots(declaredIn uri: String) -> [URL] {
 		var roots = [workspaceRoot] + ProjectKind.localPackageFolders(in: workspaceRoot)
 		if let path = uriToPath(uri), let range = path.range(of: "/checkouts/") {
 			let rest = path[range.upperBound...]
@@ -222,11 +235,11 @@ public actor SwiftNavigator {
 		return ToolResult(notices.annotate(text), isError: failed)
 	}
 
-	private func relative(_ uri: String) -> String {
+	func relative(_ uri: String) -> String {
 		uriToRelative(uri, workspaceRoot: workspaceRoot)
 	}
 
-	private func path(of uri: String) throws -> String {
+	func path(of uri: String) throws -> String {
 		guard let path = uriToPath(uri) else {
 			throw ToolInputError("'\(uri)' is not a local file.")
 		}
@@ -235,7 +248,7 @@ public actor SwiftNavigator {
 
 	/// What explains an empty or "not found" answer when the cause isn't the question: a failed
 	/// background build, or a workspace with no build description.
-	private func emptyResultHint(_ client: LSPClient) async -> String {
+	func emptyResultHint(_ client: LSPClient) async -> String {
 		var parts: [String] = []
 		if let first = await client.recentErrors.first {
 			parts.append(
@@ -259,14 +272,14 @@ public actor SwiftNavigator {
 	}
 
 	/// A symbol picked by name, or by the line/identifier it appears on.
-	private struct Target {
+	struct Target {
 		var symbol: ResolvedSymbol
 		var note: String?
 	}
 
 	static let maxListedSites = 25
 
-	private func isOutsideWorkspace(_ uri: String) -> Bool {
+	func isOutsideWorkspace(_ uri: String) -> Bool {
 		guard let path = uriToPath(uri) else { return true }
 		return relativePath(path, in: workspaceRoot) == nil
 	}
@@ -301,7 +314,7 @@ public actor SwiftNavigator {
 	/// but thin for a declaration in a sibling package or a dependency checkout (it sometimes reports only the
 	/// declaration). In those cases the answer is completed by scanning the sources for the name and asking
 	/// the server which occurrences resolve to this declaration (`UsageScan`).
-	private func referencesWithUsageFallback(
+	func referencesWithUsageFallback(
 		_ client: LSPClient, file: String, line: Int, column: Int, includeDeclaration: Bool = true
 	) async throws -> References {
 		let direct = try await client.references(file, line: line, column: column, includeDeclaration: includeDeclaration)
@@ -412,7 +425,7 @@ public actor SwiftNavigator {
 
 	/// By position when `line` plus `column`/`symbol` is given (the symbol under it is whatever the type checker
 	/// says: no name lookup, so overloads, locals and members of any type work), otherwise by name.
-	private func resolveTarget(
+	func resolveTarget(
 		_ client: LSPClient, name: String?, query: String?, aliases: KeyValuePairs<String, String?> = [:],
 		example: String, filePath: String?, line: Int?, column: Int?, symbol: String?
 	) async throws -> Target {
@@ -453,7 +466,7 @@ public actor SwiftNavigator {
 		}
 	}
 
-	private func resolvePosition(
+	func resolvePosition(
 		_ client: LSPClient, filePath: String, line: Int, column: Int?, symbol: String?
 	) async throws -> Target {
 		let column = try await resolveColumn(client, filePath: filePath, line: line, column: column, symbol: symbol)
@@ -517,6 +530,11 @@ public actor SwiftNavigator {
 			if let command = try? commandOverride ?? SourceKitLSPLocator.command(environment: environment) {
 				lines.append("language server: \(command.joined(separator: " "))")
 			}
+			let writing = ["1", "true", "yes"].contains(environment["CODENAV_SWIFT_WRITE"]?.lowercased() ?? "")
+			lines.append(
+				writing
+					? "write tools: enabled (CODENAV_SWIFT_WRITE=1); \(editJournal.count) applied edit(s) can be undone"
+					: "write tools: off (set CODENAV_SWIFT_WRITE=1 to enable apply_edit, rename_symbol, change_signature, ...)")
 			if let client, await client.isAlive {
 				let state = await client.indexProgressDescription().map { "indexing: \($0)" } ?? "ready"
 				lines.append("index: \(state)")
