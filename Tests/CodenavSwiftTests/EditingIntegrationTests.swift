@@ -77,6 +77,40 @@ struct EditingIntegrationTests {
 		}
 	}
 
+	// MARK: lookups sourcekit-lsp's symbol search can't answer
+
+	/// `workspace/symbol` omits `let` properties and loses extension members; the outlines of the files that
+	/// mention a name have them.
+	@Test func letPropertiesExtensionMembersAndTopLevelConstantsAreFoundByName() async throws {
+		let workspace = try Workspace()
+		try workspace.write("Sources/SampleKit/Profile.swift", "public struct Profile {\n\tpublic var displayName: String\n\tpublic let id: Int = 1\n}\n\npublic let maxRetries = 3\n")
+		try workspace.write("Sources/SampleKit/ProfileExt.swift", "extension Profile {\n\tpublic static let limit: Int = 10\n\tpublic var shortName: String { displayName }\n}\n")
+		try workspace.write("Sources/SampleKit/Dup.swift", "let id = 7\n")
+
+		let search = await workspace.call("search_symbol", #"{"query":"limit"}"#)
+		#expect(search.contains("Profile.limit  [Property]  (Sources/SampleKit/ProfileExt.swift:2:"))
+		let qualified = await workspace.call("search_symbol", #"{"query":"Profile.limit"}"#)
+		#expect(qualified.contains("Profile.limit"))
+		let ids = await workspace.call("search_symbol", #"{"query":"id","path":"Sources/SampleKit/Profile.swift"}"#)
+		#expect(ids.contains("Profile.id"))
+
+		for (name, fragment) in [("Profile.id", "Profile.swift:3"), ("Profile.limit", "ProfileExt.swift:2"), ("Profile.shortName", "ProfileExt.swift:3"), ("maxRetries", "Profile.swift:6")] {
+			let info = await workspace.call("symbol_info", "{\"name\":\"\(name)\",\"include_references\":false}")
+			#expect(!info.isError, "\(name)")
+			#expect(info.contains(fragment), "\(name) should resolve to \(fragment)")
+		}
+		// A bare name is the top-level one; `file_path` picks between several.
+		let bare = await workspace.call("symbol_info", #"{"name":"id","include_references":false}"#)
+		#expect(bare.contains("Dup.swift:1"))
+		let missing = await workspace.call("symbol_info", #"{"name":"Profile.nope"}"#)
+		#expect(missing.isError)
+
+		let rename = await workspace.call("rename_symbol", #"{"name":"Profile.limit","new_name":"cap","verify":"none"}"#)
+		#expect(!rename.isError)
+		#expect(try workspace.read("Sources/SampleKit/ProfileExt.swift").contains("static let cap"))
+		await workspace.finish()
+	}
+
 	// MARK: apply_edit / check_edit / undo_edit
 
 	@Test func aBreakingEditIsRefusedAndAHarmlessOneAppliedAndUndone() async throws {

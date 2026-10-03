@@ -450,11 +450,9 @@ public actor SwiftNavigator {
 			return Target(symbol: resolved, note: nil)
 		} catch let error as SymbolResolutionError where error.message.hasPrefix("No symbol found matching") {
 			let parsed = ParsedQuery(wanted)
-			// `Type.member` for a member `workspace/symbol` doesn't list (`let` properties).
-			if !parsed.container.isEmpty, filePath == nil,
-				let member = try? await resolveMemberViaOutline(client: client, query: wanted)
-			{
-				return Target(symbol: member, note: nil)
+			// A declaration `workspace/symbol` doesn't list (a `let` property, a member of an extension in another file).
+			if let found = try await resolveViaOutline(client: client, query: wanted, filePath: filePath) {
+				return Target(symbol: found, note: nil)
 			}
 			// Types from the SDK or a dependency aren't in the workspace index: find a use of the name instead.
 			if parsed.container.isEmpty, parsed.signature == nil,
@@ -669,6 +667,8 @@ public actor SwiftNavigator {
 			// sourcekit-lsp matches plain names; `Type.member` is that member name filtered by container.
 			let parsed = Self.splitQualified(query)
 			var symbols = try await client.workspaceSymbol(parsed.name)
+			// sourcekit-lsp leaves `let` properties and some extension members out of this search: add them from outlines.
+			symbols += await outlineSymbols(client: client, query: parsed.name, container: parsed.container, existing: symbols)
 			if !parsed.container.isEmpty {
 				let wanted = parsed.container.joined(separator: ".")
 				symbols = symbols.filter { symbol in

@@ -256,39 +256,3 @@ private func inheritedCandidates(
 	return []
 }
 
-
-/// `Type.member` when `workspace/symbol` doesn't list the member: sourcekit-lsp leaves `let` properties
-/// (`let id: Int`, `static let limit`) out of it, although the file's own symbol outline has them. Finds the
-/// container type by name, then the member in that type's outline. Nil unless exactly one member matches.
-public func resolveMemberViaOutline(client: LSPClient, query: String) async throws -> ResolvedSymbol? {
-	let parsed = ParsedQuery(query)
-	guard let typeName = parsed.container.last, !parsed.base.isEmpty else { return nil }
-	let outer = parsed.container.dropLast().joined(separator: ".")
-	let types = try await client.workspaceSymbol(typeName).filter { symbol in
-		guard SymbolKind.types.contains(symbol.kind), symbol.baseName == typeName else { return false }
-		let container = symbol.containerName ?? ""
-		return outer.isEmpty || container == outer || container.hasSuffix("." + outer)
-	}
-	func owner(in symbols: [DocumentSymbol], line: Int) -> DocumentSymbol? {
-		for symbol in symbols {
-			if symbol.name == typeName, SymbolKind.types.contains(symbol.kind), symbol.selectionRange.start.line == line { return symbol }
-			if let inner = owner(in: symbol.children ?? [], line: line) { return inner }
-		}
-		return nil
-	}
-	var found: [ResolvedSymbol] = []
-	for type in types {
-		guard let path = uriToPath(type.location.uri), let symbols = try? await client.documentSymbol(path),
-			let container = owner(in: symbols, line: type.position.line)
-		else { continue }
-		for child in container.children ?? [] {
-			let isMatch = parsed.signature.map { child.name == parsed.base + $0 } ?? (baseName(child.name) == parsed.base)
-			guard isMatch, SymbolKind.members.contains(child.kind) || child.kind == SymbolKind.constant || child.kind == SymbolKind.variable else { continue }
-			found.append(
-				ResolvedSymbol(
-					name: child.name, containerName: parsed.container.joined(separator: "."), kind: child.kind, uri: type.location.uri,
-					line: child.selectionRange.start.line, column: child.selectionRange.start.character))
-		}
-	}
-	return found.count == 1 ? found[0] : nil
-}

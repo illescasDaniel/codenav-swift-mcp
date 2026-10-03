@@ -540,3 +540,61 @@ private func symbol(
 		#expect(try problems("var x: Int {\n\tget { 1 }\n\tset { }\n}", name: "x", kind: SymbolKind.property).isEmpty)
 	}
 }
+
+@Suite struct OutlineIndexTests {
+	private func sym(_ name: String, _ kind: Int, line: Int, children: [DocumentSymbol] = []) -> DocumentSymbol {
+		DocumentSymbol(
+			name: name, detail: nil, kind: kind,
+			range: LSPRange(start: LSPPosition(line: line, character: 0), end: LSPPosition(line: line + 1, character: 1)),
+			selectionRange: LSPRange(start: LSPPosition(line: line, character: 4), end: LSPPosition(line: line, character: 4 + name.utf16.count)),
+			children: children)
+	}
+
+	@Test func extensionMembersBelongToTheExtendedTypeAndFunctionsHideTheirChildren() {
+		let tree = [
+			sym("Outer", SymbolKind.structure, line: 0, children: [
+				sym("Inner", SymbolKind.structure, line: 1, children: [sym("x", SymbolKind.property, line: 2)]),
+				sym("f()", SymbolKind.method, line: 3, children: [sym("T", 26, line: 3)]),
+			]),
+			sym("Outer.Inner", SymbolKind.extensionKind, line: 8, children: [sym("limit", SymbolKind.property, line: 9)]),
+			sym("maxRetries", SymbolKind.variable, line: 12),
+		]
+		let entries = OutlineIndex.flatten(tree, uri: "file:///a.swift")
+		func entry(_ name: String) -> OutlineIndex.Entry? { entries.first { $0.symbol.name == name } }
+		#expect(entry("x")?.container == ["Outer", "Inner"])
+		#expect(entry("limit")?.container == ["Outer", "Inner"])  // declared in `extension Outer.Inner`
+		#expect(entry("maxRetries")?.container == [])
+		#expect(entry("T") == nil)  // a generic parameter of a function
+		#expect(entries.contains { $0.symbol.kind == SymbolKind.extensionKind } == false)
+		#expect(entry("limit")?.workspaceSymbol.containerName == "Outer.Inner")
+	}
+
+	@Test func containersMatchBySuffixOrExactly() {
+		#expect(OutlineIndex.container(["Outer", "Inner"], matches: ["Inner"]))
+		#expect(OutlineIndex.container(["Outer", "Inner"], matches: ["Outer", "Inner"]))
+		#expect(!OutlineIndex.container(["Outer", "Inner"], matches: ["Outer"]))
+		#expect(OutlineIndex.container([], matches: [], exact: true))
+		#expect(!OutlineIndex.container(["A"], matches: [], exact: true))
+		#expect(OutlineIndex.container(["A"], matches: []))
+	}
+
+	@Test func filesAreFoundByWhatTheyMentionAndSkipBuildDirectories() throws {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("outline-\(UUID().uuidString)", isDirectory: true)
+		defer { try? FileManager.default.removeItem(at: root) }
+		try FileManager.default.createDirectory(at: root.appendingPathComponent("Sources"), withIntermediateDirectories: true)
+		try FileManager.default.createDirectory(at: root.appendingPathComponent(".build/checkouts/D"), withIntermediateDirectories: true)
+		try "struct Profile {}\nlet maxRetries = 3\n".write(to: root.appendingPathComponent("Sources/A.swift"), atomically: true, encoding: .utf8)
+		try "extension Profile { static let limit = 1 }\n".write(to: root.appendingPathComponent("Sources/B.swift"), atomically: true, encoding: .utf8)
+		try "let maxRetries = 9\n".write(to: root.appendingPathComponent(".build/checkouts/D/C.swift"), atomically: true, encoding: .utf8)
+		try "// maxretries\n".write(to: root.appendingPathComponent("Sources/D.txt"), atomically: true, encoding: .utf8)
+		func names(_ needles: [String], insensitive: Bool = false) -> [String] {
+			OutlineIndex.files(containing: needles, roots: [root.realPath], caseInsensitive: insensitive).map { ($0 as NSString).lastPathComponent }.sorted()
+		}
+		#expect(names(["maxRetries"]) == ["A.swift"])
+		#expect(names(["Profile", "limit"]) == ["B.swift"])
+		#expect(names(["Profile"]) == ["A.swift", "B.swift"])
+		#expect(names(["MAXRETRIES"]) == [])
+		#expect(names(["MAXRETRIES"], insensitive: true) == ["A.swift"])
+		#expect(names([]) == [])
+	}
+}

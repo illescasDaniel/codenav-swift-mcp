@@ -16,8 +16,10 @@
 * `change_signature` rewrites calls that end in a trailing closure when the closure parameter stays last.
 * `rename_symbol keep_deprecated_alias` also covers properties (forwarding accessor) and types (`typealias`).
 * `move_symbol to_container` moves a member into another type or extension, in the same or another file.
-* `Type.member` lookups find `let` properties (`User.id`, `static let limit`): sourcekit-lsp leaves them out of
-  `workspace/symbol`, so they are now found through the type's outline. Affects every name-based tool.
+* Name lookups and `search_symbol` find what sourcekit-lsp's `workspace/symbol` leaves out: `let` properties and constants
+  (`User.id`, `static let limit`), members declared in extensions in other files, and top-level `let`s. They are read from
+  the outlines of the files that mention the name, so a `Type.member` or bare-name lookup in any tool (rename, references,
+  change_signature, ...) now resolves them.
 * A file that still has errors gets a heuristic check for missing returns in the declarations an edit touched, since the
   compiler skips flow analysis there.
 
