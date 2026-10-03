@@ -53,6 +53,14 @@ import Testing
 		#expect(failable.parenthesized(after: 4) != nil)
 	}
 
+	@Test func anOpeningBracketCanBeFoundAtTheTopLevel() {
+		let scan = SwiftScan("var label: String { name }")
+		#expect(scan.firstTopLevel("{", in: 0..<scan.units.count) == ("var label: String { name }" as NSString).range(of: "{").location)
+		let nested = SwiftScan("f(a: { 1 }) { 2 }")
+		#expect(nested.firstTopLevel("{", in: 0..<nested.units.count) == ("f(a: { 1 }) { 2 }" as NSString).range(of: "{ 2").location)  // after the call, not inside it
+		#expect(nested.firstTopLevel("(", in: 0..<nested.units.count) == 1)
+	}
+
 	@Test func splitsOnTopLevelCommasOnly() {
 		let scan = SwiftScan("a: [1, 2], b: f(x, y), c: Dictionary<String, Int>, d: (Int, Int) -> Void")
 		#expect(scan.splitTopLevel(0, scan.units.count).count == 4)

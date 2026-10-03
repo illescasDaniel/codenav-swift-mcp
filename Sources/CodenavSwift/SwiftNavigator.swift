@@ -37,6 +37,8 @@ public actor SwiftNavigator {
 	var editJournal: [JournalEntry] = []
 	var nextEditNumber = 1
 	var journalLoaded = false
+	let outlineFileIndex = OutlineFileIndex()
+	var astCache: [String: (stamp: String, when: Date, dump: String?, problem: String?)] = [:]
 	var writeLockHeld = false
 	var writeWaiters: [CheckedContinuation<Void, Never>] = []
 	var packageGraphCache: (stamp: Date, graph: PackageGraph?)?
@@ -80,6 +82,7 @@ public actor SwiftNavigator {
 		let selection = selector.select(clientRootURIs: roots, isProject: { ProjectKind.detect(in: $0).isNavigable })
 		guard selection.root != workspaceRoot else { return }
 		await stopClient()
+		outlineFileIndex.clear()
 		workspaceRoot = selection.root
 		workspaceSource = selection.source
 		projectKind = ProjectKind.detect(in: selection.root)
@@ -734,10 +737,20 @@ public actor SwiftNavigator {
 		await run {
 			await useWorkspace()
 			let client = try await liveClient()
-			let target = try await resolveTarget(
-				client, name: name, query: query, example: "UserService.create(name:)", filePath: filePath, line: line,
-				column: column, symbol: symbol)
+			let target: Target
+			do {
+				target = try await resolveTarget(
+					client, name: name, query: query, example: "UserService.create(name:)", filePath: filePath, line: line,
+					column: column, symbol: symbol)
+			} catch let error as SymbolResolutionError {
+				// `Type.init(name:age:)` and the like: members the compiler wrote have no declaration to find.
+				if line == nil, let wanted = name ?? query, let answer = await synthesizedMemberAnswer(client: client, query: wanted) {
+					return answer
+				}
+				throw error
+			}
 			let resolved = target.symbol
+			if let answer = await synthesizedInitializerAnswer(client: client, resolved: resolved) { return answer }
 			let relativePath = relative(resolved.uri)
 			let file = try path(of: resolved.uri)
 			let line = resolved.line + 1
@@ -754,8 +767,11 @@ public actor SwiftNavigator {
 			var parts = [header]
 			if let note = target.note { parts.append(note) }
 			parts += ["", hoverText.isEmpty ? "No hover information." : Self.truncatedHover(hoverText)]
-			if SymbolKind.types.contains(resolved.kind), let supers = try? await supertypeLine(client, file: file, line: line, column: column) {
-				parts += ["", supers]
+			var supers: String?
+			if SymbolKind.types.contains(resolved.kind) {
+				supers = try? await supertypeLine(client, file: file, line: line, column: column)
+				if let supers { parts += ["", supers] }
+				if let synthesized = await synthesizedSection(for: resolved, supertypes: supers, client: client) { parts += ["", synthesized] }
 			}
 			parts += [
 				"", "Definition:",
@@ -795,12 +811,32 @@ public actor SwiftNavigator {
 		return unique.isEmpty ? nil : "Inherits / conforms to: " + unique.joined(separator: ", ")
 	}
 
-	public func outline(filePath: String) async -> ToolResult {
+	public func outline(filePath: String, synthesized: Bool = false) async -> ToolResult {
 		await run {
 			await useWorkspace()
 			let filePath = try checkSwiftFile(filePath)
 			let client = try await liveClient()
-			return formatOutline(try await client.documentSymbol(filePath))
+			let tree = try await client.documentSymbol(filePath)
+			var text = formatOutline(tree)
+			if synthesized, let source = try? readTextFile(URL(fileURLWithPath: await client.resolve(filePath).path)) {
+				// What the compiler adds to the types declared here (they have no line in the outline).
+				var sections: [String] = []
+				func visit(_ symbols: [DocumentSymbol], parents: [DocumentSymbol]) async {
+					for symbol in symbols where sections.count < 12 {
+						if SymbolKind.types.contains(symbol.kind), symbol.kind != SymbolKind.protocol,
+							let result = await synthesizedMembers(
+								file: await client.resolve(filePath).path, symbol: symbol, parents: parents, text: source, supertypes: nil),
+							let section = Self.formatSynthesized(typeName: (parents.map(\.name) + [symbol.name]).joined(separator: "."), result)
+						{
+							sections.append(section)
+						}
+						if SymbolKind.types.contains(symbol.kind) || symbol.kind == SymbolKind.extensionKind { await visit(symbol.children ?? [], parents: parents + [symbol]) }
+					}
+				}
+				await visit(tree, parents: [])
+				if !sections.isEmpty { text += "\n\n" + sections.joined(separator: "\n\n") }
+			}
+			return text
 		}
 	}
 

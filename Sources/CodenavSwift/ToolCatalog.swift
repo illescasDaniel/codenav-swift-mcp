@@ -166,7 +166,9 @@ public enum ToolCatalog {
 				"What is X and where is it used? Example: `symbol_info(name=\"UserService.create(name:)\")`. "
 				+ "One-call summary: header, hover text, definition, what a type inherits/conforms to, and references grouped by file. "
 				+ "`name` is a symbol name, or dotted `Type.member`; add argument labels to pick one overload. "
-				+ "Pass `file_path` to disambiguate; if still ambiguous the candidates are listed. `query` is an alias for `name`.",
+				+ "Pass `file_path` to disambiguate; if still ambiguous the candidates are listed. `query` is an alias for `name`. "
+				+ "For a struct, enum or class it also lists what the compiler writes for it and the source never declares (the memberwise `init`, Codable / Equatable / Hashable / "
+				+ "RawRepresentable / CaseIterable members), marked `[Auto-Generated]`; `symbol_info(name=\"Person.init(name:age:)\")` answers for such a member directly.",
 			parameters: [
 				p("name", .string, "Symbol name."), p("query", .string, "Alias for name."),
 				optionalFile, optionalLine, column, symbolOnLine,
@@ -176,8 +178,12 @@ public enum ToolCatalog {
 			name: "outline",
 			description:
 				"What's in this file? Indented outline (types, extensions, methods, properties, with line numbers) of a source file. "
-				+ "Follow up with hover/definition/references at a listed line, or symbol_info by name.",
-			parameters: [filePath]),
+				+ "Follow up with hover/definition/references at a listed line, or symbol_info by name. "
+				+ "`synthesized` also lists the members the compiler adds to the types declared here (they have no line in the file).",
+			parameters: [
+				filePath,
+				p("synthesized", .boolean, "Also list the compiler-generated members (memberwise init, Codable/Equatable/Hashable/... members) of the types in the file."),
+			]),
 		ToolSpec(
 			name: "callers",
 			description:
@@ -476,7 +482,8 @@ public enum ToolCatalog {
 					line: try arguments.optionalInt("line"), column: try optionalColumn(), symbol: arguments.string("symbol"),
 					includeReferences: arguments.bool("include_references", default: true))
 			case "outline":
-				return await navigator.outline(filePath: try arguments.requiredString("file_path"))
+				return await navigator.outline(
+					filePath: try arguments.requiredString("file_path"), synthesized: arguments.bool("synthesized", default: false))
 			case "callers":
 				return await navigator.callers(
 					name: arguments.string("name"), query: arguments.string("query"), filePath: arguments.string("file_path"),

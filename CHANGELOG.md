@@ -20,6 +20,14 @@
   (`User.id`, `static let limit`), members declared in extensions in other files, and top-level `let`s. They are read from
   the outlines of the files that mention the name, so a `Type.member` or bare-name lookup in any tool (rename, references,
   change_signature, ...) now resolves them.
+* The outline lookups that back the above keep a per-file cache of identifiers (modification time + size, files edited in
+  the last seconds are always re-read, capped memory), so a search no longer re-reads the whole workspace: about 10x
+  faster on a 5,000-file tree. It only prefilters which outlines to read, so it can't change an answer.
+* `symbol_info` lists the members the compiler writes for a type and the source never declares (memberwise `init`,
+  Codable / Equatable / Hashable / RawRepresentable / CaseIterable members), marked `[Auto-Generated]`, using
+  `swiftc -print-ast`; `Type.init(...)` and `Type.encode(to:)` lookups answer for them, and `outline` takes `synthesized`.
+  Falls back to working out the memberwise `init` when the compiler can't be used.
+* `rename_symbol keep_deprecated_alias` no longer gives a get-only computed property a setter.
 * A file that still has errors gets a heuristic check for missing returns in the declarations an edit touched, since the
   compiler skips flow analysis there.
 

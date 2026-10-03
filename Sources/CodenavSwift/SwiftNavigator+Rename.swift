@@ -300,7 +300,12 @@ extension SwiftNavigator {
 			if let brace = declScan.firstTopLevel("{", in: (colon + 1)..<typeEnd) { typeEnd = brace }
 			let type = declScan.text(colon + 1, typeEnd).trimmingCharacters(in: .whitespacesAndNewlines)
 			guard !type.isEmpty else { return nil }
+			// Read-only when it is a `let` or a computed property with no setter.
+			let hasAccessors = declScan.firstTopLevel("{", in: nameEnd..<declScan.units.count) != nil
+			let observers = declaration.range(of: #"\b(willSet|didSet)\b"#, options: .regularExpression) != nil
+			let hasSetter = declaration.range(of: #"\bset\b"#, options: .regularExpression) != nil
 			let isConstant = symbol.kind == SymbolKind.constant || firstLine.range(of: #"\blet\b"#, options: .regularExpression) != nil
+				|| (hasAccessors && !observers && !hasSetter && declScan.firstTopLevel("=", in: nameEnd..<declScan.units.count) == nil)
 			let modifiers = ["static", "class", "nonisolated"].filter { firstLine.range(of: "\\b\($0)\\b", options: .regularExpression) != nil }
 			let prefix = ((access.map { [$0] } ?? []) + modifiers).joined(separator: " ")
 			let keyword = (prefix.isEmpty ? "" : prefix + " ") + "var"

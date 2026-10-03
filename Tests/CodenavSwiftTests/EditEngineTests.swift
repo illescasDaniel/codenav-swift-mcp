@@ -399,13 +399,14 @@ private func symbol(
 	@Test func readsTheTargetGraphFromSwiftPMDescribe() throws {
 		let json = """
 			{"name":"P","path":"/p","targets":[
-			 {"name":"Lib","path":"Sources/Lib","type":"library"},
+			 {"name":"Lib","path":"Sources/Lib","type":"library","sources":["A.swift","Sub/B.swift"]},
 			 {"name":"App","path":"Sources/App","type":"executable","target_dependencies":["Lib"]},
 			 {"name":"LibTests","path":"Tests/LibTests","type":"test","target_dependencies":["Lib"]},
 			 {"name":"Tool","path":"Sources/Tool","type":"executable","target_dependencies":["App"]}]}
 			"""
 		let graph = try #require(PackageGraph.parse(json: Data(json.utf8), root: URL(fileURLWithPath: "/p")))
 		#expect(graph.target(ofPath: "/p/Sources/Lib/A.swift")?.name == "Lib")
+		#expect(graph.targets.first { $0.name == "Lib" }?.sources == ["/p/Sources/Lib/A.swift", "/p/Sources/Lib/Sub/B.swift"])
 		#expect(graph.target(ofPath: "/p/Sources/Lib") ==  graph.targets.first { $0.name == "Lib" })
 		#expect(graph.target(ofPath: "/p/Sources/Libx/A.swift") == nil)
 		#expect(graph.upstream(of: "Tool") == ["App", "Lib"])
@@ -578,23 +579,84 @@ private func symbol(
 		#expect(OutlineIndex.container(["A"], matches: []))
 	}
 
-	@Test func filesAreFoundByWhatTheyMentionAndSkipBuildDirectories() throws {
-		let root = FileManager.default.temporaryDirectory.appendingPathComponent("outline-\(UUID().uuidString)", isDirectory: true)
-		defer { try? FileManager.default.removeItem(at: root) }
+	private func makeTree() throws -> URL {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("outline-\(UUID().uuidString)", isDirectory: true).realPath
 		try FileManager.default.createDirectory(at: root.appendingPathComponent("Sources"), withIntermediateDirectories: true)
 		try FileManager.default.createDirectory(at: root.appendingPathComponent(".build/checkouts/D"), withIntermediateDirectories: true)
 		try "struct Profile {}\nlet maxRetries = 3\n".write(to: root.appendingPathComponent("Sources/A.swift"), atomically: true, encoding: .utf8)
 		try "extension Profile { static let limit = 1 }\n".write(to: root.appendingPathComponent("Sources/B.swift"), atomically: true, encoding: .utf8)
 		try "let maxRetries = 9\n".write(to: root.appendingPathComponent(".build/checkouts/D/C.swift"), atomically: true, encoding: .utf8)
 		try "// maxretries\n".write(to: root.appendingPathComponent("Sources/D.txt"), atomically: true, encoding: .utf8)
-		func names(_ needles: [String], insensitive: Bool = false) -> [String] {
-			OutlineIndex.files(containing: needles, roots: [root.realPath], caseInsensitive: insensitive).map { ($0 as NSString).lastPathComponent }.sorted()
+		return root
+	}
+
+	/// Pretends the files are old, so the cache is allowed to trust them.
+	private func age(_ root: URL) throws {
+		let old = Date().addingTimeInterval(-3600)
+		for name in ["Sources/A.swift", "Sources/B.swift"] {
+			try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: root.appendingPathComponent(name).path)
+		}
+	}
+
+	@Test func filesAreFoundByWhatTheyMentionAndSkipBuildDirectories() throws {
+		let root = try makeTree()
+		defer { try? FileManager.default.removeItem(at: root) }
+		func names(_ needles: [String], substring: Bool = false) -> [String] {
+			OutlineFileIndex().files(containing: needles, roots: [root], substring: substring).map { ($0 as NSString).lastPathComponent }.sorted()
 		}
 		#expect(names(["maxRetries"]) == ["A.swift"])
 		#expect(names(["Profile", "limit"]) == ["B.swift"])
 		#expect(names(["Profile"]) == ["A.swift", "B.swift"])
-		#expect(names(["MAXRETRIES"]) == [])
-		#expect(names(["MAXRETRIES"], insensitive: true) == ["A.swift"])
+		#expect(names(["MAXRETRIES"]) == ["A.swift"])  // a prefilter: case doesn't matter, the outline decides
+		#expect(names(["retr"]) == [])  // exact identifiers by default
+		#expect(names(["retr"], substring: true) == ["A.swift"])
 		#expect(names([]) == [])
 	}
+
+	@Test func untouchedFilesAreNotReadAgain() throws {
+		let root = try makeTree()
+		defer { try? FileManager.default.removeItem(at: root) }
+		try age(root)
+		let index = OutlineFileIndex()
+		_ = index.files(containing: ["profile"], roots: [root], substring: false)
+		#expect(index.filesRead == 2)
+		_ = index.files(containing: ["maxretries"], roots: [root], substring: false)
+		_ = index.files(containing: ["limit"], roots: [root], substring: true)
+		#expect(index.filesRead == 2)  // answered from memory
+	}
+
+	@Test func aFileEditedJustNowIsNeverServedFromTheCache() throws {
+		let root = try makeTree()
+		defer { try? FileManager.default.removeItem(at: root) }
+		try age(root)
+		let index = OutlineFileIndex()
+		#expect(index.files(containing: ["maxretries"], roots: [root], substring: false).count == 1)
+		let file = root.appendingPathComponent("Sources/A.swift")
+		// A same-length edit made right away: the size is unchanged and the timestamp may not have moved a whole tick,
+		// so only the rule "recently modified files are re-read" separates this from a stale answer.
+		try "struct Profile {}\nlet fresh12345 = 3\n".write(to: file, atomically: true, encoding: .utf8)
+		#expect(index.files(containing: ["fresh12345"], roots: [root], substring: false).count == 1)
+		#expect(index.files(containing: ["maxretries"], roots: [root], substring: false).isEmpty)
+		try "struct Profile {}\nlet other6789 = 3\n".write(to: file, atomically: true, encoding: .utf8)
+		#expect(index.files(containing: ["other6789"], roots: [root], substring: false).count == 1)
+		#expect(index.files(containing: ["fresh12345"], roots: [root], substring: false).isEmpty)
+	}
+
+	@Test func deletedFilesLeaveTheCacheAndNewOnesAppear() throws {
+		let root = try makeTree()
+		defer { try? FileManager.default.removeItem(at: root) }
+		try age(root)
+		let index = OutlineFileIndex()
+		#expect(index.files(containing: ["profile"], roots: [root], substring: false).count == 2)
+		try FileManager.default.removeItem(at: root.appendingPathComponent("Sources/B.swift"))
+		try "struct Profile2 {}\n".write(to: root.appendingPathComponent("Sources/E.swift"), atomically: true, encoding: .utf8)
+		#expect(index.files(containing: ["profile"], roots: [root], substring: false).map { ($0 as NSString).lastPathComponent } == ["A.swift"])
+		#expect(index.files(containing: ["profile2"], roots: [root], substring: false).map { ($0 as NSString).lastPathComponent } == ["E.swift"])
+	}
+
+	@Test func tokensAreLowercasedIdentifiersWithoutNumbers() {
+		let tokens = OutlineFileIndex.tokens(in: Data("let maxRetries = 3_000 + café_1 // Hello World2\n0xFF".utf8))
+		#expect(tokens == ["let", "maxretries", "café_1", "hello", "world2"])
+	}
+
 }

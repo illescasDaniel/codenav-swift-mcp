@@ -13,6 +13,8 @@ struct PackageGraph: Sendable {
 		/// Absolute directory of the target's sources.
 		var directory: String
 		var dependencies: [String]
+		/// Absolute paths of the target's source files.
+		var sources: [String] = []
 	}
 
 	var targets: [Target]
@@ -42,9 +44,10 @@ struct PackageGraph: Sendable {
 		let targets = rawTargets.compactMap { raw -> Target? in
 			guard let name = raw["name"] as? String, let path = raw["path"] as? String else { return nil }
 			let directory = (path.hasPrefix("/") ? path : base + "/" + path)
+			let folder = URL(fileURLWithPath: directory).standardizedFileURL.path
 			return Target(
-				name: name, directory: URL(fileURLWithPath: directory).standardizedFileURL.path,
-				dependencies: (raw["target_dependencies"] as? [String]) ?? [])
+				name: name, directory: folder, dependencies: (raw["target_dependencies"] as? [String]) ?? [],
+				sources: ((raw["sources"] as? [String]) ?? []).map { folder + "/" + $0 })
 		}
 		return targets.isEmpty ? nil : PackageGraph(targets: targets)
 	}
@@ -138,6 +141,12 @@ enum ToolProcess {
 		return ProcessOutput(
 			status: process.terminationStatus, stdout: String(decoding: collected.out, as: UTF8.self),
 			stderr: String(decoding: collected.err, as: UTF8.self), timedOut: collected.timedOut, seconds: Date().timeIntervalSince(started))
+	}
+
+	/// `swiftc` of the same toolchain as `swift`.
+	static func swiftcExecutable(swift: String) -> String? {
+		let sibling = URL(fileURLWithPath: swift).deletingLastPathComponent().appendingPathComponent("swiftc").path
+		return FileManager.default.isExecutableFile(atPath: sibling) ? sibling : nil
 	}
 
 	/// Every process below `pid`, parents before children.

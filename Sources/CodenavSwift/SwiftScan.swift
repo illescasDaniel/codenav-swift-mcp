@@ -227,15 +227,16 @@ struct SwiftScan {
 		return pieces
 	}
 
-	/// Offset of the first top-level occurrence of `character` in `range` (outside brackets and strings).
+	/// Offset of the first top-level occurrence of `character` in `range` (outside brackets and strings). An
+	/// opening bracket is itself a top-level occurrence when it isn't inside another.
 	func firstTopLevel(_ character: Character, in range: Range<Int>) -> Int? {
 		var depth = 0
 		for i in range where isCode[i] {
 			let c = units[i]
+			if depth == 0, c == unit(character) { return i }
 			if c == unit("(") || c == unit("[") || c == unit("{") || c == unit("<") { depth += 1 }
 			if c == unit(")") || c == unit("]") || c == unit("}") { depth -= 1 }
 			if c == unit(">"), !(i > 0 && units[i - 1] == unit("-")) { depth -= 1 }
-			if depth == 0, c == unit(character) { return i }
 		}
 		return nil
 	}
