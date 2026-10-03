@@ -71,7 +71,12 @@ final class ServerProcess: @unchecked Sendable {
 
 	var isRunning: Bool { process.isRunning }
 
+	/// Writing to a server that has just exited raises SIGPIPE, which would kill the whole process (the MCP
+	/// server, or a test run) instead of failing the write.
+	private static let ignoreBrokenPipes: Void = { signal(SIGPIPE, SIG_IGN) }()
+
 	func write(_ data: Data) {
+		_ = Self.ignoreBrokenPipes
 		let handle = stdinPipe.fileHandleForWriting
 		writeQueue.async {
 			// A dead server surfaces through the reader; a failed write here is not actionable.
