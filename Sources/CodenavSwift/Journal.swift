@@ -39,6 +39,27 @@ struct JournalStore {
 		try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 		let record = Record(id: entry.id, title: entry.title, date: entry.date, changes: entry.plan.changes)
 		if let data = try? JSONEncoder().encode(record) { try? data.write(to: file(entry.id), options: .atomic) }
+		prune(keeping: entry.id)
+	}
+
+	/// Total size of the journal's files on disk before the oldest are dropped (the newest entry always stays).
+	static let byteLimit = 64 * 1024 * 1024
+
+	/// Drops the oldest entries beyond `limit` or beyond `byteLimit` bytes of files, so a long session of large
+	/// edits doesn't fill the temporary directory.
+	func prune(keeping id: String) {
+		let fileManager = FileManager.default
+		guard let urls = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey]) else { return }
+		var entries = urls.filter { $0.pathExtension == "json" && !$0.lastPathComponent.hasPrefix("pending-") }
+			.map { (url: $0, number: Self.number($0.deletingPathExtension().lastPathComponent), size: (try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+			.sorted { $0.number < $1.number }
+		var total = entries.reduce(0) { $0 + $1.size }
+		while entries.count > 1, entries.count > Self.limit || total > Self.byteLimit {
+			let oldest = entries.removeFirst()
+			if oldest.url.deletingPathExtension().lastPathComponent == id { break }
+			total -= oldest.size
+			try? fileManager.removeItem(at: oldest.url)
+		}
 	}
 
 	func remove(_ id: String) {

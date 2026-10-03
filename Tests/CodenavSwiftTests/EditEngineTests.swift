@@ -515,6 +515,22 @@ private func symbol(
 	}
 }
 
+@Suite struct JournalPruneTests {
+	@Test func theOldestEntriesGoWhenThereAreTooManyOrTheyAreTooBig() throws {
+		let base = FileManager.default.temporaryDirectory.appendingPathComponent("journal-\(UUID().uuidString)", isDirectory: true)
+		defer { try? FileManager.default.removeItem(at: base) }
+		let store = JournalStore(workspace: FileManager.default.temporaryDirectory, base: base)
+		var plan = EditPlan()
+		plan.changes = [FileChange(path: "/p/A.swift", before: "a\n", after: "b\n")]
+		for number in 1...(JournalStore.limit + 5) {
+			store.save(JournalEntry(id: "e\(number)", title: "t", plan: plan, date: Date()))
+		}
+		let ids = store.load().map(\.id)
+		#expect(ids.count == JournalStore.limit)
+		#expect(ids.first == "e6" && ids.last == "e\(JournalStore.limit + 5)")
+	}
+}
+
 @Suite struct WriteSafetyTests {
 	private func plan(in root: URL) -> EditPlan {
 		var plan = EditPlan()
@@ -629,6 +645,8 @@ private func symbol(
 		#expect(try problems("func f() -> Int {\n\tswitch x {\n\tcase 1: 1\n\tdefault: 2\n\t}\n}").isEmpty)
 		#expect(try problems("func f() -> Int {\n\tx\n\t\t.y()\n\t\t.z()\n}").isEmpty)  // one expression over three lines
 		#expect(try problems("func f() {\n\tlet a = 1\n\tprint(a)\n}").isEmpty)  // returns nothing
+		#expect(try problems("func f() -> Int {\n\ta +\n\t\tb +\n\t\tc\n}").isEmpty)  // operator at the end of a line
+		#expect(try problems("func f() -> Int {\n\tcond\n\t\t? 1\n\t\t: 2\n}").isEmpty)
 		#expect(try problems("func f() -> Void {\n}").isEmpty)
 		#expect(try problems("func f() -> some View {\n\tText(\"a\")\n\tText(\"b\")\n}").isEmpty)  // result builder
 		#expect(try problems("func f() -> Int {\n\t// return later\n\tlet s = \"return\"\n\tprint(s)\n}").first?.contains("no `return`") == true)  // words in comments and strings don't count
@@ -895,5 +913,36 @@ private func symbol(
 		#expect(RenameName.isIdentifier("名前"))
 		#expect(!RenameName.isIdentifier("1abc"))
 		#expect(!RenameName.isIdentifier("a-b"))
+	}
+}
+
+@Suite struct DeprecatedAliasTests {
+	@Test func anObjcSelectorIsNotCopiedToTheForwardingAlias() throws {
+		let source = "@objc(doIt:) func old(_ x: Int) {\n}"
+		let lines = source.components(separatedBy: "\n")
+		let column = (lines[0] as NSString).range(of: "old").location
+		let symbol = DocumentSymbol(
+			name: "old(_:)", detail: nil, kind: SymbolKind.method,
+			range: LSPRange(start: LSPPosition(line: 0, character: 0), end: LSPPosition(line: 1, character: 1)),
+			selectionRange: LSPRange(start: LSPPosition(line: 0, character: column), end: LSPPosition(line: 0, character: column + 3)),
+			children: nil)
+		let alias = try #require(
+			SwiftNavigator.deprecatedAlias(for: symbol, parents: [], text: source, index: TextIndex(source), newFull: "new(_:)", newBase: "new"))
+		#expect(!alias.contains("@objc"))
+		#expect(alias.contains("func old(_ x: Int) { new(x) }"))
+	}
+}
+
+@Suite struct LocateTests {
+	@Test func indentationInsensitiveMatchingStaysOutOfMultilineStrings() throws {
+		let text = "let s = \"\"\"\n    hello\n    world\n    \"\"\"\nfunc f() {\n\tprint(1)\n}\n"
+		#expect(throws: ToolInputError.self) {
+			_ = try FileEditSpec.locate("hello\nworld", new: "bye\nworld", in: text, path: "a.swift", all: false)
+		}
+		// Ordinary code still matches loosely.
+		let edits = try FileEditSpec.locate("print(1)", new: "print(2)", in: text, path: "a.swift", all: false)
+		#expect(edits.count == 1)
+		let loose = try FileEditSpec.locate("func f() {\nprint(1)\n}", new: "func f() {\nprint(2)\n}", in: text, path: "a.swift", all: false)
+		#expect(loose.count == 1)
 	}
 }

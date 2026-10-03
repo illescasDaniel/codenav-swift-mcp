@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+* The loose (indentation-insensitive) `old_text` match refuses to touch a multiline string literal, where indentation is part of
+  the value; the flow lint no longer counts the continuation lines of an expression broken after an operator as statements;
+  a `keep_deprecated_alias` forwarder no longer copies `@objc(selector:)` or `@IBAction` (it would register a second selector);
+  the undo journal is also pruned by size (64 MB), not only by count.
+
 * Files that start with a UTF-8 byte-order mark keep it when an edit tool rewrites them (it was silently dropped before);
   `change_signature` warns when an argument it drops from a call looks like a call (its side effects no longer happen);
   `rename_symbol` warns about the JSON key change when `Codable` is declared in a separate `extension`; `callers`, `type_hierarchy`

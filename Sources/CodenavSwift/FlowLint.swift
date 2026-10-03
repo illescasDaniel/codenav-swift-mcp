@@ -43,10 +43,13 @@ enum FlowLint {
 		if ["if", "switch", "do"].contains(first) { return [] }
 		var statements = 0
 		var depth = 0
+		var continues = false  // the previous line ended mid-expression (`a +`, `x,`, `cond ?`)
+		let leaders = [".", "?", ":", "&&", "||", "+", "-", "*", "/", "==", "!=", "<", ">", "=", "??", "as ", "as?", "as!", "is ", "}", ")", "]"]
 		for line in lines {
-			if depth == 0, !(line.hasPrefix(".") || line.hasPrefix("?") || line.hasPrefix(":") || line.hasPrefix("&&") || line.hasPrefix("||") || line.hasPrefix("+") || line.hasPrefix("}") || line.hasPrefix(")") || line.hasPrefix("]")) { statements += 1 }
+			if depth == 0, !continues, !leaders.contains(where: { line.hasPrefix($0) }) { statements += 1 }
 			depth += line.reduce(0) { $0 + ("{([".contains($1) ? 1 : "})]".contains($1) ? -1 : 0) }
 			depth = max(depth, 0)
+			continues = line.last.map { "+-*/&|?:,<>.".contains($0) } ?? false
 		}
 		return statements > 1 ? ["\(name) returns \(type) but has \(statements) statements and no `return`"] : []
 	}

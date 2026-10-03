@@ -406,7 +406,10 @@ extension SwiftNavigator {
 				let parameters = SignatureEditor.parameters(in: scan, open: list.open, close: list.close),
 				!parameters.contains(where: \.isVariadic)
 			else { return nil }
-			let header = index.text(from: start, to: body.open).trimmingCharacters(in: .whitespacesAndNewlines)
+			// The alias must not register a second Objective-C selector or Interface Builder action under the old name.
+			var header = index.text(from: start, to: body.open).trimmingCharacters(in: .whitespacesAndNewlines)
+			header = header.replacingOccurrences(of: #"@objc\([^)]*\)\s*"#, with: "", options: .regularExpression)
+				.replacingOccurrences(of: #"@(IBAction|objc)\b\s*"#, with: "", options: .regularExpression)
 			let tail = scan.text(list.close + 1, body.open)
 			var prefix = ""
 			if tail.contains("throws") { prefix += "try " }

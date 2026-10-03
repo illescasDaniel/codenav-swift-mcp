@@ -470,6 +470,13 @@ enum FileEditSpec {
 			if starts.count == 1 {
 				let first = starts[0]
 				let last = first + trimmedWanted.count - 1
+				// Re-indenting inside a multiline string literal would change the string's value: only an exact match may touch it.
+				let before = index.text(from: 0, to: (try? index.offset(LSPPosition(line: first, character: 0))) ?? 0)
+				let insideRegion = index.text(from: (try? index.offset(LSPPosition(line: first, character: 0))) ?? 0, to: (try? index.offset(LSPPosition(line: last, character: index.lineText(last).utf16.count))) ?? 0)
+				if before.components(separatedBy: "\"\"\"").count % 2 == 0 || insideRegion.contains("\"\"\"") {
+					throw ToolInputError(
+						"old_text doesn't match exactly, and the closest match (line \(first + 1)) is in or next to a multiline string literal, where indentation is part of the value. Copy the text exactly, including its indentation.")
+				}
 				let unit = Indentation.detect(in: text)
 				let fileIndent = Indentation.leading(of: index.lineText(first))
 				let oldIndent = Indentation.leading(of: old.components(separatedBy: "\n").first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? "")
