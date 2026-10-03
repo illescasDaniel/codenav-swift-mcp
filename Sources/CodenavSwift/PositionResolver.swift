@@ -126,6 +126,46 @@ enum PositionResolver {
 		return (found, false)
 	}
 
+	/// The `.swift` files under `roots` that use any of `names` as a whole word outside comments and `import` lines,
+	/// in one walk of the tree (a walk per name costs a full read of every file each time). Stops after `fileLimit`
+	/// files; `truncated` says there were more.
+	static func filesMentioning(anyOf names: [String], under roots: [URL], fileLimit: Int = 4000) -> (paths: [String], truncated: Bool) {
+		let valid = names.filter { $0.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil }
+		guard !valid.isEmpty,
+			let pattern = try? NSRegularExpression(
+				pattern: "(?<![A-Za-z0-9_])(?:" + valid.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|") + ")(?![A-Za-z0-9_])")
+		else { return ([], false) }
+		var paths: [String] = []
+		var visited = 0
+		for root in roots {
+			guard let enumerator = FileManager.default.enumerator(
+				at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+			else { continue }
+			for case let url as URL in enumerator {
+				let last = url.lastPathComponent
+				if Exclude.directoryNames.contains(last) {
+					enumerator.skipDescendants()
+					continue
+				}
+				guard last.hasSuffix(".swift"), !last.hasSuffix(".generated.swift") else { continue }
+				visited += 1
+				if visited > fileLimit { return (paths, true) }
+				guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8),
+					valid.contains(where: { text.contains($0) })
+				else { continue }
+				for line in sourceLines(text) {
+					let trimmed = line.trimmingCharacters(in: .whitespaces)
+					if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("import ") { continue }
+					if pattern.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) != nil {
+						paths.append(url.path)
+						break
+					}
+				}
+			}
+		}
+		return (paths, false)
+	}
+
 	/// Modules that make `module` visible to whoever imports them (`@_exported import module`), transitively:
 	/// an app that only imports `Octopus` still uses `DIC` types when Octopus re-exports DIC.
 	static func reexportingModules(of module: String, under roots: [URL], fileLimit: Int = 4000) -> Set<String> {

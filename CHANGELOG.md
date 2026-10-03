@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+* The in-memory check finds the files that use a changed name in one pass over the tree for all names (it walked the tree
+  once per name, for at most 25 names); up to 200 changed names are searched. Added tests for multiple trailing closures in
+  `change_signature` and for memberwise-initializer labels on a property rename; the README lists the new safety behaviour.
+
 * The loose (indentation-insensitive) `old_text` match refuses to touch a multiline string literal, where indentation is part of
   the value; the flow lint no longer counts the continuation lines of an expression broken after an operator as statements;
   a `keep_deprecated_alias` forwarder no longer copies `@objc(selector:)` or `@IBAction` (it would register a second selector);

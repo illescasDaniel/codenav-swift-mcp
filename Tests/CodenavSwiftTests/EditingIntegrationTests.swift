@@ -757,6 +757,36 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func multipleTrailingClosuresKeepWorkingWhenAParameterIsAdded() async throws {
+		let workspace = try Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Pair.swift",
+			"public func run(_ id: Int, ok: () -> Void, fail: () -> Void) { ok() }\n\npublic func usePair() {\n\trun(1) {\n\t\tprint(\"ok\")\n\t} fail: {\n\t\tprint(\"fail\")\n\t}\n\trun(2, ok: { print(1) }, fail: { print(2) })\n}\n")
+		let result = await workspace.call(
+			"change_signature",
+			#"{"name":"run(_:ok:fail:)","operations":[{"op":"add","param":"retries: Int","position":"before:ok","call_value":"3"}],"verify":"none"}"#)
+		#expect(!result.isError)
+		let pair = try workspace.read("Sources/SampleKit/Pair.swift")
+		#expect(pair.contains("func run(_ id: Int, retries: Int, ok: () -> Void, fail: () -> Void)"))
+		#expect(pair.contains("run(1, retries: 3) {\n\t\tprint(\"ok\")\n\t} fail: {"))
+		#expect(pair.contains("run(2, retries: 3, ok: { print(1) }, fail: { print(2) })"))
+		await workspace.finish()
+	}
+
+	@Test func renamingAStoredPropertyUpdatesMemberwiseInitializerCalls() async throws {
+		let workspace = try Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Gadget.swift",
+			"public struct Gadget {\n\tpublic var title: String\n\tpublic var count: Int\n}\n\npublic func makeGadgets() -> [Gadget] {\n\t[Gadget(title: \"a\", count: 1), Gadget(title: \"b\", count: 2)]\n}\n")
+		let result = await workspace.call(
+			"rename_symbol", #"{"name":"Gadget.title","new_name":"heading","verify":"none"}"#)
+		#expect(!result.isError)
+		let text = try workspace.read("Sources/SampleKit/Gadget.swift")
+		#expect(text.contains("public var heading: String"))
+		#expect(text.contains("Gadget(heading: \"a\", count: 1), Gadget(heading: \"b\", count: 2)"))
+		await workspace.finish()
+	}
+
 	@Test func aDefaultedParameterLeavesCallersAlone() async throws {
 		let workspace = try Workspace()
 		let result = await workspace.call(

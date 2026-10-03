@@ -531,6 +531,20 @@ private func symbol(
 	}
 }
 
+@Suite struct FilesMentioningTests {
+	@Test func oneWalkFindsFilesUsingAnyOfTheNamesOutsideComments() throws {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("mention-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: root) }
+		try "let a = alpha()\n".write(to: root.appendingPathComponent("A.swift"), atomically: true, encoding: .utf8)
+		try "let b = beta + 1\n".write(to: root.appendingPathComponent("B.swift"), atomically: true, encoding: .utf8)
+		try "// alpha only in a comment\nlet c = alphabet\n".write(to: root.appendingPathComponent("C.swift"), atomically: true, encoding: .utf8)
+		let found = PositionResolver.filesMentioning(anyOf: ["alpha", "beta"], under: [root])
+		#expect(Set(found.paths.map { URL(fileURLWithPath: $0).lastPathComponent }) == ["A.swift", "B.swift"])
+		#expect(!found.truncated)
+	}
+}
+
 @Suite struct WriteSafetyTests {
 	private func plan(in root: URL) -> EditPlan {
 		var plan = EditPlan()

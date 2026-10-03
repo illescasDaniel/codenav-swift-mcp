@@ -264,7 +264,7 @@ struct EditEngine {
 	/// For an Xcode project: which module each file compiles into (there is no package graph to ask).
 	var xcodeModules: XcodeModules?
 	static let maxCheckedDependents = 40
-	static let maxNamesScanned = 25
+	static let maxNamesScanned = 200
 
 	static func isSwiftSource(_ path: String) -> Bool {
 		path.hasSuffix(".swift") && !path.hasSuffix("/Package.swift")
@@ -326,12 +326,14 @@ struct EditEngine {
 		var dependents: [String] = []
 		var seen = changedPaths
 		for path in plan.extraFiles where Self.isSwiftSource(path) && seen.insert(path).inserted { dependents.append(path) }
-		for name in ordered.prefix(Self.maxNamesScanned) {
-			let found = PositionResolver.occurrences(of: name, under: [root], limit: 400, perFile: true).hits
-			for hit in found where Self.isSwiftSource(hit.path) {
-				let path = canonicalFileURL(hit.path, relativeTo: root).path
-				if seen.insert(path).inserted { dependents.append(path) }
-			}
+		let scanned = Array(ordered.prefix(Self.maxNamesScanned))
+		let mentioning = PositionResolver.filesMentioning(anyOf: scanned, under: [root])
+		for hit in mentioning.paths {
+			let path = canonicalFileURL(hit, relativeTo: root).path
+			if seen.insert(path).inserted { dependents.append(path) }
+		}
+		if mentioning.truncated {
+			report.unchecked.append("the workspace has more than 4000 Swift files; usages in the rest were not searched for")
 		}
 		if ordered.count > Self.maxNamesScanned {
 			report.unchecked.append("only the first \(Self.maxNamesScanned) of \(ordered.count) changed names were searched for usages")

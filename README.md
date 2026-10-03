@@ -215,14 +215,25 @@ Limits worth knowing:
   a small heuristic looks for the commonest case (a function that returns a value but has an empty body or no
   `return`) and lists what it finds as *possible* problems; it can't replace the compiler, and it doesn't look for
   uninitialized variables.
+* Files changed on disk while a build checks a proposal are never overwritten when the proposal is put back (they are listed
+  instead), and a proposal stranded by a crashed server is restored and reported the next time a tool runs.
+  Tool calls take a reader/writer lock, so reads never see a proposal that is still being checked, and cancelling a call
+  stops its language-server request or build.
+* A new Swift file in an Xcode project that no target contains yet is written but not compile-checked (the result says
+  so); add it to a target, or use a synchronized folder, and run `verify`.
+* `fix_diagnostics` takes the fix-it the compiler marks as preferred and skips "force unwrap" fix-its unless `only` asks for them.
+* Diagnostics are compared by severity and message, not by line text, so an error that was already there is never
+  reported as new, at the cost of not noticing an identical error added next to it.
+* `change_signature` warns when an argument it drops from a call looks like a call (its side effects stop happening).
+* The loose (indentation-insensitive) `old_text` match never touches a multiline string literal; copy that text exactly.
 * `change_signature` leaves a function used as a value (`map(service.create)`), a trailing closure that the change
   would have to move into the parentheses, and calls it can't match to the old parameters, for you; each is listed.
 * If the language server can't analyze a file at all (broken build settings), the change is reported **not verified**
   and refused rather than waved through. `workspace` shows why.
-* `undo_edit` history is kept on disk (in the temporary directory, per workspace, the last 25 edits), so it survives a
+* `undo_edit` history is kept on disk (in the temporary directory, per workspace, the last 25 edits, at most 64 MB), so it survives a
   restart of the server, but not clearing temp files; git remains the real safety net.
 * Edits are limited to the workspace and its local packages; dependency checkouts and build products are refused.
-* File modes and `\r\n` line endings are preserved.
+* File modes, `\r\n` line endings and a leading byte-order mark are preserved.
 
 ## Requirements
 
