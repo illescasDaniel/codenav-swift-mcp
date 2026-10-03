@@ -220,7 +220,11 @@ struct BuildDiagnostic: Hashable, Sendable {
 	var message: String
 
 	/// Same problem in the same file regardless of where in it: used to compare before and after.
-	var identity: String { "\(URL(fileURLWithPath: path).lastPathComponent)|\(severity)|\(message)" }
+	var identity: String {
+		// Two path components: `Models/Item.swift` and `Views/Item.swift` are different files.
+		let parts = path.split(separator: "/").suffix(2).joined(separator: "/")
+		return "\(parts)|\(severity)|\(message)"
+	}
 }
 
 struct BuildResult: Sendable {
@@ -248,6 +252,24 @@ enum BuildRunner {
 				column: Int(text.substring(with: match.range(at: 3))) ?? 0, severity: text.substring(with: match.range(at: 4)),
 				message: text.substring(with: match.range(at: 5)))
 			if seen.insert(diagnostic).inserted { result.append(diagnostic) }  // SwiftPM prints each one twice
+		}
+		// Errors without a Swift source location: C/Objective-C compiler errors and linker failures.
+		if let other = try? NSRegularExpression(
+			pattern: #"^(?:(/[^\n:]+?\.(?:m|mm|c|cc|cpp|h)):(\d+):(\d+): error: (.+)|(ld: .+|clang: error: .+|error: link command failed.*|Undefined symbols for architecture.*))$"#,
+			options: [.anchorsMatchLines])
+		{
+			for match in other.matches(in: output, range: NSRange(location: 0, length: text.length)) {
+				let diagnostic: BuildDiagnostic
+				if match.range(at: 1).location != NSNotFound {
+					diagnostic = BuildDiagnostic(
+						path: text.substring(with: match.range(at: 1)), line: Int(text.substring(with: match.range(at: 2))) ?? 0,
+						column: Int(text.substring(with: match.range(at: 3))) ?? 0, severity: "error",
+						message: text.substring(with: match.range(at: 4)))
+				} else {
+					diagnostic = BuildDiagnostic(path: "(link)", line: 0, column: 0, severity: "error", message: text.substring(with: match.range(at: 5)))
+				}
+				if seen.insert(diagnostic).inserted { result.append(diagnostic) }
+			}
 		}
 		return result
 	}

@@ -25,7 +25,14 @@ struct XcodeBuild: Sendable, Equatable {
 		else { return nil }
 		// The build products folder says which configuration and SDK the index was built for
 		// (`Debug-iphonesimulator`); building for another would not refresh what the index reads.
-		let products = ((try? FileManager.default.contentsOfDirectory(atPath: buildRoot + "/Build/Products")) ?? []).sorted()
+		// The newest one is what the last build (and so the index) was made for.
+		let productsPath = buildRoot + "/Build/Products"
+		let products = ((try? FileManager.default.contentsOfDirectory(atPath: productsPath)) ?? []).sorted().sorted { left, right in
+			func modified(_ name: String) -> Date {
+				((try? FileManager.default.attributesOfItem(atPath: productsPath + "/" + name))?[.modificationDate] as? Date) ?? .distantPast
+			}
+			return modified(left) > modified(right)
+		}
 		let folder = products.first { $0.contains("-") } ?? products.first
 		var configuration = "Debug"
 		var destination = "generic/platform=iOS Simulator"

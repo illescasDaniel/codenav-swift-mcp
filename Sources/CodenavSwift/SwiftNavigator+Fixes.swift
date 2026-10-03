@@ -126,6 +126,14 @@ extension SwiftNavigator {
 
 	// MARK: fix_diagnostics
 
+	/// The fix-it to apply: the one the server marks preferred, else the first. A force-unwrap fix-it turns a type
+	/// error into a possible crash, so it is only taken when `only` asks for it.
+	static func preferredFix(_ fixes: [LSPCodeAction], only: String?) -> LSPCodeAction? {
+		let asked = only.map { $0.contains("unwrap") || $0.contains("optional") || $0.contains("!") } ?? false
+		let safe = fixes.filter { asked || !$0.title.lowercased().contains("force unwrap") }
+		return safe.first { $0.isPreferred == true } ?? safe.first
+	}
+
 	public func fixDiagnostics(arguments: ToolArguments) async -> ToolResult {
 		await runWrite { client in
 			let options = try EditOptions(arguments)
@@ -147,7 +155,7 @@ extension SwiftNavigator {
 					if let line, diagnostic.range.start.line + 1 != line { continue }
 					if let only, !diagnostic.message.lowercased().contains(only), !(diagnostic.codeText ?? "").lowercased().contains(only) { continue }
 					let available = await self.fixesInOverlay(client, staging: staging, path: filePath, diagnostic: diagnostic)
-					guard let fix = available.first,
+					guard let fix = Self.preferredFix(available, only: only),
 						let fileEdits = fix.edit?.fileEdits, fileEdits.count == 1, let proposed = fileEdits.values.first,
 						fileEdits.keys.first.flatMap({ uriToPath($0) }).map({ staging.canonical($0) }) == filePath
 					else {

@@ -857,3 +857,34 @@ private func symbol(
 		#expect(await log.events == ["write start", "write end", "read"])
 	}
 }
+
+@Suite struct CheckAccuracyTests {
+	@Test func buildDiagnosticsOfSameNamedFilesInDifferentFoldersAreDistinct() {
+		let a = BuildDiagnostic(path: "/p/Models/Item.swift", line: 1, column: 1, severity: "error", message: "boom")
+		let b = BuildDiagnostic(path: "/p/Views/Item.swift", line: 1, column: 1, severity: "error", message: "boom")
+		#expect(a.identity != b.identity)
+	}
+
+	@Test func linkerAndCErrorsAreParsed() {
+		let output = """
+			/p/Sources/C/a.c:3:5: error: unknown type name 'foo'
+			ld: symbol(s) not found for architecture arm64
+			"""
+		let parsed = BuildRunner.parse(output)
+		#expect(parsed.count == 2)
+		#expect(parsed.contains { $0.path == "(link)" })
+	}
+
+	@Test func forceUnwrapFixItsAreSkippedUnlessAsked() {
+		let unwrap = LSPCodeAction(title: "Force unwrap the optional")
+		let other = LSPCodeAction(title: "Add 'try'")
+		#expect(SwiftNavigator.preferredFix([unwrap, other], only: nil)?.title == "Add 'try'")
+		#expect(SwiftNavigator.preferredFix([unwrap], only: nil) == nil)
+		#expect(SwiftNavigator.preferredFix([unwrap], only: "unwrap")?.title == unwrap.title)
+	}
+
+	@Test func testFilesAreRecognisedByNameNotSubstring() {
+		#expect(SwiftNavigator.isTestFile("/p/Tests/AppTests/X.swift"))
+		#expect(SwiftNavigator.isTestFile("/p/App/StoreTests.swift"))
+	}
+}

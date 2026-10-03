@@ -168,6 +168,7 @@ public struct LSPCodeAction: Decodable, Sendable {
 	public var kind: String?
 	public var edit: LSPWorkspaceEdit?
 	public var command: Command?
+	public var isPreferred: Bool?
 
 	public init(title: String, kind: String? = nil, edit: LSPWorkspaceEdit? = nil, command: Command? = nil) {
 		self.title = title

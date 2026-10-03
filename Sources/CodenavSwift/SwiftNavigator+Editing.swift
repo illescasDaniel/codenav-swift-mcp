@@ -223,14 +223,27 @@ extension SwiftNavigator {
 	private func checkNewFilesOnDisk(
 		_ plan: EditPlan, client: LSPClient, engine: EditEngine, journalID: String, options: EditOptions
 	) async throws -> String? {
-		let created = plan.changes.filter { $0.isCreation && EditEngine.isSwiftSource($0.path) }
+		var created = plan.changes.filter { $0.isCreation && EditEngine.isSwiftSource($0.path) }
 		guard !created.isEmpty else { return nil }
+		// In an Xcode project a new file belongs to no target until Xcode (or a build, for a synchronized folder)
+		// says so: the compiler would read it with guessed arguments and report "No such module" for valid code.
+		var unknownToXcode: [String] = []
+		if projectKind != .swiftPackage {
+			let modules = xcodeModules()
+			unknownToXcode = created.map(\.path).filter { modules?.module(ofPath: $0) == nil }
+			created.removeAll { unknownToXcode.contains($0.path) }
+		}
+		let xcodeNote = unknownToXcode.isEmpty ? nil
+			: "New file(s) " + unknownToXcode.map { EditFormat.relativeName($0, root: workspaceRoot) }.joined(separator: ", ")
+			+ " are not in an Xcode target that the build knows yet, so they were not compile-checked here. Add them to a target in Xcode (a synchronized folder picks them up by itself) and run `verify`."
+		guard !created.isEmpty else { return xcodeNote }
 		try? await client.refresh()
 		_ = await client.waitForIndex(timeout: 8)
 		var problems: [DiagnosticEntry] = []
 		var checkedAny = false
 		for change in created {
 			guard let diagnostics = try? await client.diagnostics(change.path) else { continue }
+			if diagnostics.contains(where: EditEngine.isAnalysisFailure) { continue }  // no verdict, not an error
 			checkedAny = true
 			let lines = PositionResolver.sourceLines(change.after ?? "")
 			for diagnostic in diagnostics where diagnostic.isError {
@@ -242,8 +255,11 @@ extension SwiftNavigator {
 						fixTitles: diagnostic.fixes.map(\.title)))
 			}
 		}
-		guard checkedAny else { return "New file(s) written, but the language server hasn't picked them up yet; run `diagnostics` on them or `verify`." }
-		if problems.isEmpty { return "New file check (after writing): ✓ no errors." }
+		guard checkedAny else {
+			return ["New file(s) written, but the language server hasn't picked them up yet; run `diagnostics` on them or `verify`.", xcodeNote]
+				.compactMap { $0 }.joined(separator: "\n")
+		}
+		if problems.isEmpty { return (["New file check (after writing): ✓ no errors."] + [xcodeNote].compactMap { $0 }).joined(separator: "\n") }
 		var text = "New file check (after writing): ✗ \(problems.count) error(s):\n"
 			+ problems.prefix(10).map { EditFormat.entry($0, root: workspaceRoot) }.joined(separator: "\n")
 		if options.require == .noNewErrors {

@@ -70,7 +70,7 @@ struct Staging {
 
 	private func isBuildProductOrDependency(_ path: String) -> Bool {
 		guard let base = allowedRoots.first(where: { relativePath(path, in: $0) != nil }) else { return false }
-		return Exclude.isExcluded(URL(fileURLWithPath: path), root: base) || path.contains("/checkouts/") || path.contains("/DerivedSources/")
+		return Exclude.isExcluded(URL(fileURLWithPath: path), root: base) || path.contains("/.build/checkouts/") || path.contains("/SourcePackages/checkouts/") || path.contains("/DerivedSources/")
 	}
 
 	/// The staged text of a file, else its text on disk; nil when it doesn't exist.
