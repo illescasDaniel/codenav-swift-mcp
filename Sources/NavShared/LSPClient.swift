@@ -658,18 +658,30 @@ public actor LSPClient {
 		nextID += 1
 		let id = nextID
 		do {
-			return try await withCheckedThrowingContinuation { continuation in
-				pending[id] = continuation
-				timeouts[id] = Task { [weak self] in
-					try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-					guard !Task.isCancelled else { return }
-					await self?.expire(id, method: method)
+			// A cancelled tool call stops waiting, and tells the server it needn't finish the work.
+			return try await withTaskCancellationHandler {
+				try await withCheckedThrowingContinuation { continuation in
+					pending[id] = continuation
+					timeouts[id] = Task { [weak self] in
+						try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+						guard !Task.isCancelled else { return }
+						await self?.expire(id, method: method)
+					}
+					send(OutgoingRequest(id: id, method: method, params: params))
 				}
-				send(OutgoingRequest(id: id, method: method, params: params))
+			} onCancel: {
+				Task { await self.cancelRequest(id) }
 			}
 		} catch let error as LSPRequestError {
 			throw LSPRequestError(method: method, code: error.code, message: error.message)
 		}
+	}
+
+	private func cancelRequest(_ id: Int) {
+		guard let continuation = pending.removeValue(forKey: id) else { return }
+		timeouts.removeValue(forKey: id)?.cancel()
+		notify("$/cancelRequest", params: ["id": .int(id)])
+		continuation.resume(throwing: CancellationError())
 	}
 
 	private func expire(_ id: Int, method: String) {

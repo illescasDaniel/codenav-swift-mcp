@@ -40,8 +40,11 @@ public actor SwiftNavigator {
 	var recoveryNotices: [String] = []
 	let outlineFileIndex = OutlineFileIndex()
 	var astCache: [String: (stamp: String, when: Date, dump: String?, problem: String?)] = [:]
-	var writeLockHeld = false
-	var writeWaiters: [CheckedContinuation<Void, Never>] = []
+	/// Readers share the language server and the files; a write tool needs both to itself while it shows
+	/// proposals to the server and while a build has the proposal on disk. First come, first served.
+	var gateReaders = 0
+	var gateWriter = false
+	var gateQueue: [(writer: Bool, continuation: CheckedContinuation<Void, Never>)] = []
 	var packageGraphCache: (stamp: Date, graph: PackageGraph?)?
 	var xcodeModulesCache: (buildRoot: String, when: Date, modules: XcodeModules)?
 
@@ -234,14 +237,48 @@ public actor SwiftNavigator {
 		return roots
 	}
 
-	/// Runs a tool body, turning any failure into text and appending pending notices.
+	private func canEnter(writer: Bool) -> Bool { writer ? (!gateWriter && gateReaders == 0) : !gateWriter }
+
+	private func enter(writer: Bool) {
+		if writer { gateWriter = true } else { gateReaders += 1 }
+	}
+
+	func acquire(writer: Bool) async {
+		if gateQueue.isEmpty, canEnter(writer: writer) {
+			enter(writer: writer)
+			return
+		}
+		await withCheckedContinuation { gateQueue.append((writer, $0)) }
+	}
+
+	func release(writer: Bool) {
+		if writer { gateWriter = false } else { gateReaders -= 1 }
+		while let head = gateQueue.first, canEnter(writer: head.writer) {
+			gateQueue.removeFirst()
+			enter(writer: head.writer)
+			head.continuation.resume()
+		}
+	}
+
+	/// A read tool: runs alongside other readers, never while a write tool has a proposal in memory or on disk.
 	func run(_ body: () async throws -> String) async -> ToolResult {
+		await acquire(writer: false)
+		defer { release(writer: false) }
+		return await runUnlocked(body)
+	}
+
+	/// Runs a tool body, turning any failure into text and appending pending notices. Takes no lock: for
+	/// write tools, which take the exclusive one themselves.
+	func runUnlocked(_ body: () async throws -> String) async -> ToolResult {
 		let text: String
 		var failed = false
 		do {
 			text = try await body()
 		} catch let error as SymbolResolutionError {
 			text = error.message
+			failed = true
+		} catch is CancellationError {
+			text = "Cancelled."
 			failed = true
 		} catch {
 			text = formatToolError(error)

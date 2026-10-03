@@ -782,3 +782,78 @@ private func symbol(
 		}
 	}
 }
+
+@Suite struct ProcessCancellationTests {
+	@Test func aCancelledToolCallKillsTheBuildInsteadOfWaitingForIt() async throws {
+		let started = Date()
+		let task = Task {
+			await ToolProcess.run("/bin/sh", arguments: ["-c", "sleep 30; echo done"], directory: FileManager.default.temporaryDirectory, timeout: 60)
+		}
+		try await Task.sleep(nanoseconds: 300_000_000)
+		task.cancel()
+		let output = await task.value
+		#expect(Date().timeIntervalSince(started) < 10)
+		#expect(!output.timedOut)
+		#expect(!output.stdout.contains("done"))
+	}
+}
+
+@Suite struct ReadWriteGateTests {
+	private func navigator() -> SwiftNavigator {
+		SwiftNavigator(environment: [:], currentDirectory: FileManager.default.temporaryDirectory)
+	}
+
+	private actor Log {
+		var events: [String] = []
+		func add(_ event: String) { events.append(event) }
+	}
+
+	@Test func readersShareAndAWriterWaitsForThemAndKeepsLaterReadersOut() async throws {
+		let navigator = navigator()
+		let log = Log()
+		await navigator.acquire(writer: false)
+		await navigator.acquire(writer: false)  // two readers at once
+		let writer = Task {
+			await navigator.acquire(writer: true)
+			await log.add("writer in")
+			try? await Task.sleep(nanoseconds: 50_000_000)
+			await log.add("writer out")
+			await navigator.release(writer: true)
+		}
+		try await Task.sleep(nanoseconds: 50_000_000)
+		let late = Task {
+			await navigator.acquire(writer: false)
+			await log.add("late reader in")
+			await navigator.release(writer: false)
+		}
+		try await Task.sleep(nanoseconds: 50_000_000)
+		#expect(await log.events.isEmpty, "the writer must wait for both readers, and the later reader for the writer")
+		await navigator.release(writer: false)
+		try await Task.sleep(nanoseconds: 30_000_000)
+		#expect(await log.events.isEmpty)
+		await navigator.release(writer: false)
+		await writer.value
+		await late.value
+		#expect(await log.events == ["writer in", "writer out", "late reader in"])
+	}
+
+	@Test func aReadToolWaitsForARunningWriteTool() async throws {
+		let navigator = navigator()
+		let log = Log()
+		let write = Task {
+			await navigator.withWriteLock {
+				await log.add("write start")
+				try? await Task.sleep(nanoseconds: 100_000_000)
+				await log.add("write end")
+			}
+		}
+		try await Task.sleep(nanoseconds: 30_000_000)
+		let read = await navigator.run {
+			await log.add("read")
+			return "ok"
+		}
+		await write.value
+		#expect(read.text == "ok")
+		#expect(await log.events == ["write start", "write end", "read"])
+	}
+}

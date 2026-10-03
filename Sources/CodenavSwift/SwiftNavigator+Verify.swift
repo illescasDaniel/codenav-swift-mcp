@@ -103,6 +103,7 @@ extension SwiftNavigator {
 	func buildAfterWrite(_ plan: EditPlan, engine: EditEngine) async throws -> BuildOutcome {
 		guard let first = await runBuild() else { return BuildOutcome(text: "Build: no swift toolchain found.", hasNewErrors: false) }
 		if first.succeeded { return BuildOutcome(text: describe(first, fresh: [], baseline: nil, failed: false), hasNewErrors: false) }
+		try Task.checkCancellation()  // a killed build also "failed": don't build the baseline for nothing
 		// It failed. Did the project build before?
 		let skipped = try engine.restore(plan, skipChanged: true)
 		let baseline = await runBuild()
@@ -134,6 +135,7 @@ extension SwiftNavigator {
 		do {
 			first = await runBuild()
 			diverged = try engine.restore(plan, skipChanged: true)
+			try Task.checkCancellation()
 		} catch {
 			_ = try? engine.restore(plan, skipChanged: true)
 			endPending(pendingToken)
@@ -162,13 +164,13 @@ extension SwiftNavigator {
 	// MARK: verify
 
 	public func verify(tests: Bool, filter: String?) async -> ToolResult {
-		await run {
-			await useWorkspace()
-			_ = try await liveClient()  // also makes sure the language server has seen the latest files
-			guard canBuild else {
-				throw ToolInputError("verify builds with `swift build` (a SwiftPM package) or `xcodebuild` (an Xcode project with a buildServer.json from xcode-build-server). Neither is available here; build it in Xcode.")
-			}
-			return await withWriteLock {
+		await runUnlocked {
+			try await withWriteLock {
+				await useWorkspace()
+				_ = try await liveClient()  // also makes sure the language server has seen the latest files
+				guard canBuild else {
+					throw ToolInputError("verify builds with `swift build` (a SwiftPM package) or `xcodebuild` (an Xcode project with a buildServer.json from xcode-build-server). Neither is available here; build it in Xcode.")
+				}
 				guard let build = await runBuild() else { return "Build: no build tool found." }
 				var lines = [describeFull(build)]
 				if tests, build.succeeded, projectKind != .swiftPackage {
@@ -242,7 +244,14 @@ extension SwiftNavigator {
 	// MARK: affected_tests
 
 	public func affectedTests(arguments: ToolArguments) async -> ToolResult {
-		await run {
+		// Finding the tests only reads; running them takes the exclusive lock, so that part happens after the
+		// shared one is let go.
+		enum FollowUp {
+			case xcode([String])
+			case swiftTest(swift: String, filter: String)
+		}
+		var followUp: FollowUp?
+		var result = await run {
 			await useWorkspace()
 			let client = try await liveClient()
 			let target = try await resolveTarget(
@@ -320,12 +329,7 @@ extension SwiftNavigator {
 					if identifiers.isEmpty {
 						lines.append("Not run: couldn't tell which test target these belong to.")
 					} else {
-						lines.append(await withWriteLock {
-							guard await runBuild()?.succeeded == true else { return "Tests not run: the build failed (use `verify`)." }
-							var results: [String] = []
-							for identifier in identifiers { results.append(await runXcodeTests(filter: identifier)) }
-							return results.joined(separator: "\n")
-						})
+						followUp = .xcode(identifiers)
 					}
 				}
 				return lines.joined(separator: "\n")
@@ -333,10 +337,25 @@ extension SwiftNavigator {
 			lines.append("Run them: swift test --filter '\(regex)'")
 			if arguments.bool("run", default: false) {
 				guard let swift = swiftExecutable() else { throw ToolInputError("No swift toolchain found to run the tests with.") }
-				lines.append(await withWriteLock { await runTests(swift: swift, filter: regex) })
+				followUp = .swiftTest(swift: swift, filter: regex)
 			}
 			return lines.joined(separator: "\n")
 		}
+		if let followUp, !result.isError {
+			let output: String = await withWriteLock {
+				switch followUp {
+				case .xcode(let identifiers):
+					guard await runBuild()?.succeeded == true else { return "Tests not run: the build failed (use `verify`)." }
+					var results: [String] = []
+					for identifier in identifiers { results.append(await runXcodeTests(filter: identifier)) }
+					return results.joined(separator: "\n")
+				case .swiftTest(let swift, let filter):
+					return await runTests(swift: swift, filter: filter)
+				}
+			}
+			result.text += "\n" + output
+		}
+		return result
 	}
 
 	/// For an Xcode project: test files the last build never compiled (no build settings), as a short list; nil

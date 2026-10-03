@@ -88,6 +88,7 @@ enum ToolProcess {
 			var err = Data()
 			var timedOut = false
 			var closedPipes = 0
+			var timeoutTask: Task<Void, Never>?
 		}
 		let box = Box()
 		func stream(_ pipe: Pipe, into append: @escaping @Sendable (Box, Data) -> Void) {
@@ -109,26 +110,31 @@ enum ToolProcess {
 			init(_ process: Process) { self.process = process }
 		}
 		let shared = SharedProcess(process)
-		let launchError: Error? = await withCheckedContinuation { (continuation: CheckedContinuation<Error?, Never>) in
-			process.terminationHandler = { _ in continuation.resume(returning: nil) }
-			do {
-				try process.run()
-			} catch {
-				continuation.resume(returning: error)  // never started: the termination handler won't fire
-				return
+		// A cancelled tool call (the client gave up) must not leave a build running: kill the process tree.
+		let launchError: Error? = await withTaskCancellationHandler {
+			await withCheckedContinuation { (continuation: CheckedContinuation<Error?, Never>) in
+				process.terminationHandler = { _ in continuation.resume(returning: nil) }
+				do {
+					try process.run()
+				} catch {
+					continuation.resume(returning: error)  // never started: the termination handler won't fire
+					return
+				}
+				if Task.isCancelled { Self.killTree(shared.process) }
+				let timeoutTask = Task.detached {
+					try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+					guard !Task.isCancelled, shared.process.isRunning else { return }
+					box.lock.withLock { box.timedOut = true }
+					Self.killTree(shared.process)
+					try? await Task.sleep(nanoseconds: 1_000_000_000)
+					if shared.process.isRunning { kill(shared.process.processIdentifier, SIGKILL) }
+				}
+				box.lock.withLock { box.timeoutTask = timeoutTask }
 			}
-			Task.detached {
-				try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-				guard !Task.isCancelled, shared.process.isRunning else { return }
-				box.lock.withLock { box.timedOut = true }
-				// A build is a tree of processes. Killing only the top one leaves the compilers running (and, on
-				// Linux, Foundation doesn't report the exit until they let go of the pipes).
-				for child in Self.descendants(of: shared.process.processIdentifier).reversed() { kill(child, SIGKILL) }
-				shared.process.terminate()
-				try? await Task.sleep(nanoseconds: 1_000_000_000)
-				if shared.process.isRunning { kill(shared.process.processIdentifier, SIGKILL) }
-			}
+		} onCancel: {
+			Self.killTree(shared.process)
 		}
+		box.lock.withLock { box.timeoutTask?.cancel() }
 		if let launchError {
 			return ProcessOutput(status: -1, stdout: "", stderr: "could not run \(executable): \(launchError.localizedDescription)", timedOut: false, seconds: 0)
 		}
@@ -148,6 +154,14 @@ enum ToolProcess {
 	static func swiftcExecutable(swift: String) -> String? {
 		let sibling = URL(fileURLWithPath: swift).deletingLastPathComponent().appendingPathComponent("swiftc").path
 		return FileManager.default.isExecutableFile(atPath: sibling) ? sibling : nil
+	}
+
+	/// A build is a tree of processes. Killing only the top one leaves the compilers running (and, on
+	/// Linux, Foundation doesn't report the exit until they let go of the pipes).
+	static func killTree(_ process: Process) {
+		guard process.isRunning else { return }
+		for child in descendants(of: process.processIdentifier).reversed() { kill(child, SIGKILL) }
+		process.terminate()
 	}
 
 	/// Every process below `pid`, parents before children.

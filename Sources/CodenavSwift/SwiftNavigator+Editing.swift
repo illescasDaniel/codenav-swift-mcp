@@ -66,30 +66,21 @@ extension ToolArguments {
 extension SwiftNavigator {
 	// MARK: Locking and journal
 
-	/// One write tool at a time: they show proposed texts to the language server, and two proposals in
-	/// flight would see each other's in-memory documents.
+	/// One write tool at a time, and no reader meanwhile: they show proposed texts to the language server and
+	/// put proposals on disk for a build, and anything that looked at the project then would see a change
+	/// that may never be applied.
 	func withWriteLock<T>(_ body: () async throws -> T) async rethrows -> T {
-		if writeLockHeld {
-			await withCheckedContinuation { writeWaiters.append($0) }
-		} else {
-			writeLockHeld = true
-		}
-		defer {
-			if writeWaiters.isEmpty {
-				writeLockHeld = false
-			} else {
-				writeWaiters.removeFirst().resume()
-			}
-		}
+		await acquire(writer: true)
+		defer { release(writer: true) }
 		return try await body()
 	}
 
 	/// Shared opening of every write tool: workspace, language server, and the write lock.
 	func runWrite(_ body: @escaping (LSPClient) async throws -> String) async -> ToolResult {
-		await run {
-			await useWorkspace()
-			let client = try await liveClient()
-			return try await withWriteLock {
+		await runUnlocked {
+			try await withWriteLock {
+				await useWorkspace()
+				let client = try await liveClient()
 				loadJournalIfNeeded()
 				await client.clearAllOverlays()  // nothing of an earlier, interrupted proposal may be left in memory
 				let notice = takeRecoveryNotice()
@@ -189,7 +180,17 @@ extension SwiftNavigator {
 			lines.append(late)
 		}
 		if build.run {
-			let outcome = try await buildAfterWrite(plan, engine: engine)
+			let outcome: BuildOutcome
+			do {
+				outcome = try await buildAfterWrite(plan, engine: engine)
+				try Task.checkCancellation()
+			} catch is CancellationError {
+				// The caller gave up while the build ran: nothing it didn't see verified stays applied.
+				_ = try? engine.restore(plan, skipChanged: true)
+				forget(id)
+				try? await client.refresh()
+				throw CancellationError()
+			}
 			lines.append(outcome.text)
 			if outcome.hasNewErrors, options.require == .noNewErrors {
 				forget(id)
@@ -272,9 +273,9 @@ extension SwiftNavigator {
 	// MARK: undo_edit
 
 	public func undoEdit(id: String?, list: Bool, force: Bool) async -> ToolResult {
-		await run {
-			await useWorkspace()
-			return try await withWriteLock {
+		await runUnlocked {
+			try await withWriteLock {
+				await useWorkspace()
 				loadJournalIfNeeded()
 				reloadJournal()  // another session on this workspace may have added or removed entries
 				if list || editJournal.isEmpty {
