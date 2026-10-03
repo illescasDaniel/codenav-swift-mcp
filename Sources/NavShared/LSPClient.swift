@@ -240,6 +240,7 @@ public actor LSPClient {
 	private var readerTask: Task<Void, Never>?
 	private var stderrTask: Task<Void, Never>?
 	private var started = false
+	private var startTask: Task<Void, Error>?
 	private var nextID = 0
 	private var buffer = Data()
 	private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
@@ -294,6 +295,15 @@ public actor LSPClient {
 
 	public func start() async throws {
 		guard !started else { return }
+		// Several callers can arrive while the handshake is still awaiting: they share one start.
+		if let startTask { return try await startTask.value }
+		let task = Task { try await self.launchServer() }
+		startTask = task
+		defer { startTask = nil }
+		try await task.value
+	}
+
+	private func launchServer() async throws {
 		stderrTail.removeAll()
 		let server = try ServerProcess(
 			command: configuration.command,
@@ -396,6 +406,13 @@ public actor LSPClient {
 		pushedDiagnostics = [:]
 		diagnosticsArrived = []
 		openFiles = [:]
+		// The new server knows none of the documents the old one held: an overlay left in this set would make
+		// `ensureOpen` believe a proposal is still open there, and never send it.
+		overlays = []
+		capturedEdits = nil
+		buffer = Data()
+		for waiters in diagnosticWaiters.values { for waiter in waiters { waiter.resume() } }
+		diagnosticWaiters = [:]
 		symbolCache = [:]
 		activeProgress = [:]
 		try await start()

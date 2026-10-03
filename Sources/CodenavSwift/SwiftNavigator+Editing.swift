@@ -92,7 +92,13 @@ extension SwiftNavigator {
 			return try await withWriteLock {
 				loadJournalIfNeeded()
 				await client.clearAllOverlays()  // nothing of an earlier, interrupted proposal may be left in memory
-				return try await body(client)
+				let notice = takeRecoveryNotice()
+				do {
+					let text = try await body(client)
+					return notice.isEmpty ? text : notice + "\n" + text
+				} catch let error as ToolInputError where !notice.isEmpty {
+					throw ToolInputError(notice + "\n" + error.message)
+				}
 			}
 		}
 	}
@@ -175,8 +181,7 @@ extension SwiftNavigator {
 		try engine.commit(plan)
 		try? await client.refresh()
 		await client.touch(plan.changes.map(\.path).filter(EditEngine.isSwiftSource))
-		let id = "e\(nextEditNumber)"
-		nextEditNumber += 1
+		let id = reserveEditID()
 		record(JournalEntry(id: id, title: title, plan: plan, date: Date()))
 		lines.insert("\(title): applied as \(id) (\(fileCount) file(s) written).", at: 0)
 
@@ -189,12 +194,16 @@ extension SwiftNavigator {
 			if outcome.hasNewErrors, options.require == .noNewErrors {
 				forget(id)
 				try? await client.refresh()
-				lines[0] = "\(title): NOT applied. The build found new errors in code that depends on the change; every file was put back."
+				lines[0] = "\(title): NOT applied. The build found new errors in code that depends on the change; "
+					+ (outcome.diverged.isEmpty ? "every file was put back." : "the files were put back, except the ones listed below that changed meanwhile.")
 				lines.append("Fix what is listed (or pass require=none), then retry. Diff that was rejected:")
 				lines.append(EditFormat.diff(plan, root: workspaceRoot))
 				throw ToolInputError(lines.joined(separator: "\n"))
 			}
-			if outcome.hasNewErrors { try engine.commit(plan) }
+			if outcome.hasNewErrors {
+				let notWritten = try engine.reapply(plan, skipping: Set(outcome.diverged))
+				if !notWritten.isEmpty { lines.append(divergedNote(notWritten).trimmingCharacters(in: .newlines)) }
+			}
 		} else if let hint = build.hint {
 			lines.append(hint)
 		}
@@ -237,9 +246,9 @@ extension SwiftNavigator {
 		var text = "New file check (after writing): ✗ \(problems.count) error(s):\n"
 			+ problems.prefix(10).map { EditFormat.entry($0, root: workspaceRoot) }.joined(separator: "\n")
 		if options.require == .noNewErrors {
-			try engine.restore(plan, force: true)
+			let left = try engine.restore(plan, skipChanged: true)
 			forget(journalID)
-			text += "\nThe whole change was rolled back (require=no_new_errors)."
+			text += "\nThe whole change was rolled back (require=no_new_errors)." + divergedNote(left)
 			throw ToolInputError("Edit \(journalID) rolled back.\n" + text)
 		}
 		return text
@@ -267,6 +276,7 @@ extension SwiftNavigator {
 			await useWorkspace()
 			return try await withWriteLock {
 				loadJournalIfNeeded()
+				reloadJournal()  // another session on this workspace may have added or removed entries
 				if list || editJournal.isEmpty {
 					guard !editJournal.isEmpty else { return "No edits to undo." }
 					return "Applied edits (newest last):\n" + editJournal.map {

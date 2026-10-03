@@ -263,6 +263,40 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func aProposalLeftOnDiskByADeadServerIsPutBackAndReported() async throws {
+		let workspace = try Workspace()
+		let path = "Sources/SampleKit/UserService.swift"
+		let original = try workspace.read(path)
+		let proposal = original.replacingOccurrences(of: "Creates and finds users.", with: "Stranded.")
+		try workspace.write(path, proposal)
+		let canonical = workspace.root.appendingPathComponent(path).realPath.path
+		JournalStore(workspace: workspace.root).savePending(
+			.init(pid: 1 << 30, title: "check_edit verify=build", date: Date(), changes: [FileChange(path: canonical, before: original, after: proposal)]),
+			token: "dead")
+		let result = await workspace.call("check_edit", #"{"file_path":"Sources/SampleKit/UserService.swift","old_text":"Creates and finds users.","new_text":"Users.","verify":"none"}"#)
+		#expect(!result.isError, "\(result.text)")
+		#expect(result.contains("Recovered: a check_edit verify=build was interrupted"))
+		#expect(try workspace.read(path) == original, "check_edit is a dry run, so the file is as the dead server found it")
+		#expect(JournalStore(workspace: workspace.root).loadPending().isEmpty)
+		await workspace.finish()
+	}
+
+	@Test func twoSessionsOnOneWorkspaceKeepTheirOwnUndoIds() async throws {
+		let workspace = try Workspace()
+		let other = workspace.restarted()
+		let path = "Sources/SampleKit/UserService.swift"
+		let first = await workspace.call("apply_edit", #"{"file_path":"Sources/SampleKit/UserService.swift","old_text":"Creates and finds users.","new_text":"One.","verify":"none"}"#)
+		#expect(first.contains("applied as e1"), "\(first.text)")
+		let object = (try? JSONDecoder().decode([String: JSONValue].self, from: Data(#"{"file_path":"Sources/SampleKit/UserService.swift","old_text":"One.","new_text":"Two.","verify":"none"}"#.utf8))) ?? [:]
+		let second = await ToolCatalog.call("apply_edit", arguments: ToolArguments(object), navigator: other)
+		#expect(second.contains("applied as e2"), "the second session must not reuse e1: \(second.text)")
+		let listed = await ToolCatalog.call("undo_edit", arguments: ToolArguments(["list": .bool(true)]), navigator: other)
+		#expect(listed.contains("e1") && listed.contains("e2"))
+		_ = path
+		await other.shutdown()
+		await workspace.finish()
+	}
+
 	@Test func newFilesAreCheckedAfterTheyExistAndRolledBackWhenBroken() async throws {
 		let workspace = try Workspace()
 		let good = await workspace.call(

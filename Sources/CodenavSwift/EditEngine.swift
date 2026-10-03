@@ -491,18 +491,59 @@ struct EditEngine {
 
 	/// Puts the files back as they were before the plan. Refuses when a file no longer holds what the plan
 	/// wrote (someone edited it since), unless `force`.
-	func restore(_ plan: EditPlan, force: Bool = false) throws {
-		if !force {
-			for change in plan.changes {
-				let current = FileManager.default.fileExists(atPath: change.path) ? try? readTextFile(URL(fileURLWithPath: change.path)) : nil
-				if current != change.after {
-					throw ToolInputError(
-						"\(rel(change.path)) was edited after this change, so it is not restored. Pass force=true to restore it anyway (this discards the later edits), or undo by hand."
-					)
-				}
-			}
+	///
+	/// `skipChanged` is for restores nobody asked for (after a build): a file somebody else changed in the
+	/// meantime is left as it is instead of being overwritten, and returned so the caller can say so.
+	@discardableResult
+	func restore(_ plan: EditPlan, force: Bool = false, skipChanged: Bool = false) throws -> [String] {
+		try Self.restoreFiles(plan, force: force, skipChanged: skipChanged, name: rel)
+	}
+
+	@discardableResult
+	static func restoreFiles(_ plan: EditPlan, force: Bool = false, skipChanged: Bool = false, name: (String) -> String) throws -> [String] {
+		func current(_ path: String) -> String? {
+			FileManager.default.fileExists(atPath: path) ? try? readTextFile(URL(fileURLWithPath: path)) : nil
 		}
-		for change in plan.changes { try Self.write(change.before, to: change.path) }
+		var skipped: [String] = []
+		var toRestore: [FileChange] = []
+		for change in plan.changes {
+			let now = current(change.path)
+			if now == change.before { continue }  // already as it was
+			if now != change.after, !force {
+				if skipChanged {
+					skipped.append(change.path)
+					continue
+				}
+				throw ToolInputError(
+					"\(name(change.path)) was edited after this change, so it is not restored. Pass force=true to restore it anyway (this discards the later edits), or undo by hand."
+				)
+			}
+			toRestore.append(change)
+		}
+		for change in toRestore { try write(change.before, to: change.path) }
+		return skipped
+	}
+
+	/// Writes the plan again after a restore (a build compared the project without it). Files that changed
+	/// meanwhile, or that are in `skipping`, are left alone; the ones not written are returned.
+	func reapply(_ plan: EditPlan, skipping: Set<String> = []) throws -> [String] {
+		var notWritten: [String] = []
+		var written: [FileChange] = []
+		do {
+			for change in plan.changes {
+				let now = FileManager.default.fileExists(atPath: change.path) ? try? readTextFile(URL(fileURLWithPath: change.path)) : nil
+				if skipping.contains(change.path) || now != change.before {
+					if now != change.after { notWritten.append(change.path) }
+					continue
+				}
+				try Self.write(change.after, to: change.path)
+				written.append(change)
+			}
+		} catch {
+			for change in written.reversed() { try? Self.write(change.before, to: change.path) }
+			throw ToolInputError("Writing failed (\(error.localizedDescription)); the files written so far were restored.")
+		}
+		return notWritten
 	}
 
 	private static func write(_ text: String?, to path: String) throws {

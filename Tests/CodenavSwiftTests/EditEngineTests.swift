@@ -515,6 +515,88 @@ private func symbol(
 	}
 }
 
+@Suite struct WriteSafetyTests {
+	private func plan(in root: URL) -> EditPlan {
+		var plan = EditPlan()
+		plan.changes = [
+			FileChange(path: root.appendingPathComponent("A.swift").path, before: "a\n", after: "A\n"),
+			FileChange(path: root.appendingPathComponent("B.swift").path, before: "b\n", after: "B\n"),
+		]
+		return plan
+	}
+
+	private func scratch() throws -> URL {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("safety-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+		return root.realPath
+	}
+
+	@Test func aRestoreAfterABuildLeavesFilesSomebodyElseChanged() throws {
+		let root = try scratch()
+		defer { try? FileManager.default.removeItem(at: root) }
+		let plan = plan(in: root)
+		for change in plan.changes { try change.after!.write(toFile: change.path, atomically: true, encoding: .utf8) }
+		// The user saved B in their editor while the build ran.
+		try "mine\n".write(toFile: plan.changes[1].path, atomically: true, encoding: .utf8)
+		let skipped = try EditEngine.restoreFiles(plan, skipChanged: true) { $0 }
+		#expect(skipped == [plan.changes[1].path])
+		#expect(try String(contentsOfFile: plan.changes[0].path, encoding: .utf8) == "a\n")
+		#expect(try String(contentsOfFile: plan.changes[1].path, encoding: .utf8) == "mine\n")
+		// The strict restore still refuses, and a restore of a file that is already back is not an error.
+		#expect(throws: ToolInputError.self) { try EditEngine.restoreFiles(plan) { $0 } }
+		try "b\n".write(toFile: plan.changes[1].path, atomically: true, encoding: .utf8)
+		#expect(try EditEngine.restoreFiles(plan) { $0 }.isEmpty)
+	}
+
+	@Test func writingTheProposalAgainSkipsWhatChangedMeanwhile() async throws {
+		let root = try scratch()
+		defer { try? FileManager.default.removeItem(at: root) }
+		let plan = plan(in: root)
+		for change in plan.changes { try change.before!.write(toFile: change.path, atomically: true, encoding: .utf8) }
+		try "mine\n".write(toFile: plan.changes[1].path, atomically: true, encoding: .utf8)
+		let engine = EditEngine(client: LSPClient(configuration: .init(workspaceRoot: root, command: ["true"], languageID: "swift")), root: root)
+		let notWritten = try engine.reapply(plan)
+		#expect(notWritten == [plan.changes[1].path])
+		#expect(try String(contentsOfFile: plan.changes[0].path, encoding: .utf8) == "A\n")
+		#expect(try String(contentsOfFile: plan.changes[1].path, encoding: .utf8) == "mine\n")
+	}
+
+	@Test func journalIdsAreNeverHandedOutTwice() throws {
+		let base = FileManager.default.temporaryDirectory.appendingPathComponent("journal-\(UUID().uuidString)", isDirectory: true)
+		defer { try? FileManager.default.removeItem(at: base) }
+		let workspace = FileManager.default.temporaryDirectory
+		// Two servers on one workspace, both believing the next number is 1.
+		let first = JournalStore(workspace: workspace, base: base).reserve(startingAt: 1)
+		let second = JournalStore(workspace: workspace, base: base).reserve(startingAt: 1)
+		#expect(first == "e1" && second == "e2")
+		// A reserved id that was never filled in is not a journal entry.
+		#expect(JournalStore(workspace: workspace, base: base).load().isEmpty)
+	}
+
+	@Test func strandedProposalsAreFoundAndPutBackByTheNextServer() throws {
+		let base = FileManager.default.temporaryDirectory.appendingPathComponent("journal-\(UUID().uuidString)", isDirectory: true)
+		let root = try scratch()
+		defer {
+			try? FileManager.default.removeItem(at: base)
+			try? FileManager.default.removeItem(at: root)
+		}
+		let plan = plan(in: root)
+		for change in plan.changes { try change.after!.write(toFile: change.path, atomically: true, encoding: .utf8) }
+		let store = JournalStore(workspace: root, base: base)
+		// A process that no longer exists (pid 2^30 is never in use) left this behind.
+		store.savePending(.init(pid: 1 << 30, title: "check_edit verify=build", date: Date(), changes: plan.changes), token: "t")
+		#expect(store.loadPending().count == 1)
+		for (token, pending) in store.loadPending() {
+			var stranded = EditPlan()
+			stranded.changes = pending.changes
+			#expect(try EditEngine.restoreFiles(stranded, skipChanged: true) { $0 }.isEmpty)
+			store.removePending(token)
+		}
+		#expect(try String(contentsOfFile: plan.changes[0].path, encoding: .utf8) == "a\n")
+		#expect(store.loadPending().isEmpty)
+	}
+}
+
 @Suite struct FlowLintTests {
 	private func problems(_ source: String, name: String = "f()", kind: Int = SymbolKind.function) throws -> [String] {
 		let index = TextIndex(source)

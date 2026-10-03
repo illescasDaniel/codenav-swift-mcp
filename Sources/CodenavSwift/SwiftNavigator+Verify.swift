@@ -4,6 +4,8 @@ import NavShared
 struct BuildOutcome {
 	var text: String
 	var hasNewErrors: Bool
+	/// Files somebody else changed while the build ran: they were left as they are, not put back or rewritten.
+	var diverged: [String] = []
 }
 
 extension SwiftNavigator {
@@ -102,13 +104,15 @@ extension SwiftNavigator {
 		guard let first = await runBuild() else { return BuildOutcome(text: "Build: no swift toolchain found.", hasNewErrors: false) }
 		if first.succeeded { return BuildOutcome(text: describe(first, fresh: [], baseline: nil, failed: false), hasNewErrors: false) }
 		// It failed. Did the project build before?
-		try engine.restore(plan, force: true)
+		let skipped = try engine.restore(plan, skipChanged: true)
 		let baseline = await runBuild()
 		let fresh = baseline.map { Self.newErrors(first, comparedTo: $0) } ?? first.errors
 		let unattributed = first.errors.isEmpty && baseline?.succeeded != false
 		let blamed = first.timedOut || !fresh.isEmpty || unattributed
-		if !blamed { try engine.commit(plan) }
-		return BuildOutcome(text: describe(first, fresh: fresh, baseline: baseline, failed: blamed), hasNewErrors: blamed)
+		var diverged = skipped
+		if !blamed { diverged = try engine.reapply(plan, skipping: Set(skipped)) }
+		return BuildOutcome(
+			text: describe(first, fresh: fresh, baseline: baseline, failed: blamed) + divergedNote(diverged), hasNewErrors: blamed, diverged: diverged)
 	}
 
 	/// Xcode's index store is written by builds: a build of a proposed change that is then put back leaves the
@@ -122,23 +126,37 @@ extension SwiftNavigator {
 	/// For a dry run that asked for a build: writes the plan, builds, and puts every file back.
 	func buildOnTemporaryWrite(_ plan: EditPlan, engine: EditEngine) async throws -> BuildOutcome {
 		try engine.commit(plan)
+		// The files are changed on disk with nothing in the journal: if this process dies during the build,
+		// the next one finds this record and puts them back.
+		let pendingToken = beginPending(plan, title: "check_edit verify=build")
 		let first: BuildResult?
+		var diverged: [String] = []
 		do {
 			first = await runBuild()
-			try engine.restore(plan, force: true)
+			diverged = try engine.restore(plan, skipChanged: true)
 		} catch {
-			try? engine.restore(plan, force: true)
+			_ = try? engine.restore(plan, skipChanged: true)
+			endPending(pendingToken)
 			throw error
 		}
+		endPending(pendingToken)
 		guard let first else { return BuildOutcome(text: "Build: no swift toolchain found.", hasNewErrors: false) }
 		if first.succeeded {
 			await resyncXcodeIndex()
-			return BuildOutcome(text: describe(first, fresh: [], baseline: nil, failed: false), hasNewErrors: false)
+			return BuildOutcome(text: describe(first, fresh: [], baseline: nil, failed: false) + divergedNote(diverged), hasNewErrors: false, diverged: diverged)
 		}
 		let baseline = await runBuild()
 		let fresh = baseline.map { Self.newErrors(first, comparedTo: $0) } ?? first.errors
 		let blamed = first.timedOut || !fresh.isEmpty || (first.errors.isEmpty && baseline?.succeeded != false)
-		return BuildOutcome(text: describe(first, fresh: fresh, baseline: baseline, failed: blamed), hasNewErrors: blamed)
+		return BuildOutcome(
+			text: describe(first, fresh: fresh, baseline: baseline, failed: blamed) + divergedNote(diverged), hasNewErrors: blamed, diverged: diverged)
+	}
+
+	func divergedNote(_ paths: [String]) -> String {
+		guard !paths.isEmpty else { return "" }
+		return "\n⚠ " + paths.map { EditFormat.relativeName($0, root: workspaceRoot) }.joined(separator: ", ")
+			+ " changed while the build ran (an editor, another tool?), so codenav left "
+			+ (paths.count == 1 ? "it" : "them") + " as " + (paths.count == 1 ? "it is" : "they are") + " instead of overwriting the newer text."
 	}
 
 	// MARK: verify

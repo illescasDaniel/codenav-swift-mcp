@@ -45,6 +45,55 @@ struct JournalStore {
 		try? FileManager.default.removeItem(at: file(id))
 	}
 
+	/// Claims the next free id by creating its file exclusively, so two servers on the same workspace
+	/// (two clients) never hand out the same one.
+	func reserve(startingAt number: Int) -> String {
+		try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+		var candidate = max(number, 1)
+		while candidate < number + 10_000 {
+			let path = file("e\(candidate)").path
+			let descriptor = open(path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+			if descriptor >= 0 {
+				close(descriptor)
+				return "e\(candidate)"
+			}
+			if errno != EEXIST { break }
+			candidate += 1
+		}
+		return "e\(max(number, 1))"
+	}
+
+	// MARK: Changes written while a build runs
+
+	/// A record of files that are changed on disk without being in the journal yet (a `check_edit` that builds
+	/// the proposal). If the process dies meanwhile, the next one restores them.
+	struct Pending: Codable {
+		var pid: Int32
+		var title: String
+		var date: Date
+		var changes: [FileChange]
+	}
+
+	func savePending(_ pending: Pending, token: String) {
+		try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+		if let data = try? JSONEncoder().encode(pending) { try? data.write(to: pendingFile(token), options: .atomic) }
+	}
+
+	func removePending(_ token: String) {
+		try? FileManager.default.removeItem(at: pendingFile(token))
+	}
+
+	func loadPending() -> [(token: String, pending: Pending)] {
+		guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return [] }
+		let decoder = JSONDecoder()
+		return files.filter { $0.lastPathComponent.hasPrefix("pending-") && $0.pathExtension == "json" }.compactMap { url in
+			guard let data = try? Data(contentsOf: url), let pending = try? decoder.decode(Pending.self, from: data) else { return nil }
+			return (String(url.deletingPathExtension().lastPathComponent.dropFirst("pending-".count)), pending)
+		}
+	}
+
+	private func pendingFile(_ token: String) -> URL { directory.appendingPathComponent("pending-\(token).json") }
+
 	private func file(_ id: String) -> URL { directory.appendingPathComponent("\(id).json") }
 }
 
@@ -53,10 +102,59 @@ extension SwiftNavigator {
 	func loadJournalIfNeeded() {
 		guard !journalLoaded else { return }
 		journalLoaded = true
+		recoverStrandedChanges()
 		let stored = JournalStore(workspace: workspaceRoot).load()
 		guard !stored.isEmpty else { return }
 		editJournal = stored + editJournal
 		nextEditNumber = max(nextEditNumber, (stored.map { JournalStore.number($0.id) }.max() ?? 0) + 1)
+	}
+
+	/// The journal as it is on disk now: entries of other sessions on this workspace included.
+	func reloadJournal() {
+		let stored = JournalStore(workspace: workspaceRoot).load()
+		editJournal = stored
+		nextEditNumber = max(nextEditNumber, (stored.map { JournalStore.number($0.id) }.max() ?? 0) + 1)
+	}
+
+	func reserveEditID() -> String {
+		let id = JournalStore(workspace: workspaceRoot).reserve(startingAt: nextEditNumber)
+		nextEditNumber = JournalStore.number(id) + 1
+		return id
+	}
+
+	func beginPending(_ plan: EditPlan, title: String) -> String {
+		let token = UUID().uuidString
+		JournalStore(workspace: workspaceRoot).savePending(
+			.init(pid: ProcessInfo.processInfo.processIdentifier, title: title, date: Date(), changes: plan.changes), token: token)
+		return token
+	}
+
+	func endPending(_ token: String) {
+		JournalStore(workspace: workspaceRoot).removePending(token)
+	}
+
+	/// A previous server died while a proposal was written for a build: put those files back, unless the user
+	/// has changed them since, and say so on the next write tool's answer.
+	func recoverStrandedChanges() {
+		let store = JournalStore(workspace: workspaceRoot)
+		for (token, pending) in store.loadPending() {
+			if pending.pid != ProcessInfo.processInfo.processIdentifier, kill(pending.pid, 0) == 0 { continue }  // still running elsewhere
+			var plan = EditPlan()
+			plan.changes = pending.changes
+			let name = { (path: String) in EditFormat.relativeName(path, root: self.workspaceRoot) }
+			let left = (try? EditEngine.restoreFiles(plan, skipChanged: true, name: name)) ?? plan.changes.map(\.path)
+			store.removePending(token)
+			let restored = plan.changes.map(\.path).filter { !left.contains($0) }
+			var notice = "Recovered: a \(pending.title) was interrupted while its proposal was on disk; "
+			notice += restored.isEmpty ? "nothing needed restoring" : "restored " + restored.map(name).joined(separator: ", ")
+			if !left.isEmpty { notice += "; left as they are because they changed since: " + left.map(name).joined(separator: ", ") }
+			recoveryNotices.append(notice + ".")
+		}
+	}
+
+	func takeRecoveryNotice() -> String {
+		defer { recoveryNotices = [] }
+		return recoveryNotices.joined(separator: "\n")
 	}
 
 	func record(_ entry: JournalEntry) {

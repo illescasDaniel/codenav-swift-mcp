@@ -37,6 +37,7 @@ public actor SwiftNavigator {
 	var editJournal: [JournalEntry] = []
 	var nextEditNumber = 1
 	var journalLoaded = false
+	var recoveryNotices: [String] = []
 	let outlineFileIndex = OutlineFileIndex()
 	var astCache: [String: (stamp: String, when: Date, dump: String?, problem: String?)] = [:]
 	var writeLockHeld = false
