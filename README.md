@@ -136,11 +136,11 @@ diagnostics from before, and written only if it introduces no new errors. Off by
 
 | Tool | What it does |
 | --- | --- |
-| `rename_symbol` | Renames through the type checker (overloads, witnesses, overrides, labels). Rejects keywords, wrong label counts and collisions, then lists what a rename can't follow: the name left in comments and strings, Codable keys that would change, Objective-C exposure. `keep_deprecated_alias` leaves a forwarding function |
-| `change_signature` | Adds, removes, reorders, retypes or re-defaults parameters **and rewrites every call site**; overrides and protocol witnesses change with it, and a witness pulls in the requirement it implements |
+| `rename_symbol` | Renames through the type checker (overloads, witnesses, overrides, labels). Rejects keywords, wrong label counts and collisions, then lists what a rename can't follow: the name left in comments and strings, Codable keys that would change, Objective-C exposure. `keep_deprecated_alias` leaves a deprecated forwarding declaration: a function that calls the new one, a property that forwards, or a `typealias` for a type |
+| `change_signature` | Adds, removes, reorders, retypes or re-defaults parameters **and rewrites every call site** (trailing closures included, while the closure stays last); overrides and protocol witnesses change with it, and a witness pulls in the requirement it implements |
 | `edit_symbol` | Replaces a declaration, or only its body, addressed by name: no text to quote, no wrong overload |
 | `insert_member` | Adds a member to a type or extension (`first`, `last`, `after:x`, `before:x`), or a top-level declaration, indented like its neighbours |
-| `delete_symbol`, `move_symbol` | Delete refuses while anything still uses the symbol and lists the usages; move carries the doc comment and imports to another file |
+| `delete_symbol`, `move_symbol` | Delete refuses while anything still uses the symbol and lists the usages; move carries the doc comment to another file (top-level declarations, imports included) or into another type (`to_container`, members) |
 | `add_conformance` | `extension T: P` (or inline) with the compiler's stubs, re-indented, returning stubs as `fatalError` so it compiles |
 | `fix_diagnostics` | Applies the compiler's own fix-its in a file, re-checking between rounds |
 | `refactor` | sourcekit-lsp's Extract Method / Expression, Convert to Async, Memberwise Init... with tidy indentation and your name for the result |
@@ -194,16 +194,43 @@ The check has two tiers, and every result says which ones ran:
    writing (`verify=auto`). If the build adds errors, every file is put back. Errors that were already there are
    recognised and don't block. `check_edit verify=build` does the same in a temporary write that is always undone.
 
+### Xcode projects: the build tier is not done yet (to try on a Mac)
+
+The second tier above is SwiftPM-only today, and it has **never been run against an Xcode project**: the development
+machine for it was Linux. Until it is done, an edit in an Xcode project is judged in memory per target, and the result
+says that files in other targets were not compiled. Two ways to close the gap, to be tried on a Mac with Xcode:
+
+1. **Let the agent build (works today, nothing to implement).** Apply the edit with `verify=none`, then have the agent
+   call the Xcode MCP's build tool (`BuildProject`, from `xcrun mcpbridge`, e.g. via
+   `"xcode-tools": {"command": "uvx", "args": ["--from", "mcpbridge-wrapper", "mcpbridge-wrapper", "--broker"]}`) and
+   read its errors. codenav is itself an MCP *server* and can't call another one, so this stays on the agent's side.
+   To check: does the build report errors in other targets that the in-memory check missed? Does `undo_edit` still
+   restore the files cleanly while Xcode has the project open?
+2. **Let codenav run `xcodebuild`.** Needs: the scheme and project/workspace (both are in the `buildServer.json` that
+   xcode-build-server writes), a destination, and a way to know which target a file belongs to (today that comes from
+   `swift package describe`; for Xcode it could come from the compile commands xcode-build-server records, or from
+   `import` statements). To check on a Mac:
+   * `xcodebuild -scheme <S> -destination 'generic/platform=macOS' build` output is parsed by `BuildRunner.parse`
+     (it expects `/path/File.swift:LINE:COL: error: message`; Xcode may prefix or format differently);
+   * how long an incremental build takes, and whether it fights with Xcode's own build for the DerivedData lock;
+   * whether `-quiet` / `-skipPackagePluginValidation` are needed.
+
 Limits worth knowing:
 
 * The build tier needs a SwiftPM package (it reads the target graph from `swift package describe`). For an Xcode
   project the in-memory tier still runs, but module boundaries are unknown, and the result says that files in other
   targets were not compiled: build the project to be sure.
 * While a file has type errors, the Swift compiler skips flow analysis (missing returns, uninitialized variables), so
-  a check on a file that already had errors may be incomplete; the result says so.
+  a check on a file that already had errors is incomplete; the result says so. For the declarations an edit touched,
+  a small heuristic looks for the commonest case (a function that returns a value but has an empty body or no
+  `return`) and lists what it finds as *possible* problems; it can't replace the compiler, and it doesn't look for
+  uninitialized variables.
+* `change_signature` leaves a function used as a value (`map(service.create)`), a trailing closure that the change
+  would have to move into the parentheses, and calls it can't match to the old parameters, for you; each is listed.
 * If the language server can't analyze a file at all (broken build settings), the change is reported **not verified**
   and refused rather than waved through. `workspace` shows why.
-* `undo_edit` history lives in the server's memory for the session; git remains the safety net across restarts.
+* `undo_edit` history is kept on disk (in the temporary directory, per workspace, the last 25 edits), so it survives a
+  restart of the server, but not clearing temp files; git remains the real safety net.
 * Edits are limited to the workspace and its local packages; dependency checkouts and build products are refused.
 * File modes and `\r\n` line endings are preserved.
 

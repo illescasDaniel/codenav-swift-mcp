@@ -61,8 +61,18 @@ struct EditingIntegrationTests {
 
 		func exists(_ path: String) -> Bool { FileManager.default.fileExists(atPath: root.appendingPathComponent(path).path) }
 
+		/// A fresh navigator (as after the MCP client restarted the server) on the same files.
+		func restarted() -> SwiftNavigator {
+			var environment = ProcessInfo.processInfo.environment
+			environment["CODENAV_SWIFT_WORKSPACE"] = root.path
+			environment["CODENAV_SWIFT_WRITE"] = "1"
+			environment["CODENAV_SWIFT_INDEX_TIMEOUT"] = "120"
+			return SwiftNavigator(environment: environment, currentDirectory: root)
+		}
+
 		func finish() async {
 			await navigator.shutdown()
+			try? FileManager.default.removeItem(at: JournalStore(workspace: root).directory)
 			try? FileManager.default.removeItem(at: root)
 		}
 	}
@@ -99,6 +109,29 @@ struct EditingIntegrationTests {
 		#expect(undone.contains("Undid e1"))
 		#expect(try workspace.read("Sources/SampleKit/UserService.swift").contains("/// Creates a user and saves it."))
 		#expect(await workspace.call("undo_edit", #"{"list":true}"#).contains("No edits to undo"))
+		await workspace.finish()
+	}
+
+	@Test func undoStillWorksAfterTheServerRestarted() async throws {
+		let workspace = try Workspace()
+		let applied = await workspace.call(
+			"apply_edit", #"{"file_path":"Sources/SampleKit/UserService.swift","old_text":"Creates and finds users.","new_text":"Users."}"#)
+		#expect(applied.contains("applied as e1"))
+		await workspace.navigator.shutdown()
+
+		let again = workspace.restarted()
+		let arguments = ToolArguments([:])
+		let listed = await again.undoEdit(id: nil, list: true, force: false)
+		#expect(listed.contains("e1"))
+		let undone = await ToolCatalog.call("undo_edit", arguments: arguments, navigator: again)
+		#expect(undone.contains("Undid e1"))
+		#expect(try workspace.read("Sources/SampleKit/UserService.swift").contains("Creates and finds users."))
+		// Numbering continues instead of reusing an id that is still on record.
+		let next = await ToolCatalog.call(
+			"apply_edit", arguments: ToolArguments(["file_path": "Sources/SampleKit/UserService.swift", "old_text": "Creates and finds users.", "new_text": "Users."]),
+			navigator: again)
+		#expect(next.contains("applied as e2"))
+		await again.shutdown()
 		await workspace.finish()
 	}
 
@@ -269,7 +302,7 @@ struct EditingIntegrationTests {
 		#expect(!(try workspace.read("Sources/SampleKit/Models.swift")).contains("class Dog"))
 		let member = await workspace.call("move_symbol", #"{"name":"UserService.find(id:)","to_file":"Sources/SampleKit/Other.swift"}"#)
 		#expect(member.isError)
-		#expect(member.contains("only top-level"))
+		#expect(member.contains("to_container"))
 		await workspace.finish()
 	}
 
@@ -325,6 +358,67 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func typesAndPropertiesKeepDeprecatedAliases() async throws {
+		let workspace = try Workspace()
+		try workspace.write("Sources/SampleKit/Profile.swift", "public struct Profile {\n\tpublic var displayName: String\n\tpublic static let limit: Int = 3\n}\n")
+		let property = await workspace.call(
+			"rename_symbol", #"{"name":"Profile.displayName","new_name":"fullName","keep_deprecated_alias":true,"verify":"none"}"#)
+		#expect(!property.isError)
+		let profile = try workspace.read("Sources/SampleKit/Profile.swift")
+		#expect(profile.contains("\t@available(*, deprecated, renamed: \"fullName\")\n\tpublic var displayName: String {\n\t\tget { fullName }\n\t\tset { fullName = newValue }\n\t}"))
+		let constant = await workspace.call(
+			"rename_symbol", #"{"name":"Profile.limit","new_name":"maximum","keep_deprecated_alias":true,"verify":"none"}"#)
+		#expect(!constant.isError)
+		#expect(try workspace.read("Sources/SampleKit/Profile.swift").contains("public static var limit: Int { maximum }"))
+		let type = await workspace.call("rename_symbol", #"{"name":"Dog","new_name":"Hound","keep_deprecated_alias":true,"verify":"none"}"#)
+		#expect(!type.isError)
+		let models = try workspace.read("Sources/SampleKit/Models.swift")
+		#expect(models.contains("public final class Hound: Animal"))
+		#expect(models.contains("@available(*, deprecated, renamed: \"Hound\")\npublic typealias Dog = Hound"))
+		await workspace.finish()
+	}
+
+	@Test func membersMoveBetweenTypesInOneFileOrAcrossFiles() async throws {
+		let workspace = try Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Repo.swift",
+			"public final class Repo {\n\tpublic init() {}\n}\n\nextension UserService {\n\tpublic func ping() -> Int { 1 }\n}\n")
+		let moved = await workspace.call("move_symbol", #"{"name":"UserService.ping()","to_container":"Repo","verify":"none"}"#)
+		#expect(!moved.isError)
+		let repo = try workspace.read("Sources/SampleKit/Repo.swift")
+		#expect(repo.contains("public init() {}\n\n\tpublic func ping() -> Int { 1 }\n}"))
+		#expect(!repo.contains("extension UserService {\n\tpublic func ping"))
+
+		// Same file: one declaration's member into another type of the same file.
+		let sameFile = await workspace.call("move_symbol", #"{"name":"Dog.speak()","to_container":"Animal","verify":"none","require":"none"}"#)
+		#expect(!sameFile.isError)
+		let models = try workspace.read("Sources/SampleKit/Models.swift")
+		#expect(models.components(separatedBy: "\"woof\"").count == 2)  // moved, not copied
+		let woof = try #require(models.range(of: "\"woof\""))
+		let dog = try #require(models.range(of: "public final class Dog"))
+		#expect(woof.lowerBound < dog.lowerBound)  // now inside Animal, which comes first
+
+		let usesSelf = await workspace.call("move_symbol", #"{"name":"UserService.find(id:)","to_container":"Repo","verify":"none"}"#)
+		#expect(usesSelf.isError)
+		#expect(usesSelf.contains("Cannot find 'store' in scope"))
+		let topLevel = await workspace.call("move_symbol", #"{"name":"Dog","to_container":"Repo"}"#)
+		#expect(topLevel.isError && topLevel.contains("top-level"))
+		let both = await workspace.call("move_symbol", #"{"name":"Dog","to_container":"Repo","to_file":"Sources/SampleKit/X.swift"}"#)
+		#expect(both.isError && both.contains("exactly one"))
+		await workspace.finish()
+	}
+
+	@Test func aFileThatStillHasErrorsGetsTheFlowLintForWhatWasEdited() async throws {
+		let workspace = try Workspace()
+		try workspace.write("Sources/SampleKit/Sw.swift", "public func describe(_ r: Role) -> Int {\n\tswitch r {\n\tcase .admin: return 1\n\t}\n}\n")
+		let result = await workspace.call(
+			"insert_member",
+			#"{"file_path":"Sources/SampleKit/Sw.swift","code":"public func g(_ x: Int) -> Int {\n    let y = x + 1\n    print(y)\n}","require":"none","verify":"none"}"#)
+		#expect(result.contains("Possible problems the compiler can't report"))
+		#expect(result.contains("g returns Int but has 2 statements and no `return`"))
+		await workspace.finish()
+	}
+
 	// MARK: change_signature
 
 	@Test func addingAParameterRewritesEveryCallAcrossModulesAndWitnesses() async throws {
@@ -352,6 +446,28 @@ struct EditingIntegrationTests {
 		#expect(bulk.contains("_ = try await create(name: name, admin: false)"))
 		#expect(bulk.contains("_ = try await create(\n\t\t\tname: \"x\",\n\t\t\tadmin: false\n\t\t)"))
 		#expect(try workspace.read("Sources/SampleApp/main.swift").contains("service.create(name: \"Ada\", admin: false)"))
+		await workspace.finish()
+	}
+
+	@Test func callsWithTrailingClosuresAreRewrittenWhenTheClosureStaysLast() async throws {
+		let workspace = try Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Loader.swift",
+			"public func load(_ id: Int, then done: @escaping (Int) -> Void) { done(id) }\n\npublic func useLoader() {\n\tload(1) { print($0) }\n\tload(2, then: { print($0) })\n}\n")
+		let before = await workspace.call(
+			"change_signature",
+			#"{"name":"load(_:then:)","operations":[{"op":"add","param":"force: Bool","position":"before:then","call_value":"true"}],"verify":"none"}"#)
+		#expect(!before.isError)
+		let loader = try workspace.read("Sources/SampleKit/Loader.swift")
+		#expect(loader.contains("public func load(_ id: Int, force: Bool, then done: @escaping (Int) -> Void)"))
+		#expect(loader.contains("\tload(1, force: true) { print($0) }"))
+		#expect(loader.contains("\tload(2, force: true, then: { print($0) })"))
+
+		// An added parameter after the closure would force the closure into the parentheses: left for a person.
+		let after = await workspace.call(
+			"change_signature",
+			#"{"name":"load(_:force:then:)","operations":[{"op":"add","param":"extra: Int","call_value":"0"}],"verify":"none"}"#)
+		#expect(after.contains("trailing closure would have to move") || after.isError)
 		await workspace.finish()
 	}
 

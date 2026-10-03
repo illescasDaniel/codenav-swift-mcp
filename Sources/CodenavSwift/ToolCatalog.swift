@@ -319,11 +319,14 @@ public enum ToolCatalog {
 			name: "move_symbol",
 			description:
 				writeIntro
-				+ "Move a top-level declaration (with its doc comment) to another file, creating the file when needed and carrying over the imports. "
-				+ "Example: `move_symbol(name=\"Dog\", to_file=\"Sources/SampleKit/Dog.swift\")`.",
+				+ "Move a declaration with its doc comment. A top-level declaration goes to another file (`to_file`, created when needed, imports carried over); "
+				+ "a member goes into another type or extension (`to_container`, in the same or another file; `position` as for insert_member). "
+				+ "Examples: `move_symbol(name=\"Dog\", to_file=\"Sources/SampleKit/Dog.swift\")`, `move_symbol(name=\"UserService.find(id:)\", to_container=\"UserRepository\")`.",
 			parameters: symbolTarget + [
-				p("to_file", .string, "Destination file (created when it doesn't exist).", required: true),
-				p("position", .string, "Where in an existing destination: `last` (default), `first`, `after:<symbol>`, `before:<symbol>`."),
+				p("to_file", .string, "Destination file for a top-level declaration (created when it doesn't exist)."),
+				p("to_container", .string, "Destination type for a member."),
+				p("to_container_file", .string, "Disambiguates `to_container` when several types share the name."),
+				p("position", .string, "Where in the destination: `last` (default), `first`, `after:<symbol>`, `before:<symbol>`."),
 			] + editOptions),
 	]
 
@@ -335,10 +338,10 @@ public enum ToolCatalog {
 			+ "`new_name` is the base name (`make`, which keeps the labels) or the full name with labels (`make(named:)`, `make(_:to:)`); "
 			+ "the number of labels can't change (use change_signature for that). Checks the name (keywords, validity, collisions in the same scope), "
 			+ "then lists what a rename can't follow: the old name left in comments and strings, Codable keys that would change, Objective-C/runtime exposure, public API. "
-			+ "`keep_deprecated_alias` leaves a deprecated forwarding function under the old name. Example: `rename_symbol(name=\"UserService.create(name:)\", new_name=\"make(named:)\")`.",
+			+ "`keep_deprecated_alias` leaves a deprecated forwarding declaration under the old name (a function that calls the new one, a property that forwards, or a `typealias` for a type). Example: `rename_symbol(name=\"UserService.create(name:)\", new_name=\"make(named:)\")`.",
 		parameters: symbolTarget + [
 			p("new_name", .string, "The new name: `make` or `make(named:)`.", required: true),
-			p("keep_deprecated_alias", .boolean, "For functions and methods: keep the old name as a deprecated function that calls the new one."),
+			p("keep_deprecated_alias", .boolean, "Keep the old name as a deprecated declaration that forwards to the new one (functions, methods, properties, types)."),
 		] + editOptions)
 
 	static let fixTools: [ToolSpec] = [
@@ -350,7 +353,7 @@ public enum ToolCatalog {
 				+ "`operations` is a list: {op:\"add\", param:\"overwrite: Bool = false\", position:\"last\"|\"first\"|\"before:x\"|\"after:x\", call_value:\"false\"} "
 				+ "(call_value is what existing callers pass; optional when the parameter has a default), {op:\"remove\", param:\"flag\"}, {op:\"reorder\", order:[\"b\",\"a\"]}, "
 				+ "{op:\"retype\", param:\"x\", type:\"Int\"}, {op:\"default\", param:\"x\", value:\"3\"} (omit value to drop the default). "
-				+ "Calls it can't rewrite safely (a trailing closure, a function used as a value) are listed for you; uses of a removed parameter inside the body show up in the compile check. "
+				+ "Calls with a trailing closure are rewritten while the closure parameter stays last; calls it can't rewrite safely (a function used as a value, a closure that would have to move) are listed for you; uses of a removed parameter inside the body show up in the compile check. "
 				+ "To only rename labels use rename_symbol.",
 			parameters: symbolTarget + [
 				p("operations", .array, "List of operations (see the tool description)."),

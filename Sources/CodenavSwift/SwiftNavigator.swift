@@ -36,6 +36,7 @@ public actor SwiftNavigator {
 	// in-memory documents. Used by the `SwiftNavigator+Editing` extensions.
 	var editJournal: [JournalEntry] = []
 	var nextEditNumber = 1
+	var journalLoaded = false
 	var writeLockHeld = false
 	var writeWaiters: [CheckedContinuation<Void, Never>] = []
 	var packageGraphCache: (stamp: Date, graph: PackageGraph?)?
@@ -530,6 +531,7 @@ public actor SwiftNavigator {
 			if let command = try? commandOverride ?? SourceKitLSPLocator.command(environment: environment) {
 				lines.append("language server: \(command.joined(separator: " "))")
 			}
+			loadJournalIfNeeded()
 			let writing = ["1", "true", "yes"].contains(environment["CODENAV_SWIFT_WRITE"]?.lowercased() ?? "")
 			lines.append(
 				writing

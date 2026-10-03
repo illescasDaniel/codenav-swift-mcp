@@ -167,7 +167,47 @@ import Testing
 			operations: [.add(.init(label: "force", name: "force", type: "Bool", defaultValue: "false"), position: .last, callValue: nil)])
 		#expect(try call("rename(copy, to: \"x\")", change: harmless) == .unchanged)
 		let removed = try SignatureChange.plan(old: SignatureChangeTests.old, operations: [.remove(key: "to")])
+		// No parameter takes a closure here, so a trailing closure can't belong to this function.
 		if case .manual = try call("rename(copy) { }", change: removed, trailing: true) {} else { Issue.record("expected manual") }
 		if case .manual = try call("rename(copy, wrong: 1)", change: removed) {} else { Issue.record("expected manual") }
+	}
+}
+
+@Suite struct TrailingClosureRewriteTests {
+	static let old = [
+		SignatureParameter(label: "_", name: "id", type: "Int", defaultValue: nil),
+		SignatureParameter(label: "then", name: "done", type: "@escaping (Int) -> Void", defaultValue: nil),
+	]
+
+	private func call(_ text: String, change: SignatureChange) throws -> SignatureEditor.CallRewrite {
+		let scan = SwiftScan(text)
+		let open = (text as NSString).range(of: "(").location
+		let close = try #require(scan.matching(openAt: open))
+		return SignatureEditor.rewrite(
+			arguments: SignatureEditor.arguments(in: scan, open: open, close: close), original: scan.text(open + 1, close),
+			hasTrailingClosure: true, change: change)
+	}
+
+	@Test func aParameterAddedBeforeTheClosureKeepsItTrailing() throws {
+		let change = try SignatureChange.plan(
+			old: Self.old,
+			operations: [.add(.init(label: "force", name: "force", type: "Bool", defaultValue: nil), position: .before("then"), callValue: "true")])
+		#expect(try call("load(5) { print($0) }", change: change) == .rewritten("5, force: true"))
+	}
+
+	@Test func removingAnArgumentBeforeTheClosureLeavesTheClosureAlone() throws {
+		let change = try SignatureChange.plan(old: Self.old, operations: [.remove(key: "id")])
+		#expect(try call("load(5) { print($0) }", change: change) == .rewritten(""))
+	}
+
+	@Test func theClosureParameterMustStayLastAndMustNotBeDropped() throws {
+		let after = try SignatureChange.plan(
+			old: Self.old,
+			operations: [.add(.init(label: "force", name: "force", type: "Bool", defaultValue: nil), position: .last, callValue: "true")])
+		if case .manual = try call("load(5) { }", change: after) {} else { Issue.record("expected manual") }
+		let dropped = try SignatureChange.plan(old: Self.old, operations: [.remove(key: "then")])
+		if case .manual = try call("load(5) { }", change: dropped) {} else { Issue.record("expected manual") }
+		let reordered = try SignatureChange.plan(old: Self.old, operations: [.reorder(keys: ["then", "id"])])
+		if case .manual = try call("load(5) { }", change: reordered) {} else { Issue.record("expected manual") }
 	}
 }

@@ -12,6 +12,12 @@
   `swift test --filter` for them) are always available.
 * `workspace` reports whether the write tools are on.
 * `CODENAV_SWIFT_BUILD_TIMEOUT` bounds builds and test runs.
+* `undo_edit` history is kept on disk (per workspace, last 25 edits) and survives a server restart.
+* `change_signature` rewrites calls that end in a trailing closure when the closure parameter stays last.
+* `rename_symbol keep_deprecated_alias` also covers properties (forwarding accessor) and types (`typealias`).
+* `move_symbol to_container` moves a member into another type or extension, in the same or another file.
+* A file that still has errors gets a heuristic check for missing returns in the declarations an edit touched, since the
+  compiler skips flow analysis there.
 
 ## 0.1.3
 

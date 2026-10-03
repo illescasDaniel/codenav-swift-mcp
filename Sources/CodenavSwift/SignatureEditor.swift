@@ -202,21 +202,26 @@ enum SignatureEditor {
 
 	/// The new argument list for a call (`original` is the text between the parentheses), or why a person
 	/// has to look at it.
+	///
+	/// A trailing closure is the argument of the last function-typed parameter. It stays outside the
+	/// parentheses, so the change must keep that parameter last, and must not drop it.
 	static func rewrite(
 		arguments: [Argument], original: String, hasTrailingClosure: Bool, change: SignatureChange
 	) -> CallRewrite {
 		guard change.needsCallRewrite else { return .unchanged }
-		if hasTrailingClosure {
-			return .manual("the call ends in a trailing closure, which this change can move")
-		}
 		if change.old.contains(where: \.isVariadic) { return .manual("the function has a variadic parameter") }
+		var closureIndex: Int?
+		if hasTrailingClosure {
+			closureIndex = change.old.lastIndex { $0.type.contains("->") }
+			guard closureIndex != nil else { return .manual("the call ends in a trailing closure, but no parameter takes a closure") }
+		}
 		// Match each written argument to the old parameter it supplies.
 		var matched: [Int: Argument] = [:]
 		var cursor = 0
 		for argument in arguments {
 			var found: Int?
 			var index = cursor
-			while index < change.old.count {
+			while index < change.old.count, index != closureIndex {
 				let parameter = change.old[index]
 				let isMatch = argument.label.map { $0 == parameter.label } ?? (parameter.label == "_")
 				if isMatch {
@@ -231,13 +236,23 @@ enum SignatureEditor {
 			cursor = found + 1
 		}
 		var output: [String] = []
+		var closureEmitted = closureIndex == nil
 		for entry in change.entries {
 			if let origin = entry.origin {
-				if let argument = matched[origin] { output.append(argument.text) }
+				if origin == closureIndex {
+					closureEmitted = true
+					continue  // stays a trailing closure
+				}
+				if let argument = matched[origin] {
+					if closureIndex != nil, closureEmitted { return .manual("the change puts a parameter after the closure parameter, so the trailing closure would have to move into the parentheses") }
+					output.append(argument.text)
+				}
 			} else if let value = entry.callValue {
+				if closureIndex != nil, closureEmitted { return .manual("the change puts a parameter after the closure parameter, so the trailing closure would have to move into the parentheses") }
 				output.append(entry.parameter.argument(value))
 			}
 		}
+		if !closureEmitted { return .manual("the change removes the closure parameter that this call's trailing closure is the argument of") }
 		return .rewritten(SignatureChange.layout(output, like: original))
 	}
 }

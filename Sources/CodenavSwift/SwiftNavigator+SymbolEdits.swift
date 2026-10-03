@@ -395,10 +395,17 @@ extension SwiftNavigator {
 		await runWrite { client in
 			let options = try EditOptions(arguments)
 			var staging = self.stagingForWorkspace()
-			let toFile = try arguments.requiredString("to_file")
+			let toContainer = arguments.string("to_container")
+			guard (arguments.string("to_file") != nil) != (toContainer != nil) else {
+				throw ToolInputError("Give exactly one of `to_file` (move a top-level declaration to a file) or `to_container` (move a member into another type).")
+			}
 			let declaration = try await self.locateDeclaration(client, staging: &staging, arguments: arguments, example: "Dog")
+			if let toContainer {
+				return try await self.moveMember(declaration, to: toContainer, arguments: arguments, client: client, staging: &staging, options: options)
+			}
+			let toFile = try arguments.requiredString("to_file")
 			guard declaration.parents.isEmpty else {
-				throw ToolInputError("\(declaration.qualifiedName) is a member of \(declaration.parents.last?.name ?? "a type"); only top-level declarations can be moved. Use insert_member to add it elsewhere, then delete_symbol.")
+				throw ToolInputError("\(declaration.qualifiedName) is a member of \(declaration.parents.last?.name ?? "a type"); to move it into another type pass `to_container` instead of `to_file`.")
 			}
 			let destination = staging.canonical(try self.checkSwiftFile(toFile))
 			guard destination != declaration.path else { throw ToolInputError("\(declaration.qualifiedName) is already in that file.") }
@@ -445,5 +452,52 @@ extension SwiftNavigator {
 				staging, client: client, title: "move_symbol \(declaration.qualifiedName)", options: options,
 				extraNames: [NavShared.baseName(declaration.symbol.name)])
 		}
+	}
+}
+
+extension SwiftNavigator {
+	/// Moves a member (with its doc comment) into another type or extension, in the same or another file.
+	func moveMember(
+		_ member: Declaration, to containerName: String, arguments: ToolArguments, client: LSPClient, staging: inout Staging, options: EditOptions
+	) async throws -> String {
+		guard !member.parents.isEmpty else {
+			throw ToolInputError("\(member.qualifiedName) is a top-level declaration; `to_container` moves members. Use `to_file` to move it to another file.")
+		}
+		var destinationArguments = ToolArguments(["name": .string(containerName)])
+		if let file = arguments.string("to_container_file") { destinationArguments.values["file_path"] = .string(file) }
+		let destination = try await locateDeclaration(client, staging: &staging, arguments: destinationArguments, example: "UserService")
+		guard DeclarationLookup.typeKinds.contains(destination.symbol.kind), let body = destination.body else {
+			throw ToolInputError("\(destination.qualifiedName) is a \(SymbolKind.label(destination.symbol.kind)), not a type or extension with a body to move a member into.")
+		}
+		let sameFile = destination.path == member.path
+		if sameFile, destination.startOffset >= member.startOffset, destination.startOffset < member.endOffset {
+			throw ToolInputError("\(destination.qualifiedName) is inside \(member.qualifiedName); a declaration can't be moved into itself.")
+		}
+		if destination.symbol.range == member.parents.last?.range, sameFile {
+			throw ToolInputError("\(member.qualifiedName) is already in \(destination.qualifiedName).")
+		}
+		let index = member.index
+		let snippetSpan = DeclarationRange.wholeLines(of: member.symbol.range, in: index, includingDocComment: true, swallowBlank: false)
+		let snippet = index.text(from: snippetSpan.start, to: snippetSpan.end).trimmingCharacters(in: .newlines)
+		let removalSpan = DeclarationRange.wholeLines(of: member.symbol.range, in: index, includingDocComment: true, swallowBlank: true)
+		let removal = Self.edit(index, from: removalSpan.start, to: removalSpan.end, "")
+		let container = MemberContainer(
+			children: (destination.symbol.children ?? []).filter { $0.kind != 26 }, body: body, baseIndent: destination.baseIndent, isFile: false)
+		let insertion = try Self.memberInsertion(
+			snippet, container: container, position: arguments.string("position") ?? "last", text: destination.text,
+			index: destination.index, unit: destination.unit)
+		if sameFile {
+			try staging.apply([removal, insertion], to: member.path)
+		} else {
+			try staging.apply([removal], to: member.path)
+			try staging.apply([insertion], to: destination.path)
+		}
+		if snippet.range(of: #"(?<![A-Za-z0-9_])(private|fileprivate)\s"#, options: .regularExpression) != nil {
+			staging.note("\(member.qualifiedName) is private/fileprivate: code left in \(member.parents.last?.name ?? "the old type") can no longer use it")
+		}
+		staging.note("`self` and unqualified names inside \(member.symbol.name) now refer to \(destination.qualifiedName); the compile check below shows what no longer resolves")
+		return try await finishEdit(
+			staging, client: client, title: "move_symbol \(member.qualifiedName) → \(destination.qualifiedName)", options: options,
+			extraNames: [NavShared.baseName(member.symbol.name)])
 	}
 }

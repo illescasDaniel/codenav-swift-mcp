@@ -476,3 +476,67 @@ private func symbol(
 		#expect(summary.contains("C.swift: deleted"))
 	}
 }
+
+@Suite struct JournalStoreTests {
+	@Test func entriesSurviveAndAreNumberedOnAfterARestart() throws {
+		let base = FileManager.default.temporaryDirectory.appendingPathComponent("journal-\(UUID().uuidString)", isDirectory: true)
+		defer { try? FileManager.default.removeItem(at: base) }
+		let workspace = FileManager.default.temporaryDirectory
+		let store = JournalStore(workspace: workspace, base: base)
+		var plan = EditPlan()
+		plan.changes = [FileChange(path: "/p/A.swift", before: "a\n", after: "b\n"), FileChange(path: "/p/New.swift", before: nil, after: "n\n")]
+		store.save(JournalEntry(id: "e10", title: "rename", plan: plan, date: Date()))
+		store.save(JournalEntry(id: "e2", title: "edit", plan: plan, date: Date()))
+		let loaded = JournalStore(workspace: workspace, base: base).load()
+		#expect(loaded.map(\.id) == ["e2", "e10"])  // numeric order, not alphabetical
+		#expect(loaded[1].plan.changes == plan.changes)
+		#expect(loaded[1].plan.changes[1].isCreation)
+		store.remove("e2")
+		#expect(store.load().map(\.id) == ["e10"])
+		// Another workspace has its own journal.
+		#expect(JournalStore(workspace: URL(fileURLWithPath: "/somewhere/else"), base: base).load().isEmpty)
+	}
+}
+
+@Suite struct FlowLintTests {
+	private func problems(_ source: String, name: String = "f()", kind: Int = SymbolKind.function) throws -> [String] {
+		let index = TextIndex(source)
+		let scan = SwiftScan(source)
+		let lines = source.components(separatedBy: "\n")
+		let nameColumn = (lines[0] as NSString).range(of: NSRegularExpression.escapedPattern(for: NavShared.baseName(name))).location
+		let symbol = DocumentSymbol(
+			name: name, detail: nil, kind: kind,
+			range: LSPRange(start: LSPPosition(line: 0, character: 0), end: LSPPosition(line: lines.count - 1, character: lines.last?.utf16.count ?? 0)),
+			selectionRange: LSPRange(
+				start: LSPPosition(line: 0, character: nameColumn),
+				end: LSPPosition(
+					line: 0,
+					character: kind == SymbolKind.property
+						? nameColumn + name.utf16.count : (lines[0] as NSString).range(of: ")", options: .backwards).upperBound)),
+			children: nil)
+		return FlowLint.problems(for: symbol, in: source, index: index, scan: scan)
+	}
+
+	@Test func flagsAnEmptyBodyAndAMultiStatementBodyWithoutReturn() throws {
+		#expect(try problems("func f() -> Int {\n}").first?.contains("body is empty") == true)
+		#expect(try problems("func f() -> Int {\n\tlet a = 1\n\tprint(a)\n}").first?.contains("no `return`") == true)
+	}
+
+	@Test func leavesLegitimateBodiesAlone() throws {
+		#expect(try problems("func f() -> Int { 1 }").isEmpty)  // implicit return
+		#expect(try problems("func f() -> Int {\n\tlet a = 1\n\treturn a\n}").isEmpty)
+		#expect(try problems("func f() -> Int {\n\tfatalError(\"no\")\n}").isEmpty)
+		#expect(try problems("func f() throws -> Int {\n\tlet a = 1\n\tthrow E()\n}").isEmpty)
+		#expect(try problems("func f() -> Int {\n\tswitch x {\n\tcase 1: 1\n\tdefault: 2\n\t}\n}").isEmpty)
+		#expect(try problems("func f() -> Int {\n\tx\n\t\t.y()\n\t\t.z()\n}").isEmpty)  // one expression over three lines
+		#expect(try problems("func f() {\n\tlet a = 1\n\tprint(a)\n}").isEmpty)  // returns nothing
+		#expect(try problems("func f() -> Void {\n}").isEmpty)
+		#expect(try problems("func f() -> some View {\n\tText(\"a\")\n\tText(\"b\")\n}").isEmpty)  // result builder
+		#expect(try problems("func f() -> Int {\n\t// return later\n\tlet s = \"return\"\n\tprint(s)\n}").first?.contains("no `return`") == true)  // words in comments and strings don't count
+	}
+
+	@Test func computedPropertiesAreCheckedUnlessTheyHaveAccessors() throws {
+		#expect(try problems("var x: Int {\n}", name: "x", kind: SymbolKind.property).first?.contains("empty") == true)
+		#expect(try problems("var x: Int {\n\tget { 1 }\n\tset { }\n}", name: "x", kind: SymbolKind.property).isEmpty)
+	}
+}

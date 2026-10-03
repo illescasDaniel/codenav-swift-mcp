@@ -90,6 +90,7 @@ extension SwiftNavigator {
 			await useWorkspace()
 			let client = try await liveClient()
 			return try await withWriteLock {
+				loadJournalIfNeeded()
 				await client.clearAllOverlays()  // nothing of an earlier, interrupted proposal may be left in memory
 				return try await body(client)
 			}
@@ -169,8 +170,7 @@ extension SwiftNavigator {
 		await client.touch(plan.changes.map(\.path).filter(EditEngine.isSwiftSource))
 		let id = "e\(nextEditNumber)"
 		nextEditNumber += 1
-		editJournal.append(JournalEntry(id: id, title: title, plan: plan, date: Date()))
-		if editJournal.count > 25 { editJournal.removeFirst() }
+		record(JournalEntry(id: id, title: title, plan: plan, date: Date()))
 		lines.insert("\(title): applied as \(id) (\(fileCount) file(s) written).", at: 0)
 
 		if let late = try await checkNewFilesOnDisk(plan, client: client, engine: engine, journalID: id, options: options) {
@@ -180,7 +180,7 @@ extension SwiftNavigator {
 			let outcome = try await buildAfterWrite(plan, engine: engine)
 			lines.append(outcome.text)
 			if outcome.hasNewErrors, options.require == .noNewErrors {
-				editJournal.removeAll { $0.id == id }
+				forget(id)
 				try? await client.refresh()
 				lines[0] = "\(title): NOT applied. The build found new errors in code that depends on the change; every file was put back."
 				lines.append("Fix what is listed (or pass require=none), then retry. Diff that was rejected:")
@@ -231,7 +231,7 @@ extension SwiftNavigator {
 			+ problems.prefix(10).map { EditFormat.entry($0, root: workspaceRoot) }.joined(separator: "\n")
 		if options.require == .noNewErrors {
 			try engine.restore(plan, force: true)
-			editJournal.removeAll { $0.id == journalID }
+			forget(journalID)
 			text += "\nThe whole change was rolled back (require=no_new_errors)."
 			throw ToolInputError("Edit \(journalID) rolled back.\n" + text)
 		}
@@ -259,8 +259,9 @@ extension SwiftNavigator {
 		await run {
 			await useWorkspace()
 			return try await withWriteLock {
+				loadJournalIfNeeded()
 				if list || editJournal.isEmpty {
-					guard !editJournal.isEmpty else { return "No edits to undo in this session." }
+					guard !editJournal.isEmpty else { return "No edits to undo." }
 					return "Applied edits (newest last):\n" + editJournal.map {
 						"  \($0.id)  \($0.title): " + $0.plan.changes.map { EditFormat.relativeName($0.path, root: workspaceRoot) }.joined(separator: ", ")
 					}.joined(separator: "\n")
@@ -277,7 +278,7 @@ extension SwiftNavigator {
 				let client = try await liveClient()
 				let engine = EditEngine(client: client, root: workspaceRoot)
 				try engine.restore(entry.plan, force: force)
-				editJournal.removeAll { $0.id == entry.id }
+				forget(entry.id)
 				try? await client.refresh()
 				return "Undid \(entry.id) (\(entry.title)): restored "
 					+ entry.plan.changes.map { EditFormat.relativeName($0.path, root: workspaceRoot) }.joined(separator: ", ") + "."

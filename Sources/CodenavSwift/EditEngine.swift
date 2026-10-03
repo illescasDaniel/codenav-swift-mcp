@@ -7,7 +7,7 @@ import NavShared
 
 // MARK: - Plan
 
-struct FileChange: Sendable, Equatable {
+struct FileChange: Sendable, Equatable, Codable {
 	/// Absolute, canonical path.
 	var path: String
 	/// The text on disk when the plan was made; nil for a file the plan creates.
@@ -170,6 +170,8 @@ struct CheckReport: Sendable {
 	/// Files the language server could not analyze at all (broken build settings, a failed build): a clean
 	/// answer for them would mean nothing.
 	var analysisFailures: [String] = []
+	/// Likely problems in edited declarations of files that still have errors (see `FlowLint`).
+	var flowWarnings: [String] = []
 
 	var hasNewErrors: Bool { !newErrors.isEmpty }
 	var isVerified: Bool { analysisFailures.isEmpty }
@@ -285,8 +287,10 @@ struct EditEngine {
 		await client.touch(swiftChanges.map(\.path))
 
 		var names = plan.extraNames
+		var afterSymbols: [String: [DocumentSymbol]] = [:]
 		for change in swiftChanges {
 			let after = (try? await client.documentSymbol(change.path)) ?? []
+			afterSymbols[change.path] = after
 			names.formUnion(
 				ChangedNames.compute(
 					before: beforeSymbols[change.path] ?? [], beforeText: change.before ?? "", after: after,
@@ -360,6 +364,21 @@ struct EditEngine {
 		}
 
 		let texts = Dictionary(uniqueKeysWithValues: swiftChanges.map { ($0.path, $0.after ?? "") })
+		// A file with errors never reaches the compiler's flow analysis: look at what the edit touched ourselves.
+		for change in checkable {
+			guard let newText = change.after, (after[change.path] ?? []).contains(where: { $0.isError }),
+				let edit = TextEditing.replacement(from: change.before ?? "", to: newText), let tree = afterSymbols[change.path]
+			else { continue }
+			let first = edit.range.start.line
+			let touched = first...(first + edit.newText.components(separatedBy: "\n").count - 1)
+			let index = TextIndex(newText)
+			let scan = SwiftScan(newText)
+			for symbol in FlowLint.symbols(in: tree, overlapping: touched) {
+				for problem in FlowLint.problems(for: symbol, in: newText, index: index, scan: scan) {
+					report.flowWarnings.append("\(rel(change.path)):\(symbol.selectionRange.start.line + 1) \(problem)")
+				}
+			}
+		}
 		for path in (checkable.map(\.path) + sameModule) where after[path] != nil {
 			let current = after[path] ?? []
 			let previous = baseline[path] ?? []
@@ -540,6 +559,10 @@ enum EditFormat {
 			)
 		}
 		for reason in report.unchecked { lines.append("Not checked: \(reason).") }
+		if !report.flowWarnings.isEmpty {
+			lines.append("Possible problems the compiler can't report while these files have errors (missing returns):")
+			lines += report.flowWarnings.prefix(6).map { "  \($0)" }
+		}
 		return lines.joined(separator: "\n")
 	}
 }

@@ -127,7 +127,7 @@ extension SwiftNavigator {
 					edit.fileEdits[key, default: []].append(TextEdit(range: LSPRange(start: end, end: end), newText: alias))
 					staging.note("left a deprecated forwarding declaration `\(oldFull)` that calls `\(newFull)`")
 				} else {
-					staging.needsAttention("keep_deprecated_alias only supports functions and methods with a body; no alias was added")
+					staging.needsAttention("keep_deprecated_alias supports functions, methods, properties with a written-out type, and non-generic types; no alias was added for this one")
 				}
 			}
 			try staging.apply(edit)
@@ -149,7 +149,11 @@ extension SwiftNavigator {
 						"`\(old.base)` still appears in \(mentions.code.count) code position(s) (other symbols with the same name, or places the compiler couldn't resolve, such as Objective-C): \(shown)\(mentions.code.count > 6 ? " …" : "")")
 				}
 			}
-			if let found { Self.semanticWarnings(for: found.symbol, parents: found.parents, text: original, index: originalIndex, newFull: newFull, staging: &staging) }
+			if let found {
+				Self.semanticWarnings(
+					for: found.symbol, parents: found.parents, text: original, index: originalIndex, newFull: newFull,
+					aliasKept: arguments.bool("keep_deprecated_alias", default: false), staging: &staging)
+			}
 			staging.note("renamed \(oldFull) → \(newFull) across \(staging.plan().changes.count) file(s)")
 			return try await self.finishEdit(
 				staging, client: client, title: "rename_symbol \(resolved.qualifiedName) → \(newFull)", options: options,
@@ -209,7 +213,8 @@ extension SwiftNavigator {
 	// MARK: Warnings that need the declaration
 
 	static func semanticWarnings(
-		for symbol: DocumentSymbol, parents: [DocumentSymbol], text: String, index: TextIndex, newFull: String, staging: inout Staging
+		for symbol: DocumentSymbol, parents: [DocumentSymbol], text: String, index: TextIndex, newFull: String, aliasKept: Bool = false,
+		staging: inout Staging
 	) {
 		let header = index.text(from: (try? index.offset(symbol.range.start)) ?? 0, to: min((try? index.offset(symbol.range.end)) ?? 0, ((try? index.offset(symbol.range.start)) ?? 0) + 300))
 		let firstLines = header.components(separatedBy: "\n").prefix(3).joined(separator: " ")
@@ -232,39 +237,88 @@ extension SwiftNavigator {
 			staging.needsAttention("this declaration is visible to Objective-C or the runtime (selector strings, Interface Builder connections, KVC/KVO key paths, Core Data) which a rename can't follow")
 		}
 		if firstLines.range(of: #"\b(public|open)\b"#, options: .regularExpression) != nil {
-			staging.note("this is public API: callers in other packages will break (use keep_deprecated_alias=true to leave a forwarding declaration)")
+			staging.note(
+				aliasKept
+					? "this is public API: callers in other packages keep working through the deprecated forwarding declaration"
+					: "this is public API: callers in other packages will break (use keep_deprecated_alias=true to leave a forwarding declaration)")
 		}
 		if parents.last?.kind == SymbolKind.protocol {
 			staging.note("it is a protocol requirement: conforming types' implementations were renamed with it")
 		}
 	}
 
-	/// `@available(*, deprecated, renamed: "new(...)")` forwarding declaration, to insert after a function.
+	/// A deprecated declaration under the old name that forwards to the new one, to insert after the renamed
+	/// declaration: a function that calls it, a property that reads and writes it, or a `typealias` for a type.
+	/// Nil when the kind of declaration (or how it is written) can't be forwarded.
 	static func deprecatedAlias(
 		for symbol: DocumentSymbol, parents: [DocumentSymbol], text: String, index: TextIndex, newFull: String, newBase: String
 	) -> String? {
-		guard [SymbolKind.method, SymbolKind.function].contains(symbol.kind), parents.last?.kind != SymbolKind.protocol else { return nil }
+		guard parents.last?.kind != SymbolKind.protocol,
+			let start = try? index.offset(symbol.range.start), let end = try? index.offset(symbol.range.end),
+			let selectionStart = try? index.offset(symbol.selectionRange.start)
+		else { return nil }
 		let scan = SwiftScan(text)
-		guard let start = try? index.offset(symbol.range.start), let end = try? index.offset(symbol.range.end),
-			let selectionStart = try? index.offset(symbol.selectionRange.start),
-			let body = scan.body(of: start..<end, from: selectionStart)
-		else { return nil }
-		let oldBase = NavShared.baseName(symbol.name)
-		guard let list = scan.parenthesized(after: selectionStart + oldBase.utf16.count),
-			let parameters = SignatureEditor.parameters(in: scan, open: list.open, close: list.close),
-			!parameters.contains(where: \.isVariadic)
-		else { return nil }
-		let header = index.text(from: start, to: body.open).trimmingCharacters(in: .whitespacesAndNewlines)
-		let tail = scan.text(list.close + 1, body.open)
-		var prefix = ""
-		if tail.contains("throws") { prefix += "try " }
-		if tail.contains("async") { prefix += "await " }
-		let arguments = parameters.map { parameter -> String in
-			let value = parameter.type.hasPrefix("inout ") ? "&" + parameter.name : parameter.name
-			return parameter.label == "_" ? value : "\(parameter.label): \(value)"
-		}.joined(separator: ", ")
-		let call = "\(prefix)\(newBase)(\(arguments))"
 		let base = Indentation.leading(of: index.lineText(symbol.range.start.line))
-		return "\n\n\(base)@available(*, deprecated, renamed: \"\(newFull)\")\n\(base)\(header) { \(call) }"
+		let oldBase = NavShared.baseName(symbol.name)
+		let attribute = "@available(*, deprecated, renamed: \"\(newFull)\")"
+		let firstLine = index.lineText(symbol.range.start.line)
+		let access = accessModifier(in: firstLine)
+
+		switch symbol.kind {
+		case SymbolKind.method, SymbolKind.function:
+			guard let body = scan.body(of: start..<end, from: selectionStart),
+				let list = scan.parenthesized(after: selectionStart + oldBase.utf16.count),
+				let parameters = SignatureEditor.parameters(in: scan, open: list.open, close: list.close),
+				!parameters.contains(where: \.isVariadic)
+			else { return nil }
+			let header = index.text(from: start, to: body.open).trimmingCharacters(in: .whitespacesAndNewlines)
+			let tail = scan.text(list.close + 1, body.open)
+			var prefix = ""
+			if tail.contains("throws") { prefix += "try " }
+			if tail.contains("async") { prefix += "await " }
+			let arguments = parameters.map { parameter -> String in
+				let value = parameter.type.hasPrefix("inout ") ? "&" + parameter.name : parameter.name
+				return parameter.label == "_" ? value : "\(parameter.label): \(value)"
+			}.joined(separator: ", ")
+			return "\n\n\(base)\(attribute)\n\(base)\(header) { \(prefix)\(newBase)(\(arguments)) }"
+
+		case SymbolKind.class, SymbolKind.structure, SymbolKind.enumeration, SymbolKind.protocol:
+			// `typealias Old = New`; a generic type would need its parameters repeated.
+			let header = index.text(from: selectionStart, to: min(selectionStart + oldBase.utf16.count + 1, index.units.count))
+			if header.hasSuffix("<") { return nil }
+			let qualifier = access.map { $0 + " " } ?? ""
+			return "\n\n\(base)\(attribute)\n\(base)\(qualifier)typealias \(oldBase) = \(newBase)"
+
+		case SymbolKind.property, SymbolKind.field, SymbolKind.variable, SymbolKind.constant:
+			// A stored property becomes a deprecated computed one that forwards; it needs its type written out.
+			let declaration = index.text(from: start, to: end)
+			let declScan = SwiftScan(declaration)
+			let nameEnd = selectionStart - start + oldBase.utf16.count
+			guard let colon = declScan.nextSignificant(from: nameEnd), declScan.units[colon] == declScan.unit(":") else { return nil }
+			var typeEnd = declScan.units.count
+			if let equals = declScan.firstTopLevel("=", in: (colon + 1)..<typeEnd) { typeEnd = equals }
+			if let brace = declScan.firstTopLevel("{", in: (colon + 1)..<typeEnd) { typeEnd = brace }
+			let type = declScan.text(colon + 1, typeEnd).trimmingCharacters(in: .whitespacesAndNewlines)
+			guard !type.isEmpty else { return nil }
+			let isConstant = symbol.kind == SymbolKind.constant || firstLine.range(of: #"\blet\b"#, options: .regularExpression) != nil
+			let modifiers = ["static", "class", "nonisolated"].filter { firstLine.range(of: "\\b\($0)\\b", options: .regularExpression) != nil }
+			let prefix = ((access.map { [$0] } ?? []) + modifiers).joined(separator: " ")
+			let keyword = (prefix.isEmpty ? "" : prefix + " ") + "var"
+			let unit = Indentation.detect(in: text).text
+			let accessors = isConstant ? "{ \(newBase) }" : "{\n\(base)\(unit)get { \(newBase) }\n\(base)\(unit)set { \(newBase) = newValue }\n\(base)}"
+			return "\n\n\(base)\(attribute)\n\(base)\(keyword) \(oldBase): \(type) \(accessors)"
+
+		default:
+			return nil
+		}
+	}
+
+	/// The access level written on a declaration line (`open` is forwarded as `public`).
+	static func accessModifier(in line: String) -> String? {
+		for keyword in ["open", "public", "package", "internal", "fileprivate", "private"]
+		where line.range(of: "(?<![A-Za-z0-9_])\(keyword)(?![A-Za-z0-9_])", options: .regularExpression) != nil {
+			return keyword == "open" ? "public" : keyword
+		}
+		return nil
 	}
 }
