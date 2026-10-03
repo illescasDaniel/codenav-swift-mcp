@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+* Fixes from trying the tools on three real Xcode projects: `verify` and the build checks find the project from
+  `buildServer.json`'s `workspace` (a project in a subfolder such as `src/App/App.xcodeproj` used to be "not buildable");
+  `rename_symbol` on a stored property also updates `Type(old: …)` memberwise-initializer labels the language server
+  doesn't follow; `swiftc -print-ast` gets the project's SDK and sibling files, so synthesized members work on Xcode
+  projects (and on macOS 27); `callers` shows `#Preview` and property-wrapper/macro-generated callers by what they come from;
+  `affected_tests` says when test files have no build settings yet instead of "no test found", and gives `-only-testing`
+  filters (and `run=true` works) for Xcode projects; `rename_symbol` accepts `new_name="reload()"` for a no-argument function.
 * `verify tests=true` runs an Xcode project's tests (`xcodebuild test-without-building` on the newest iPhone simulator the scheme
   supports; `filter` is an `-only-testing` identifier). Previously it only built.
 * Fixed the SwiftPM package graph never matching files when the package sits behind a symlink (`/var` vs `/private/var`, as

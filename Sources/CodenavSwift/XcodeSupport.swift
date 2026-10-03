@@ -21,14 +21,8 @@ struct XcodeBuild: Sendable, Equatable {
 			let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
 			let buildRoot = json["build_root"] as? String, let scheme = json["scheme"] as? String
 		else { return nil }
-		let entries = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).sorted()
-		var flag = "-workspace"
-		var container = entries.first { $0.hasSuffix(".xcworkspace") }
-		if container == nil {
-			flag = "-project"
-			container = entries.first { $0.hasSuffix(".xcodeproj") }
-		}
-		guard let container else { return nil }
+		guard let (flag, container) = containerFromBuildServer(json["workspace"] as? String, root: root) ?? containerInFolder(root)
+		else { return nil }
 		// The build products folder says which configuration and SDK the index was built for
 		// (`Debug-iphonesimulator`); building for another would not refresh what the index reads.
 		let products = ((try? FileManager.default.contentsOfDirectory(atPath: buildRoot + "/Build/Products")) ?? []).sorted()
@@ -48,6 +42,24 @@ struct XcodeBuild: Sendable, Equatable {
 		return XcodeBuild(
 			scheme: scheme, buildRoot: buildRoot, containerFlag: flag, container: container, configuration: configuration,
 			destination: destination)
+	}
+
+	/// The project or workspace `buildServer.json` names (`workspace` may be an `.xcodeproj`'s inner
+	/// `project.xcworkspace`, and the project may live in a subfolder of the repository).
+	static func containerFromBuildServer(_ path: String?, root: URL) -> (String, String)? {
+		guard var path, !path.isEmpty else { return nil }
+		if !path.hasPrefix("/") { path = root.appendingPathComponent(path).path }
+		if path.hasSuffix(".xcodeproj/project.xcworkspace") { path = (path as NSString).deletingLastPathComponent }
+		guard FileManager.default.fileExists(atPath: path) else { return nil }
+		return (path.hasSuffix(".xcworkspace") ? "-workspace" : "-project", path)
+	}
+
+	/// Fallback: the first workspace (else project) in the folder itself.
+	static func containerInFolder(_ root: URL) -> (String, String)? {
+		let entries = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).sorted()
+		if let workspace = entries.first(where: { $0.hasSuffix(".xcworkspace") }) { return ("-workspace", workspace) }
+		if let project = entries.first(where: { $0.hasSuffix(".xcodeproj") }) { return ("-project", project) }
+		return nil
 	}
 
 	static func destination(forSDK sdk: String) -> String {
@@ -141,6 +153,13 @@ struct XcodeModules: Sendable {
 			}
 		}
 		return result
+	}
+
+	func files(inModule name: String) -> [String] {
+		// The normal and the indexing build each generate the same files (GeneratedAssetSymbols.swift…): one copy only.
+		var generated: Set<String> = []
+		return moduleByFile.filter { $0.value == name }.map(\.key).sorted { !$0.contains("/Index.noindex/") && $1.contains("/Index.noindex/") || $0 < $1 && $0.contains("/Index.noindex/") == $1.contains("/Index.noindex/") }
+			.filter { path in !path.contains("/DerivedSources/") || generated.insert((path as NSString).lastPathComponent).inserted }
 	}
 
 	func module(ofPath path: String) -> String? {

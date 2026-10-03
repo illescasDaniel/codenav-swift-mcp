@@ -422,6 +422,21 @@ struct EditingIntegrationTests {
 
 	// MARK: rename_symbol
 
+	@Test func renamingAStoredPropertyFollowsTheMemberwiseInitializerLabel() async throws {
+		let workspace = try Workspace()
+		try workspace.write("Sources/SampleKit/Pet.swift", "struct Pet {\n\tlet nickname: String\n\tvar age: Int\n}\n")
+		try workspace.write(
+			"Sources/SampleKit/PetUse.swift",
+			"func makePet() -> Pet {\n\tPet(\n\t\tnickname: \"Rex\",\n\t\tage: 3\n\t)\n}\nfunc other() -> Pet { Pet(nickname: \"A\", age: 1) }\n")
+		let renamed = await workspace.call("rename_symbol", #"{"name":"Pet.nickname","new_name":"alias","verify":"none"}"#)
+		#expect(!renamed.isError)
+		let use = try workspace.read("Sources/SampleKit/PetUse.swift")
+		#expect(use.contains("alias: \"Rex\""))
+		#expect(use.contains("Pet(alias: \"A\""))
+		#expect(!use.contains("nickname"))
+		await workspace.finish()
+	}
+
 	@Test func renamesFollowOverloadsWitnessesAndLabelsAndTellWhatTheyCouldNotFollow() async throws {
 		let workspace = try Workspace()
 		var service = try workspace.read("Sources/SampleKit/UserService.swift")

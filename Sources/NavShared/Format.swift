@@ -567,11 +567,41 @@ public func formatOutline(_ symbols: [DocumentSymbol], indent: String = "  ") ->
 /// (unlike `references`).
 public func formatCallers(_ calls: [IncomingCall], workspaceRoot: URL) -> String {
 	guard !calls.isEmpty else { return "No callers found." }
-	return calls.map { call in
+	// Macros and property wrappers make callers the user never wrote (`#Preview` bodies are mangled
+	// `$s…makePreview()` methods, `@State var x` also yields `_x`, `__x`, `$x`): show them under the name
+	// of what they come from, and fold the ones sharing a declaration line into one entry.
+	struct Entry { var name: String; var kind: Int; var path: String; var line: Int; var sites: Set<Int>; var macro: Bool }
+	var entries: [Entry] = []
+	for call in calls {
 		let path = uriToRelative(call.from.uri, workspaceRoot: workspaceRoot)
 		let callerLine = call.from.selectionRange.start.line + 1
-		let sites = Set(call.fromRanges.map { $0.start.line + 1 }).sorted().map { "L\($0)" }
-		return "\(call.from.name)  [\(SymbolKind.label(call.from.kind))]  (\(path):\(callerLine)) calls at "
-			+ (sites.isEmpty ? "L\(callerLine)" : sites.joined(separator: ", "))
+		var sites = Set(call.fromRanges.map { $0.start.line + 1 })
+		if sites.isEmpty { sites = [callerLine] }
+		let (name, macro) = displayCallerName(call.from.name)
+		if let index = entries.firstIndex(where: { $0.path == path && $0.line == callerLine && ($0.macro || macro) }) {
+			entries[index].sites.formUnion(sites)
+			if entries[index].macro, !macro {
+				entries[index].name = name
+				entries[index].kind = call.from.kind
+				entries[index].macro = false
+			}
+		} else {
+			entries.append(Entry(name: name, kind: call.from.kind, path: path, line: callerLine, sites: sites, macro: macro))
+		}
+	}
+	return entries.map { entry in
+		"\(entry.name)  [\(SymbolKind.label(entry.kind))]  (\(entry.path):\(entry.line)) calls at "
+			+ entry.sites.sorted().map { "L\($0)" }.joined(separator: ", ")
 	}.joined(separator: "\n")
+}
+
+/// A readable name for a caller, and whether it is compiler/macro generated.
+private func displayCallerName(_ name: String) -> (String, Bool) {
+	if name.hasPrefix("$s") || name.hasPrefix("$S") || name.contains(":$s") || name.contains(".$s") {
+		if name.contains("Preview") { return ("#Preview", true) }
+		return ("<macro-generated closure or accessor>", true)
+	}
+	let member = name.split(separator: ".").last.map(String.init) ?? name
+	if member.hasPrefix("_") || member.hasPrefix("$") { return (name, true) }
+	return (name, false)
 }

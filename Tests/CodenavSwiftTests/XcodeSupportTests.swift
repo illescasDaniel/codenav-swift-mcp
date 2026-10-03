@@ -98,4 +98,47 @@ import Testing
 		let fine: JSONValue = .object(["op": .string("add"), "param": .string("x: Int = 1")])
 		_ = try SwiftNavigator.signatureOperations(ToolArguments(["operations": .array([fine])]))
 	}
+
+	@Test func theContainerComesFromTheWorkspaceBuildServerNames() throws {
+		let root = try temporaryFolder()
+		defer { try? FileManager.default.removeItem(at: root) }
+		let buildRoot = root.appendingPathComponent("DD")
+		try FileManager.default.createDirectory(at: buildRoot.appendingPathComponent("Build/Products/Debug-iphonesimulator"), withIntermediateDirectories: true)
+		let project = root.appendingPathComponent("src/App/App.xcodeproj")
+		try FileManager.default.createDirectory(at: project.appendingPathComponent("project.xcworkspace"), withIntermediateDirectories: true)
+		let json = "{\"build_root\": \"\(buildRoot.path)\", \"scheme\": \"App\", \"workspace\": \"\(project.path)/project.xcworkspace\"}"
+		try json.write(to: root.appendingPathComponent("buildServer.json"), atomically: true, encoding: .utf8)
+		let build = try #require(XcodeBuild.detect(in: root))
+		#expect(build.containerFlag == "-project")
+		#expect(build.container == project.path)
+	}
+
+	@Test func swiftcGetsTheSDKOfTheDestination() {
+		#expect(SwiftNavigator.sdkName(forDestination: "generic/platform=iOS Simulator") == "iphonesimulator")
+		#expect(SwiftNavigator.sdkName(forDestination: "platform=macOS") == "macosx")
+		#expect(SwiftNavigator.targetTriple(sdk: "iphonesimulator", majorVersion: "26") == "arm64-apple-ios26.0-simulator")
+		#expect(SwiftNavigator.targetTriple(sdk: "macosx", majorVersion: "27") == nil)
+	}
+
+	@Test func aRenameToAnEmptyLabelListIsTheSameAsTheBareName() throws {
+		let requested = try RenameName.parse("reload()")
+		#expect(try requested.full(replacing: ParsedQuery("loadData")) == "reload")
+	}
+
+	@Test func generatedCallersAreNamedAfterWhatTheyComeFromAndFolded() {
+		func call(_ name: String, kind: Int, line: Int) -> IncomingCall {
+			let range = LSPRange(start: LSPPosition(line: line, character: 0), end: LSPPosition(line: line, character: 1))
+			let item = HierarchyItem(name: name, kind: kind, uri: "file:///w/A.swift", range: range, selectionRange: range)
+			return IncomingCall(from: item, fromRanges: [range])
+		}
+		let text = formatCallers(
+			[
+				call("$s6Planes0024ViewswiftPreviewfMf_15PreviewRegistryfMu_.makePreview()", kind: 6, line: 77),
+				call("App.$model", kind: 7, line: 13), call("App.model", kind: 7, line: 13),
+			], workspaceRoot: URL(fileURLWithPath: "/w"))
+		#expect(text.contains("#Preview"))
+		#expect(!text.contains("$s6Planes"))
+		#expect(text.components(separatedBy: "\n").count == 2)
+		#expect(text.contains("App.model"))
+	}
 }

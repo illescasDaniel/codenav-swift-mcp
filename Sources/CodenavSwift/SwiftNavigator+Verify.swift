@@ -265,7 +265,13 @@ extension SwiftNavigator {
 				tests[key] = (canonical, owner.symbol.selectionRange.start.line + 1, owner.container?.name)
 			}
 			guard !tests.isEmpty else {
-				return "No test found that uses or (within \(depth) call level(s)) reaches \(resolved.qualifiedName). Nothing in the tests exercises it: consider adding one."
+				var message = "No test found that uses or (within \(depth) call level(s)) reaches \(resolved.qualifiedName)."
+				if let blind = testFilesWithoutBuildSettings() {
+					message += " But the language server can't see into \(blind): they have no build settings yet (the last build didn't compile the test targets), so uses there are invisible. Run `verify` (it builds for testing, which fixes that) and ask again."
+				} else {
+					message += " Nothing in the tests exercises it: consider adding one."
+				}
+				return message
 			}
 			let ordered = tests.sorted { ($0.value.path, $0.value.line) < ($1.value.path, $1.value.line) }
 			var lines = ["\(ordered.count) test(s) exercise \(resolved.qualifiedName):"]
@@ -277,6 +283,35 @@ extension SwiftNavigator {
 				lines.append("  \(test.container.map { $0 + "." } ?? "")\(name)  (\(EditFormat.relativeName(test.path, root: workspaceRoot)):\(test.line))")
 			}
 			let regex = Array(Set(names)).sorted().map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+			if projectKind != .swiftPackage, xcodeBuild() != nil {
+				// `-only-testing` identifiers (Target/Class), one per test class.
+				let modules = xcodeModules()
+				var identifiers: [String] = []
+				for (_, test) in ordered {
+					guard let container = test.container, let module = modules?.module(ofPath: test.path) else { continue }
+					let identifier = "\(module)/\(container)"
+					if !identifiers.contains(identifier) { identifiers.append(identifier) }
+				}
+				if identifiers.isEmpty {
+					lines.append("Run them with `verify(tests=true, filter=\"<Target>/<Class>\")`.")
+				} else {
+					lines.append("Run them: verify(tests=true, filter=\"\(identifiers.joined(separator: ","))\")" + (identifiers.count > 1 ? " (one filter per class; run each)" : ""))
+				}
+				if arguments.bool("run", default: false) {
+					guard xcodeBuild() != nil else { throw ToolInputError("No xcodebuild found to run the tests with.") }
+					if identifiers.isEmpty {
+						lines.append("Not run: couldn't tell which test target these belong to.")
+					} else {
+						lines.append(await withWriteLock {
+							guard await runBuild()?.succeeded == true else { return "Tests not run: the build failed (use `verify`)." }
+							var results: [String] = []
+							for identifier in identifiers { results.append(await runXcodeTests(filter: identifier)) }
+							return results.joined(separator: "\n")
+						})
+					}
+				}
+				return lines.joined(separator: "\n")
+			}
 			lines.append("Run them: swift test --filter '\(regex)'")
 			if arguments.bool("run", default: false) {
 				guard let swift = swiftExecutable() else { throw ToolInputError("No swift toolchain found to run the tests with.") }
@@ -284,6 +319,26 @@ extension SwiftNavigator {
 			}
 			return lines.joined(separator: "\n")
 		}
+	}
+
+	/// For an Xcode project: test files the last build never compiled (no build settings), as a short list; nil
+	/// when there are none, or this isn't an Xcode project.
+	func testFilesWithoutBuildSettings() -> String? {
+		guard xcodeBuild() != nil else { return nil }
+		let known = xcodeModules()
+		var blind: [String] = []
+		for root in [workspaceRoot] + ProjectKind.localPackageFolders(in: workspaceRoot) {
+			guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+			for case let url as URL in enumerator {
+				if Exclude.directoryNames.contains(url.lastPathComponent) { enumerator.skipDescendants(); continue }
+				guard url.pathExtension == "swift", Self.isTestFile(url.path) else { continue }
+				if known?.module(ofPath: url.realPath.path) == nil { blind.append(EditFormat.relativeName(url.path, root: workspaceRoot)) }
+				if blind.count >= 50 { break }
+			}
+		}
+		guard !blind.isEmpty else { return nil }
+		let folders = Set(blind.map { ($0 as NSString).deletingLastPathComponent }).sorted().prefix(3)
+		return "\(blind.count) test file(s) (in \(folders.joined(separator: ", ")))"
 	}
 
 	static func isTestFile(_ path: String) -> Bool {

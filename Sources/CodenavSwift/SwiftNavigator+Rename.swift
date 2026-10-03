@@ -50,6 +50,8 @@ struct RenameName: Equatable {
 	/// The full name to hand the language server, given what the symbol is called now.
 	func full(replacing old: ParsedQuery) throws -> String {
 		if let labels {
+			// `reload()` for a function the query named without its (empty) label list is the same name.
+			if labels.isEmpty, old.signature == nil { return base }
 			guard let signature = old.signature else {
 				throw ToolInputError("'\(old.base)' has no argument labels, so the new name can't have any: use `\(base)`.")
 			}
@@ -130,6 +132,14 @@ extension SwiftNavigator {
 					staging.needsAttention("keep_deprecated_alias supports functions, methods, properties with a written-out type, and non-generic types; no alias was added for this one")
 				}
 			}
+			// A stored property is also the label of the synthesized memberwise initializer, which the language
+			// server doesn't follow: `Type(old: …)` calls become `Type(new: …)`.
+			if let found, old.base != requested.base {
+				let labels = try await self.memberwiseLabelEdits(
+					client, symbol: found.symbol, parents: found.parents, path: path, oldBase: old.base, newBase: requested.base, existing: edit, staging: &staging)
+				for (uri, edits) in labels.edits { edit.fileEdits[uri, default: []] += edits }
+				if labels.count > 0 { staging.note("also updated \(labels.count) memberwise-initializer label(s) `\(old.base):` → `\(requested.base):`") }
+			}
 			try staging.apply(edit)
 
 			// What the rename can't know about.
@@ -158,6 +168,63 @@ extension SwiftNavigator {
 				staging, client: client, title: "rename_symbol \(resolved.qualifiedName) → \(newFull)", options: options,
 				extraNames: baseChanged ? [old.base] : [])
 		}
+	}
+
+	/// Edits for the calls of a struct's synthesized memberwise initializer that pass `oldBase:` for the renamed
+	/// stored property. Nothing when the property isn't a stored member of a struct without its own `init`.
+	func memberwiseLabelEdits(
+		_ client: LSPClient, symbol: DocumentSymbol, parents: [DocumentSymbol], path: String, oldBase: String, newBase: String, existing: LSPWorkspaceEdit,
+		staging: inout Staging
+	) async throws -> (edits: [String: [TextEdit]], count: Int) {
+		let storedKinds = [SymbolKind.property, SymbolKind.field, SymbolKind.variable, SymbolKind.constant]
+		guard storedKinds.contains(symbol.kind), let parent = parents.last, parent.kind == SymbolKind.structure,
+			!(parent.children ?? []).contains(where: { $0.kind == SymbolKind.initializer })
+		else { return ([:], 0) }
+		let original = try staging.read(path) ?? ""
+		// Computed properties are not initializer parameters.
+		let originalIndex = TextIndex(original)
+		let declaration = originalIndex.text(
+			from: (try? originalIndex.offset(symbol.range.start)) ?? 0, to: (try? originalIndex.offset(symbol.range.end)) ?? 0)
+		let declScan = SwiftScan(declaration)
+		let isComputed = declScan.firstTopLevel("{", in: 0..<declScan.units.count).map { brace in
+			declScan.firstTopLevel("=", in: 0..<brace) == nil
+		} ?? false
+		if isComputed || declaration.range(of: #"\bstatic\b|\bclass\b"#, options: .regularExpression) != nil { return ([:], 0) }
+
+		let references = try await client.references(
+			path, line: parent.selectionRange.start.line + 1, column: parent.selectionRange.start.character + 1, includeDeclaration: false)
+		let typeName = NavShared.baseName(parent.name)
+		var result: [String: [TextEdit]] = [:]
+		var count = 0
+		var seen: Set<String> = []
+		for reference in references {
+			guard let file = uriToPath(reference.uri), let text = try staging.read(file) else { continue }
+			let index = TextIndex(text)
+			let scan = SwiftScan(text)
+			// A call of the initializer is reported at the start of the type name, as an empty range.
+			guard let begin = try? index.offset(reference.range.start), begin + typeName.utf16.count <= scan.units.count,
+				scan.text(begin, begin + typeName.utf16.count) == typeName
+			else { continue }
+			let end = begin + typeName.utf16.count
+			guard let call = scan.parenthesized(after: end) else { continue }
+			// `Type(` directly; anything between the name and the parenthesis other than generics means it isn't a call.
+			let between = scan.text(end, call.open).trimmingCharacters(in: .whitespacesAndNewlines)
+			guard between.isEmpty || (between.hasPrefix("<") && between.hasSuffix(">")) else { continue }
+			for piece in scan.splitTopLevel(call.open + 1, call.close) {
+				guard let colon = scan.firstTopLevel(":", in: piece) else { continue }
+				let labelText = scan.text(piece.lowerBound, colon)
+				guard labelText.trimmingCharacters(in: .whitespacesAndNewlines) == oldBase else { continue }
+				let leading = labelText.count - labelText.drop(while: { $0.isWhitespace || $0.isNewline }).count
+				let start = piece.lowerBound + labelText.prefix(leading).utf16.count
+				let range = LSPRange(start: index.position(at: start), end: index.position(at: start + oldBase.utf16.count))
+				let key = existing.fileEdits.keys.first { uriToPath($0).map { staging.canonical($0) } == staging.canonical(file) } ?? reference.uri
+				let covered = existing.fileEdits[key]?.contains { $0.range == range } ?? false
+				guard !covered, seen.insert("\(key):\(start)").inserted else { continue }
+				result[key, default: []].append(TextEdit(range: range, newText: newBase))
+				count += 1
+			}
+		}
+		return (result, count)
 	}
 
 	// MARK: Mentions the rename didn't touch

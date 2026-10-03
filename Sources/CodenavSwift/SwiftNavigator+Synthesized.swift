@@ -42,6 +42,15 @@ extension SwiftNavigator {
 			module = target.name
 			key = "target:" + target.name
 		}
+		// An Xcode project: the files the build compiled together with this one.
+		if key.hasPrefix("file:"), let modules = xcodeModules(), let name = modules.module(ofPath: path) {
+			let siblings = modules.files(inModule: name).filter { FileManager.default.fileExists(atPath: $0) }
+			if !siblings.isEmpty {
+				files = siblings
+				module = name
+				key = "xcode:" + name
+			}
+		}
 		module = module.map { $0.isLetter || $0.isNumber ? String($0) : "_" }.joined()
 		let stamp = files.map { file -> String in
 			let values = try? URL(fileURLWithPath: file).resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
@@ -62,6 +71,7 @@ extension SwiftNavigator {
 				arguments += ["-I", folder.path]
 			}
 		}
+		arguments += await swiftcPlatformArguments()
 		arguments += files
 		let output = await ToolProcess.run(swiftc, arguments: arguments, directory: workspaceRoot, environment: environment, timeout: astTimeout)
 		var result: (dump: String?, problem: String?)
@@ -82,6 +92,61 @@ extension SwiftNavigator {
 		if astCache.count >= 6 { astCache.removeValue(forKey: astCache.min { $0.value.when < $1.value.when }?.key ?? "") }
 		astCache[key] = (stamp, Date(), result.dump, result.problem)
 		return result
+	}
+
+	/// The toolchain's own `swiftc` knows no SDK (`unable to load standard library for target …`): name the
+	/// one the project builds for, and for an Xcode project the products an earlier build left for its imports.
+	func swiftcPlatformArguments() async -> [String] {
+		var sdk = "macosx"
+		var triple: String?
+		var products: [String] = []
+		if let build = xcodeBuild() {
+			sdk = Self.sdkName(forDestination: build.destination)
+			products = ((try? FileManager.default.contentsOfDirectory(atPath: build.buildRoot + "/Build/Products")) ?? []).sorted()
+				.map { build.buildRoot + "/Build/Products/" + $0 }
+		}
+		guard let xcrun = Optional("/usr/bin/xcrun"), FileManager.default.isExecutableFile(atPath: xcrun) else { return [] }
+		let path = await ToolProcess.run(xcrun, arguments: ["--sdk", sdk, "--show-sdk-path"], directory: workspaceRoot, environment: environment, timeout: 20)
+		let sdkPath = path.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard path.status == 0, !sdkPath.isEmpty else { return [] }
+		var arguments = ["-sdk", sdkPath]
+		if sdk != "macosx" {
+			let version = await ToolProcess.run(xcrun, arguments: ["--sdk", sdk, "--show-sdk-version"], directory: workspaceRoot, environment: environment, timeout: 20)
+			let major = version.stdout.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ".").first.map(String.init) ?? "17"
+			triple = Self.targetTriple(sdk: sdk, majorVersion: major)
+		}
+		if let triple { arguments += ["-target", triple] }
+		for folder in products { arguments += ["-I", folder, "-F", folder] }
+		return arguments
+	}
+
+	static func sdkName(forDestination destination: String) -> String {
+		let platform = destination.replacingOccurrences(of: "generic/platform=", with: "").replacingOccurrences(of: "platform=", with: "")
+		switch platform {
+		case "iOS": return "iphoneos"
+		case "iOS Simulator": return "iphonesimulator"
+		case "tvOS": return "appletvos"
+		case "tvOS Simulator": return "appletvsimulator"
+		case "watchOS": return "watchos"
+		case "watchOS Simulator": return "watchsimulator"
+		case "visionOS": return "xros"
+		case "visionOS Simulator": return "xrsimulator"
+		default: return "macosx"
+		}
+	}
+
+	static func targetTriple(sdk: String, majorVersion: String) -> String? {
+		switch sdk {
+		case "iphoneos": return "arm64-apple-ios\(majorVersion).0"
+		case "iphonesimulator": return "arm64-apple-ios\(majorVersion).0-simulator"
+		case "appletvos": return "arm64-apple-tvos\(majorVersion).0"
+		case "appletvsimulator": return "arm64-apple-tvos\(majorVersion).0-simulator"
+		case "watchos": return "arm64-apple-watchos\(majorVersion).0"
+		case "watchsimulator": return "arm64-apple-watchos\(majorVersion).0-simulator"
+		case "xros": return "arm64-apple-xros\(majorVersion).0"
+		case "xrsimulator": return "arm64-apple-xros\(majorVersion).0-simulator"
+		default: return nil
+		}
 	}
 
 	// MARK: Which members, and when it is worth asking
