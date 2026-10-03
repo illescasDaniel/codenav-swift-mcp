@@ -60,8 +60,7 @@ struct Staging {
 	}
 
 	private func validate(_ path: String) throws {
-		let url = URL(fileURLWithPath: path)
-		guard let base = allowedRoots.first(where: { relativePath(path, in: $0) != nil }) else {
+		guard allowedRoots.contains(where: { relativePath(path, in: $0) != nil }) else {
 			throw ToolInputError("Refusing to edit \(path): it is outside the workspace.")
 		}
 		if isBuildProductOrDependency(path) {
@@ -577,8 +576,10 @@ enum EditFormat {
 			lines.append("Compile check (sourcekit-lsp, in memory, \(checked)): ✗ \(report.newErrors.count) new error(s)")
 			for entry in report.newErrors.prefix(maxDiagnosticsShown) { lines.append(Self.entry(entry, root: root)) }
 			if report.newErrors.count > maxDiagnosticsShown { lines.append("  … and \(report.newErrors.count - maxDiagnosticsShown) more") }
-		} else if report.isVerified {
+		} else if report.isVerified, !report.checkedFiles.isEmpty {
 			lines.append("Compile check (sourcekit-lsp, in memory, \(checked)): ✓ no new errors")
+		} else if report.isVerified {
+			lines.append("Compile check (sourcekit-lsp, in memory): nothing was checked in memory (the changed files belong to modules the language server can't check on its own); rely on the build below or run `verify`.")
 		}
 		if !report.newWarnings.isEmpty {
 			lines.append("\(report.newWarnings.count) new warning(s):")

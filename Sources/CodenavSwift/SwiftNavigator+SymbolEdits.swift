@@ -22,7 +22,7 @@ struct Declaration {
 	var selectionEnd: Int { (try? index.offset(symbol.selectionRange.end)) ?? startOffset }
 	/// Indentation of the line the declaration starts on.
 	var baseIndent: String { Indentation.leading(of: index.lineText(symbol.range.start.line)) }
-	var qualifiedName: String { (parents.map(\.name) + [symbol.name]).joined(separator: ".") }
+	var qualifiedName: String { (parents.map(\.name) + [symbol.name]).map { $0.replacingOccurrences(of: "extension ", with: "") }.joined(separator: ".") }
 
 	/// The `{`...`}` of the declaration's body, when it has one.
 	var body: (open: Int, close: Int)? { scan.body(of: startOffset..<endOffset, from: selectionEnd) }
@@ -59,6 +59,39 @@ func placeBlock(_ code: String, base: String, unit: Indentation.Unit) -> String 
 	guard !lines.isEmpty else { return "" }
 	lines[0] = String(lines[0].drop(while: { $0 == " " || $0 == "\t" }))
 	return Indentation.reindent(lines.joined(separator: "\n"), base: base, unit: unit)
+}
+
+/// Where imports end in a file: the line after the last `import`, counting a whole `#if … #endif` block that
+/// contains imports as one (new code must not land inside a conditional branch). Only top-level imports
+/// (outside `#if`) are returned in `topLevel`.
+func importLayout(of lines: [String]) -> (end: Int, topLevel: [String]) {
+	func isImport(_ line: String) -> Bool {
+		["import ", "@testable import ", "@_exported import ", "@preconcurrency import ", "@_implementationOnly import "].contains { line.hasPrefix($0) }
+	}
+	var depth = 0
+	var end = 0
+	var blockHasImport = false
+	var topLevel: [String] = []
+	for (number, raw) in lines.enumerated() {
+		let line = raw.trimmingCharacters(in: .whitespaces)
+		if line.hasPrefix("#if") {
+			depth += 1
+		} else if line.hasPrefix("#endif") {
+			depth = max(0, depth - 1)
+			if depth == 0, blockHasImport {
+				end = number + 1
+				blockHasImport = false
+			}
+		} else if isImport(line) {
+			if depth == 0 {
+				end = number + 1
+				topLevel.append(line)
+			} else {
+				blockHasImport = true
+			}
+		}
+	}
+	return (end, topLevel)
 }
 
 extension SwiftNavigator {
@@ -193,7 +226,7 @@ extension SwiftNavigator {
 			let edit: TextEdit
 			let path: String
 			let title: String
-			if containerName != nil || (arguments.string("name") != nil) || (arguments.string("line") != nil) {
+			if containerName != nil || arguments.string("name") != nil || arguments.values["line"].map({ $0 != .null }) == true {
 				var args = arguments
 				if let containerName { args.values["name"] = .string(containerName) }
 				let declaration = try await self.locateDeclaration(client, staging: &staging, arguments: args, example: "UserService")
@@ -303,13 +336,7 @@ extension SwiftNavigator {
 			return edit(index, from: body.open + 1, to: body.close, "\n" + placed + "\n" + container.baseIndent)
 		case "first":
 			if container.isFile {
-				var afterImports = 0
-				for line in 0..<index.lineCount {
-					let trimmed = index.lineText(line).trimmingCharacters(in: .whitespaces)
-					if trimmed.hasPrefix("import ") || trimmed.hasPrefix("@testable import ") || trimmed.hasPrefix("@_exported import ") || trimmed.hasPrefix("@preconcurrency import ") {
-						afterImports = line + 1
-					}
-				}
+				let afterImports = importLayout(of: (0..<index.lineCount).map { index.lineText($0) }).end
 				let at = index.position(at: lineStart(afterImports))
 				let followedByCode = afterImports < index.lineCount && !blank(afterImports)
 				return TextEdit(
@@ -414,10 +441,7 @@ extension SwiftNavigator {
 			let snippetSpan = DeclarationRange.wholeLines(of: range, in: index, includingDocComment: true, swallowBlank: false)
 			let snippet = index.text(from: snippetSpan.start, to: snippetSpan.end).trimmingCharacters(in: .newlines)
 			let removal = DeclarationRange.wholeLines(of: range, in: index, includingDocComment: true, swallowBlank: true)
-			let imports = declaration.text.components(separatedBy: "\n").filter {
-				let line = $0.trimmingCharacters(in: .whitespaces)
-				return line.hasPrefix("import ") || line.hasPrefix("@testable import ") || line.hasPrefix("@_exported import ") || line.hasPrefix("@preconcurrency import ")
-			}
+			let imports = importLayout(of: declaration.text.components(separatedBy: "\n")).topLevel
 			try staging.apply([Self.edit(index, from: removal.start, to: removal.end, "")], to: declaration.path)
 
 			if let existing = try staging.read(destination) {
@@ -431,9 +455,9 @@ extension SwiftNavigator {
 				try staging.apply([edit], to: destination)
 				if !missing.isEmpty, let current = try staging.read(destination) {
 					var lines = current.components(separatedBy: "\n")
-					let lastImport = lines.lastIndex { $0.trimmingCharacters(in: .whitespaces).hasPrefix("import ") || $0.trimmingCharacters(in: .whitespaces).hasPrefix("@testable import ") }
-					if let lastImport {
-						lines.insert(contentsOf: missing, at: lastImport + 1)
+					let importsEnd = importLayout(of: lines).end
+					if importsEnd > 0 {
+						lines.insert(contentsOf: missing, at: importsEnd)
 					} else {
 						lines.insert(contentsOf: missing + [""], at: 0)
 					}

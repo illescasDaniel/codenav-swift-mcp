@@ -286,6 +286,20 @@ private func symbol(
 		#expect(throws: ToolInputError.self) { try insert("var x = 1", at: "after") }
 	}
 
+	@Test func importsInsideConditionalCompilationAreSkippedAsAWhole() throws {
+		let plain = importLayout(of: ["import A", "@testable import B", "", "struct S {}"])
+		#expect(plain.end == 2 && plain.topLevel == ["import A", "@testable import B"])
+		let lines = ["import A", "#if canImport(UIKit)", "import UIKit", "#endif", "", "struct S {}"]
+		let layout = importLayout(of: lines)
+		#expect(layout.end == 4, "new code goes after #endif, not inside the branch")
+		#expect(layout.topLevel == ["import A"], "a conditional import is not copied unguarded")
+		#expect(importLayout(of: ["struct S {}"]).end == 0)
+		let text = lines.joined(separator: "\n") + "\n"
+		let file = SwiftNavigator.MemberContainer(children: [], body: nil, baseIndent: "", isFile: true)
+		let first = try SwiftNavigator.memberInsertion("struct Z {}", container: file, position: "first", text: text, index: TextIndex(text), unit: .tab)
+		#expect(try TextEditing.apply([first], to: text).contains("#endif\n\nstruct Z {}\n"))
+	}
+
 	@Test func topLevelAppendAndFirstAfterImports() throws {
 		let text = "import Foundation\nimport OSLog\n\nstruct A {}\n"
 		let file = SwiftNavigator.MemberContainer(children: [try symbol("A", kind: SymbolKind.structure, lines: 3...3, endColumn: 12)], body: nil, baseIndent: "", isFile: true)
@@ -362,6 +376,8 @@ private func symbol(
 		#expect(SwiftNavigator.renameGenerated(text, to: "make") == "func make(_ a: Int) -> Int { a }\nlet x = make(1)")
 		#expect(SwiftNavigator.renameGenerated("let extractedExpr = 1", to: "value") == "let value = 1")
 		#expect(SwiftNavigator.renameGenerated("let extractor = 1", to: "value") == "let extractor = 1")
+		// The caller's own identifiers that merely start with "extracted" stay.
+		#expect(SwiftNavigator.renameGenerated("let extractedData = extractedFunc()", to: "go") == "let extractedData = go()")
 	}
 }
 

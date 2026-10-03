@@ -275,7 +275,7 @@ extension SwiftNavigator {
 
 	/// `extractedFunc` / `extractedExpr` -> the name the caller asked for.
 	static func renameGenerated(_ text: String, to name: String) -> String {
-		text.replacingOccurrences(of: #"\bextracted[A-Z][A-Za-z]*\b"#, with: name, options: .regularExpression)
+		text.replacingOccurrences(of: #"\bextracted(Func|Expr|Expression|Function|Method|Variable|Var|Property|Closure)\b"#, with: name, options: .regularExpression)
 	}
 
 	// MARK: add_conformance
@@ -314,7 +314,8 @@ extension SwiftNavigator {
 				}
 				try work.apply([Self.edit(index, from: insertionPoint, to: insertionPoint, hasInheritance ? ", \(proto)" : ": \(proto)")], to: declaration.path)
 			} else {
-				let endLine = declaration.symbol.range.end.line
+				// After the outermost enclosing type: an extension can't be declared inside another type's body.
+				let endLine = (declaration.parents.first ?? declaration.symbol).range.end.line
 				let at = endLine + 1 < index.lineStarts.count ? index.lineStarts[endLine + 1] : index.units.count
 				let prefix = (at == index.units.count && !declaration.text.hasSuffix("\n")) ? "\n\n" : "\n"
 				try work.apply([Self.edit(index, from: at, to: at, prefix + extensionHeader + "\n}\n")], to: declaration.path)
@@ -352,7 +353,7 @@ extension SwiftNavigator {
 					let prefix = existing.isEmpty || existing.hasSuffix("\n\n") ? "" : (existing.hasSuffix("\n") ? "\n" : "\n\n")
 					try staging.write(existing + prefix + block, to: destination)
 				} else {
-					let imports = declaration.text.components(separatedBy: "\n").filter { $0.hasPrefix("import ") || $0.hasPrefix("@testable import ") }
+					let imports = importLayout(of: declaration.text.components(separatedBy: "\n")).topLevel
 					try staging.write((imports.isEmpty ? "" : imports.joined(separator: "\n") + "\n\n") + block, to: destination)
 					staging.note("\(destinationArgument) is a new file; it is compile-checked after it is written.")
 				}

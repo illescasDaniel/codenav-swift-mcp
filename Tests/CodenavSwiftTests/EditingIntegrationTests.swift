@@ -390,6 +390,27 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func aMemberIsInsertedIntoTheTypeSelectedByFileAndLine() async throws {
+		let workspace = try Workspace()
+		let added = await workspace.call(
+			"insert_member",
+			#"{"file_path":"Sources/SampleKit/UserService.swift","line":2,"symbol":"UserService","code":"public func ping() -> Bool { true }","position":"first","verify":"none"}"#)
+		#expect(!added.isError, "\(added.text)")
+		// Inside the class (its first member), not appended at the end of the file.
+		let service = try workspace.read("Sources/SampleKit/UserService.swift")
+		#expect(service.contains("public final class UserService {\n\tpublic func ping() -> Bool { true }"))
+		await workspace.finish()
+	}
+
+	@Test func aNestedTypeGetsItsConformanceAfterTheOutermostType() async throws {
+		let workspace = try Workspace()
+		let result = await workspace.call("add_conformance", #"{"type":"Outer.Inner","protocol":"Sendable","stubs":false,"verify":"none"}"#)
+		#expect(!result.isError, "\(result.text)")
+		let models = try workspace.read("Sources/SampleKit/Models.swift")
+		#expect(models.contains("\t}\n}\n\nextension Outer.Inner: Sendable {\n}\n"))
+		await workspace.finish()
+	}
+
 	@Test func aUsedSymbolIsNotDeletedAnUnusedOneIs() async throws {
 		let workspace = try Workspace()
 		let used = await workspace.call("delete_symbol", #"{"name":"UserService.create(name:)"}"#)
