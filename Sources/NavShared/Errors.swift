@@ -95,8 +95,9 @@ public func readTextFile(_ url: URL) throws -> String {
 	} catch {
 		throw ToolInputError("Cannot read \(url.path): \(error.localizedDescription).")
 	}
-	guard let text = String(data: data, encoding: .utf8) else {
+	guard String(data: data, encoding: .utf8) != nil else {
 		throw ToolInputError("Cannot read \(url.path) as UTF-8 text.")
 	}
-	return text
+	// Not `String(data:encoding:)`'s result: it drops a leading byte-order mark, and an edit would then delete it from the file.
+	return String(decoding: data, as: UTF8.self)
 }

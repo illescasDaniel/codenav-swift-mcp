@@ -689,6 +689,31 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func crlfBomAndEmojiSurviveAnEdit() async throws {
+		let workspace = try Workspace()
+		let original = "\u{FEFF}public struct Crlf {\r\n\tpublic func greet() -> String { \"hi 😀\" }\r\n\tpublic func other() -> Int { 1 }\r\n}\r\n"
+		try workspace.write("Sources/SampleKit/Crlf.swift", original)
+		let result = await workspace.call(
+			"edit_symbol", #"{"name":"Crlf.other()","old_text":"1","new_text":"2","verify":"none"}"#)
+		#expect(!result.isError)
+		let text = String(decoding: try Data(contentsOf: workspace.root.appendingPathComponent("Sources/SampleKit/Crlf.swift")), as: UTF8.self)
+		#expect(text == original.replacingOccurrences(of: "{ 1 }", with: "{ 2 }"))
+		await workspace.finish()
+	}
+
+	@Test func removingAParameterWarnsWhenTheDroppedArgumentWasACall() async throws {
+		let workspace = try Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Tick.swift",
+			"public func tick(_ n: Int, label: String) {}\npublic func counter() -> Int { 1 }\npublic func useTick() {\n\ttick(1, label: String(counter()))\n\ttick(2, label: \"x\")\n}\n")
+		let result = await workspace.call(
+			"change_signature", #"{"name":"tick(_:label:)","operations":[{"op":"remove","param":"label"}],"verify":"none"}"#)
+		#expect(!result.isError)
+		#expect(result.contains("looks like a call"))
+		#expect(try workspace.read("Sources/SampleKit/Tick.swift").contains("\ttick(1)"))
+		await workspace.finish()
+	}
+
 	@Test func aDefaultedParameterLeavesCallersAlone() async throws {
 		let workspace = try Workspace()
 		let result = await workspace.call(

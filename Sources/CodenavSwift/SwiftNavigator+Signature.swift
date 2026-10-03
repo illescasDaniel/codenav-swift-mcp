@@ -240,6 +240,16 @@ extension SwiftNavigator {
 						let trailing = Self.hasTrailingClosure(scan: scan, index: index, close: list.close)
 						switch SignatureEditor.rewrite(arguments: arguments, original: original, hasTrailingClosure: trailing, change: change) {
 						case .rewritten(let replacement):
+							// A removed parameter's argument disappears with its evaluation: flag calls that may have had effects.
+							let kept = Set(change.entries.compactMap(\.origin))
+							for (position, parameter) in change.old.enumerated() where !kept.contains(position) {
+								let dropped = parameter.label == "_" || parameter.label.isEmpty
+									? (arguments.indices.contains(position) && arguments[position].label == nil ? arguments[position] : nil)
+									: arguments.first { $0.label == parameter.label }
+								if let dropped, dropped.expression.contains("("), !dropped.expression.hasPrefix("\"") {
+									staging.needsAttention("\(spot): the dropped argument `\(dropped.expression)` looks like a call; its side effects no longer happen")
+								}
+							}
 							text = try TextEditing.apply([Self.edit(index, from: list.open + 1, to: list.close, replacement)], to: text)
 							rewrittenCalls += 1
 						case .unchanged:

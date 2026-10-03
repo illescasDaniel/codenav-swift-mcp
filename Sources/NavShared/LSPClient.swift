@@ -1093,6 +1093,7 @@ public actor LSPClient {
 
 	public func prepareCallHierarchy(_ filePath: String, line: Int, column: Int) async throws -> [HierarchyItem] {
 		let uri = try await ensureOpen(filePath)
+		try checkPosition(uri: uri, filePath: filePath, line: line, column: column)
 		return try await request(
 			"textDocument/prepareCallHierarchy", params: positionParams(uri, line: line, column: column),
 			as: [HierarchyItem].self
@@ -1106,6 +1107,7 @@ public actor LSPClient {
 
 	public func prepareTypeHierarchy(_ filePath: String, line: Int, column: Int) async throws -> [HierarchyItem] {
 		let uri = try await ensureOpen(filePath)
+		try checkPosition(uri: uri, filePath: filePath, line: line, column: column)
 		return try await request(
 			"textDocument/prepareTypeHierarchy", params: positionParams(uri, line: line, column: column),
 			as: [HierarchyItem].self

@@ -353,7 +353,13 @@ extension SwiftNavigator {
 			return index.text(from: start, to: min(start + 300, index.units.count)).components(separatedBy: "{").first ?? ""
 		}()
 		let isStoredProperty = [SymbolKind.property, SymbolKind.field, SymbolKind.variable, SymbolKind.constant].contains(symbol.kind)
-		if isStoredProperty, ["Codable", "Decodable", "Encodable"].contains(where: { ownerHeader.contains($0) }) {
+		// The conformance may be declared apart from the type: `extension Foo: Codable {}`.
+		let codableInExtension: Bool = {
+			guard let owner = parents.last, !owner.name.hasPrefix("extension ") else { return false }
+			let pattern = #"extension\s+(?:[\w.]+\.)?"# + NSRegularExpression.escapedPattern(for: owner.name) + #"\s*:[^{]*\b(Codable|Decodable|Encodable)\b"#
+			return text.range(of: pattern, options: .regularExpression) != nil
+		}()
+		if isStoredProperty, codableInExtension || ["Codable", "Decodable", "Encodable"].contains(where: { ownerHeader.contains($0) }) {
 			let hasKeys = (parents.last?.children ?? []).contains { $0.name == "CodingKeys" }
 			staging.needsAttention(
 				hasKeys

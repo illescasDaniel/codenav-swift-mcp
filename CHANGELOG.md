@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+* Files that start with a UTF-8 byte-order mark keep it when an edit tool rewrites them (it was silently dropped before);
+  `change_signature` warns when an argument it drops from a call looks like a call (its side effects no longer happen);
+  `rename_symbol` warns about the JSON key change when `Codable` is declared in a separate `extension`; `callers`, `type_hierarchy`
+  and `symbol_info` reject an out-of-range position instead of answering "nothing there".
+
 * Accuracy and robustness pass: new Swift files in an Xcode project that no target contains yet are no longer rolled back
   (they get a note to add them to a target); build comparisons tell same-named files in different folders apart; linker and
   C/Objective-C errors are parsed from builds; the newest `Build/Products` folder is used; `fix_diagnostics` prefers the
