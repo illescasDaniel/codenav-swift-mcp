@@ -164,3 +164,28 @@ import Testing
 		#expect(Indentation.braceDelta("}") == -1)
 	}
 }
+
+@Suite struct TextHandlingTests {
+	@Test func braceDeltaUnderstandsEscapesRawStringsAndBlockComments() {
+		#expect(Indentation.braceDelta(#"let s = "a\\"; foo {"#) == 1)
+		#expect(Indentation.braceDelta(#"let s = "\" {""#) == 0)
+		#expect(Indentation.braceDelta(##"let s = #"{ " }"#; x {"##) == 1)
+		#expect(Indentation.braceDelta("a /* { */ b {") == 1)
+		#expect(Indentation.braceDelta("f() // {") == 0)
+	}
+
+	@Test func replacementNeverSplitsSurrogatePairsOrCRLF() throws {
+		let edit = try #require(TextEditing.replacement(from: "a😀b", to: "a😁b"))
+		let applied = try TextEditing.apply([edit], to: "a😀b")
+		#expect(applied == "a😁b")
+		let crlf = try #require(TextEditing.replacement(from: "x\r\ny", to: "x\ny"))
+		#expect(try TextEditing.apply([crlf], to: "x\r\ny") == "x\ny")
+	}
+}
+
+@Suite struct TrailingNewlineDiffTests {
+	@Test func aFinalNewlineChangeIsStillShown() {
+		let diff = UnifiedDiff.make(old: "a\nb", new: "a\nb\n", path: "x.swift")
+		#expect(diff.contains("final newline was added"))
+	}
+}

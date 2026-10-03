@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+* Accuracy and robustness pass: new Swift files in an Xcode project that no target contains yet are no longer rolled back
+  (they get a note to add them to a target); build comparisons tell same-named files in different folders apart; linker and
+  C/Objective-C errors are parsed from builds; the newest `Build/Products` folder is used; `fix_diagnostics` prefers the
+  server's preferred fix-it and skips force-unwrap fix-its unless `only` asks; `edit_symbol new_body` with a trailing `//`
+  comment no longer swallows the closing brace; brace counting understands escapes, raw strings and block comments; edits
+  never split an emoji or a CRLF; a final-newline-only change shows in diffs; non-ASCII identifiers are valid rename targets;
+  a failing `prepareRename` reports the server's error. Known trade-off: diagnostics are compared by severity and message,
+  not line text, so an unchanged pre-existing error is never reported as new.
+
 * Fixes from a trial on a real Xcode app: the project kind is re-detected on every tool call, so a `buildServer.json`
   generated after the MCP started is picked up (before, cross-module detection, `verify=build` and the module checks stayed
   off and a correct rename of a property used from the test target was rejected); the in-memory compile check says

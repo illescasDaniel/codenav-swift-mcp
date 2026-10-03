@@ -138,6 +138,17 @@ public enum TextEditing {
 		while suffix < limit - prefix, before.units[before.units.count - 1 - suffix] == after.units[after.units.count - 1 - suffix] {
 			suffix += 1
 		}
+		// Never cut inside a surrogate pair or a CRLF.
+		func splits(_ units: [UInt16], at offset: Int) -> Bool {
+			guard offset > 0, offset < units.count else { return false }
+			return (0xDC00...0xDFFF).contains(units[offset]) || (units[offset] == 0x0A && units[offset - 1] == 0x0D)
+		}
+		while prefix > 0, splits(before.units, at: prefix) || splits(after.units, at: prefix) { prefix -= 1 }
+		while suffix > 0,
+			splits(before.units, at: before.units.count - suffix) || splits(after.units, at: after.units.count - suffix)
+		{
+			suffix -= 1
+		}
 		let start = before.position(at: prefix)
 		let end = before.position(at: before.units.count - suffix)
 		let newStart = after.units.index(after.units.startIndex, offsetBy: prefix)
@@ -249,6 +260,10 @@ public enum UnifiedDiff {
 				case .insert: out.append("+" + op.text)
 				}
 			}
+		}
+		if hunks.isEmpty {
+			// Only the end of the file differs (a final newline added or removed), which a line diff can't show.
+			out.append(new.hasSuffix("\n") ? "(a final newline was added)" : "(the final newline was removed)")
 		}
 		return out.joined(separator: "\n")
 	}
@@ -437,24 +452,57 @@ public enum Indentation {
 		return output.joined(separator: "\n")
 	}
 
-	/// Net `{`/`(`/`[` minus closers on a line, ignoring string literals and `//` comments.
+	/// Net `{`/`(`/`[` minus closers on a line, ignoring string literals (escapes, `#"…"#` raw strings),
+	/// `//` comments and `/* … */` comments that open and close on the line.
 	public static func braceDelta(_ line: String) -> Int {
 		var delta = 0
+		let characters = Array(line)
+		var index = 0
 		var inString = false
-		var previous: Character = " "
-		for character in line {
+		var escaped = false
+		var hashes = 0
+		while index < characters.count {
+			let character = characters[index]
 			if inString {
-				if character == "\"", previous != "\\" { inString = false }
+				if hashes == 0, escaped {
+					escaped = false
+				} else if hashes == 0, character == "\\" {
+					escaped = true
+				} else if character == "\"" {
+					var matched = 0
+					while matched < hashes, index + 1 + matched < characters.count, characters[index + 1 + matched] == "#" { matched += 1 }
+					if matched == hashes {
+						inString = false
+						index += hashes
+					}
+				}
+			} else if character == "#" {
+				var count = 0
+				while index + count < characters.count, characters[index + count] == "#" { count += 1 }
+				if index + count < characters.count, characters[index + count] == "\"" {
+					hashes = count
+					inString = true
+					index += count
+				} else {
+					index += count - 1
+				}
 			} else if character == "\"" {
+				hashes = 0
 				inString = true
-			} else if character == "/", previous == "/" {
+				escaped = false
+			} else if character == "/", index + 1 < characters.count, characters[index + 1] == "/" {
 				break
+			} else if character == "/", index + 1 < characters.count, characters[index + 1] == "*" {
+				var look = index + 2
+				while look + 1 < characters.count, !(characters[look] == "*" && characters[look + 1] == "/") { look += 1 }
+				if look + 1 >= characters.count { break }  // continues on the next line
+				index = look + 1
 			} else if "{([".contains(character) {
 				delta += 1
 			} else if "})]".contains(character) {
 				delta -= 1
 			}
-			previous = character
+			index += 1
 		}
 		return delta
 	}

@@ -327,6 +327,10 @@ public actor LSPClient {
 					partial.removeSubrange(partial.startIndex...newline)
 					await self?.recordStderr(line)
 				}
+				if partial.count > 64 * 1024 {  // a server that never prints a newline must not grow this without bound
+					await self?.recordStderr(String(decoding: partial.prefix(2000), as: UTF8.self) + "…")
+					partial.removeAll()
+				}
 			}
 		}
 		let rootURI = configuration.workspaceRoot.absoluteString

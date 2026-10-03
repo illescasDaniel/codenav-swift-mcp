@@ -44,7 +44,8 @@ struct RenameName: Equatable {
 	}
 
 	static func isIdentifier(_ text: String) -> Bool {
-		text.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil
+		// Unicode letters are valid in Swift identifiers (`let größe`, `let 名前`).
+		text.range(of: #"^[\p{L}_][\p{L}\p{N}\p{M}_]*$"#, options: .regularExpression) != nil
 	}
 
 	/// The full name to hand the language server, given what the symbol is called now.
@@ -84,8 +85,18 @@ extension SwiftNavigator {
 			await self.awaitIndex(client)
 			let line = resolved.line + 1
 			let column = resolved.column + 1
-			guard let prepared = try? await client.prepareRename(path, line: line, column: column) else {
-				throw ToolInputError("\(resolved.qualifiedName) can't be renamed here (it is declared in the SDK or a dependency, or is not a renamable symbol).")
+			let prepared: PrepareRenameResult
+			do {
+				guard let result = try await client.prepareRename(path, line: line, column: column) else {
+					throw ToolInputError("\(resolved.qualifiedName) can't be renamed here (it is declared in the SDK or a dependency, or is not a renamable symbol).")
+				}
+				prepared = result
+			} catch is CancellationError {
+				throw CancellationError()
+			} catch let error as ToolInputError {
+				throw error
+			} catch {
+				throw ToolInputError("The language server couldn't prepare the rename of \(resolved.qualifiedName): \(error.localizedDescription)")
 			}
 			let oldFull = prepared.placeholder ?? resolved.name
 			let old = ParsedQuery(oldFull)

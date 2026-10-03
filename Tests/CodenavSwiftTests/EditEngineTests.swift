@@ -888,3 +888,12 @@ private func symbol(
 		#expect(SwiftNavigator.isTestFile("/p/App/StoreTests.swift"))
 	}
 }
+
+@Suite struct IdentifierTests {
+	@Test func unicodeIdentifiersAreAccepted() {
+		#expect(RenameName.isIdentifier("größe"))
+		#expect(RenameName.isIdentifier("名前"))
+		#expect(!RenameName.isIdentifier("1abc"))
+		#expect(!RenameName.isIdentifier("a-b"))
+	}
+}

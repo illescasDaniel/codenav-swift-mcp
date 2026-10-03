@@ -203,7 +203,7 @@ extension SwiftNavigator {
 		let replacement: String
 		if lines.isEmpty {
 			replacement = "{}"
-		} else if lines.count == 1, !oldBody.contains("\n") {
+		} else if lines.count == 1, !oldBody.contains("\n"), !lines[0].contains("//") {  // a trailing comment would swallow the brace
 			replacement = "{ \(lines[0].trimmingCharacters(in: .whitespaces)) }"
 		} else {
 			let bodyIndent = base + declaration.unit.text
