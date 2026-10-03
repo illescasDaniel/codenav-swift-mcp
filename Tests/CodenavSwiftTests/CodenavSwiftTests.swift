@@ -85,6 +85,10 @@ struct IntegrationTests {
 		#expect(type.contains("struct User"))
 		let missing = await navigator.hover(filePath: "Sources/SampleApp/main.swift", line: 4, column: nil, symbol: "nope")
 		#expect(missing.isError)
+		// sourcekit-lsp's workspace/symbol omits `let` properties; the type's outline has them.
+		let letProperty = await navigator.symbolInfo(name: "User.id", query: nil, filePath: nil, includeReferences: false)
+		#expect(!letProperty.isError)
+		#expect(letProperty.contains("User.id  [Property]") || letProperty.contains("User.id  [Constant]"))
 		let sdk = await navigator.symbolInfo(name: "String", query: nil, filePath: nil, includeReferences: false)
 		#expect(sdk.contains("[Struct]"))
 	}

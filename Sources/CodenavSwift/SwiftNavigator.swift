@@ -450,6 +450,12 @@ public actor SwiftNavigator {
 			return Target(symbol: resolved, note: nil)
 		} catch let error as SymbolResolutionError where error.message.hasPrefix("No symbol found matching") {
 			let parsed = ParsedQuery(wanted)
+			// `Type.member` for a member `workspace/symbol` doesn't list (`let` properties).
+			if !parsed.container.isEmpty, filePath == nil,
+				let member = try? await resolveMemberViaOutline(client: client, query: wanted)
+			{
+				return Target(symbol: member, note: nil)
+			}
 			// Types from the SDK or a dependency aren't in the workspace index: find a use of the name instead.
 			if parsed.container.isEmpty, parsed.signature == nil,
 				let usage = PositionResolver.findUsage(of: parsed.base, under: workspaceRoot),

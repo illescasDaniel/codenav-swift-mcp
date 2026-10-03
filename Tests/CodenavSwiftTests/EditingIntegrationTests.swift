@@ -366,6 +366,10 @@ struct EditingIntegrationTests {
 		#expect(!property.isError)
 		let profile = try workspace.read("Sources/SampleKit/Profile.swift")
 		#expect(profile.contains("\t@available(*, deprecated, renamed: \"fullName\")\n\tpublic var displayName: String {\n\t\tget { fullName }\n\t\tset { fullName = newValue }\n\t}"))
+		// `let` properties aren't in workspace/symbol; they are found through the type's outline.
+		let letProperty = await workspace.call("rename_symbol", #"{"name":"Profile.limit","new_name":"cap","dry_run":true}"#)
+		#expect(!letProperty.isError)
+		#expect(letProperty.contains("limit → cap") || letProperty.contains("limit"))
 		let constant = await workspace.call(
 			"rename_symbol", #"{"name":"Profile.limit","new_name":"maximum","keep_deprecated_alias":true,"verify":"none"}"#)
 		#expect(!constant.isError)
