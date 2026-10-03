@@ -117,7 +117,7 @@ extension SwiftNavigator {
 			if !plan.manual.isEmpty { text += "\n" + manualSection(plan) }
 			return text
 		}
-		let engine = EditEngine(client: client, root: workspaceRoot, graph: await packageGraph())
+		let engine = EditEngine(client: client, root: workspaceRoot, graph: await packageGraph(), xcodeModules: xcodeModules())
 		let report = try await engine.check(plan)
 		let build = buildPlan(report: report, options: options)
 
@@ -137,7 +137,7 @@ extension SwiftNavigator {
 		}
 		lines.append(EditFormat.summary(plan, root: workspaceRoot))
 		lines.append(EditFormat.check(report, root: workspaceRoot))
-		if engine.graph == nil, projectKind != .swiftPackage {
+		if engine.graph == nil, projectKind != .swiftPackage, engine.xcodeModules == nil {
 			lines.append(
 				"Not checked: this isn't a SwiftPM package, so module boundaries are unknown. Files in other targets that use a changed declaration were not compiled here; build the project to be sure.")
 		}
@@ -280,6 +280,7 @@ extension SwiftNavigator {
 				try engine.restore(entry.plan, force: force)
 				forget(entry.id)
 				try? await client.refresh()
+				await resyncXcodeIndex()  // (the write lock is held) the build that checked the edit left the index describing it
 				return "Undid \(entry.id) (\(entry.title)): restored "
 					+ entry.plan.changes.map { EditFormat.relativeName($0.path, root: workspaceRoot) }.joined(separator: ", ") + "."
 			}

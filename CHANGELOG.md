@@ -2,12 +2,25 @@
 
 ## Unreleased
 
+* `verify tests=true` runs an Xcode project's tests (`xcodebuild test-without-building` on the newest iPhone simulator the scheme
+  supports; `filter` is an `-only-testing` identifier). Previously it only built.
+* Fixed the SwiftPM package graph never matching files when the package sits behind a symlink (`/var` vs `/private/var`, as
+  in temp folders): compiler-written members were then missing from `symbol_info`, and a cross-file change could slip
+  through the in-memory check. A file added after the graph was cached now refreshes it.
 * **Compiler-checked editing tools**, off unless `CODENAV_SWIFT_WRITE=1`: `rename_symbol`, `change_signature`, `edit_symbol`,
   `insert_member`, `delete_symbol`, `move_symbol`, `add_conformance`, `fix_diagnostics`, `refactor`, `apply_edit`,
   `check_edit` and `undo_edit`. A change is compiled in memory by sourcekit-lsp (diagnostics before vs after, in the edited
   files and every file that uses a changed name), written atomically only when it adds no errors, and journaled for undo.
 * Files in modules that depend on a changed module are checked with a real `swift build --build-tests` after writing
   (SwiftPM target graph from `swift package describe`); a build that adds errors puts every file back.
+* **Xcode projects** (found on a real app with a local package): module boundaries come from the `.SwiftFileList` files of the
+  build `buildServer.json` points at, so a change to a package type no longer fails on its app-side conformer; files in
+  dependent modules are checked with `xcodebuild build-for-testing` (scheme, project and destination from `buildServer.json`,
+  the same DerivedData). A build of a temporarily written or undone change is followed by one of the restored files so
+  Xcode's index store never keeps describing a change that isn't there, and build logs of ours with no Swift compilation are
+  removed so xcode-build-server keeps finding compile arguments.
+* `rename_symbol` lists leftover mentions per file; `change_signature` refuses an operation key it doesn't read (an
+  `add` with `default` used to drop the default silently); an edit aimed outside the workspace is refused as such.
 * `verify` (build, and optionally run the tests) and `affected_tests` (the tests that use or reach a symbol, with the
   `swift test --filter` for them) are always available.
 * `workspace` reports whether the write tools are on.

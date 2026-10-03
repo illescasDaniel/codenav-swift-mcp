@@ -37,12 +37,12 @@ extension SwiftNavigator {
 
 	/// Whether to build after an edit, and what to say when it can't.
 	func buildPlan(report: CheckReport, options: EditOptions) -> (run: Bool, hint: String?) {
-		let available = swiftExecutable() != nil && projectKind == .swiftPackage
+		let available = canBuild
 		switch options.verify {
 		case .none:
 			return (false, nil)
 		case .build:
-			return available ? (true, nil) : (false, "Build verification isn't available here (it needs a SwiftPM package and the swift toolchain); build the project yourself to verify.")
+			return available ? (true, nil) : (false, "Build verification isn't available here (it needs a SwiftPM package, or an Xcode project with a buildServer.json and xcodebuild); build the project yourself to verify.")
 		case .auto:
 			guard !report.crossModule.isEmpty else { return (false, nil) }
 			return available
@@ -51,7 +51,17 @@ extension SwiftNavigator {
 		}
 	}
 
+	/// Whether a whole-project build can run here: `swift build` for a package, `xcodebuild` for an Xcode project.
+	var canBuild: Bool {
+		if projectKind == .swiftPackage { return swiftExecutable() != nil }
+		return xcodeBuild() != nil && xcodebuildExecutable() != nil
+	}
+
 	func runBuild() async -> BuildResult? {
+		if projectKind != .swiftPackage {
+			guard let build = xcodeBuild(), let xcodebuild = xcodebuildExecutable() else { return nil }
+			return await BuildRunner.runXcode(build, xcodebuild: xcodebuild, root: workspaceRoot, environment: environment, timeout: buildTimeout)
+		}
 		guard let swift = swiftExecutable() else { return nil }
 		return await BuildRunner.run(swift: swift, root: workspaceRoot, buildTests: true, environment: environment, timeout: buildTimeout)
 	}
@@ -101,6 +111,14 @@ extension SwiftNavigator {
 		return BuildOutcome(text: describe(first, fresh: fresh, baseline: baseline, failed: blamed), hasNewErrors: blamed)
 	}
 
+	/// Xcode's index store is written by builds: a build of a proposed change that is then put back leaves the
+	/// store describing the proposal, and the next rename or reference lookup would trust it. Building the
+	/// restored files once refreshes the store (an incremental build, a few seconds).
+	func resyncXcodeIndex() async {
+		guard projectKind != .swiftPackage, xcodeBuild() != nil else { return }
+		_ = await runBuild()
+	}
+
 	/// For a dry run that asked for a build: writes the plan, builds, and puts every file back.
 	func buildOnTemporaryWrite(_ plan: EditPlan, engine: EditEngine) async throws -> BuildOutcome {
 		try engine.commit(plan)
@@ -113,7 +131,10 @@ extension SwiftNavigator {
 			throw error
 		}
 		guard let first else { return BuildOutcome(text: "Build: no swift toolchain found.", hasNewErrors: false) }
-		if first.succeeded { return BuildOutcome(text: describe(first, fresh: [], baseline: nil, failed: false), hasNewErrors: false) }
+		if first.succeeded {
+			await resyncXcodeIndex()
+			return BuildOutcome(text: describe(first, fresh: [], baseline: nil, failed: false), hasNewErrors: false)
+		}
 		let baseline = await runBuild()
 		let fresh = baseline.map { Self.newErrors(first, comparedTo: $0) } ?? first.errors
 		let blamed = first.timedOut || !fresh.isEmpty || (first.errors.isEmpty && baseline?.succeeded != false)
@@ -126,13 +147,15 @@ extension SwiftNavigator {
 		await run {
 			await useWorkspace()
 			_ = try await liveClient()  // also makes sure the language server has seen the latest files
-			guard projectKind == .swiftPackage, let swift = swiftExecutable() else {
-				throw ToolInputError("verify builds with `swift build`, which needs a SwiftPM package (Package.swift) and the swift toolchain. For an Xcode project, build it in Xcode.")
+			guard canBuild else {
+				throw ToolInputError("verify builds with `swift build` (a SwiftPM package) or `xcodebuild` (an Xcode project with a buildServer.json from xcode-build-server). Neither is available here; build it in Xcode.")
 			}
 			return await withWriteLock {
-				let build = await BuildRunner.run(swift: swift, root: workspaceRoot, buildTests: true, environment: environment, timeout: buildTimeout)
+				guard let build = await runBuild() else { return "Build: no build tool found." }
 				var lines = [describeFull(build)]
-				if tests, build.succeeded {
+				if tests, build.succeeded, projectKind != .swiftPackage {
+					lines.append(await runXcodeTests(filter: filter))
+				} else if tests, build.succeeded, let swift = swiftExecutable() {
 					lines.append(await runTests(swift: swift, filter: filter))
 				} else if tests {
 					lines.append("Tests not run: the build failed.")
@@ -160,15 +183,40 @@ extension SwiftNavigator {
 		var arguments = ["test"]
 		if let filter { arguments += ["--filter", filter] }
 		let output = await ToolProcess.run(swift, arguments: arguments, directory: workspaceRoot, environment: environment, timeout: buildTimeout)
+		return Self.describeTests(output, command: "swift \(arguments.joined(separator: " "))")
+	}
+
+	/// Runs the scheme's tests with the products the verify build just made (`xcodebuild test-without-building`).
+	func runXcodeTests(filter: String?) async -> String {
+		guard let build = xcodeBuild(), let xcodebuild = xcodebuildExecutable() else { return "Tests not run: no xcodebuild." }
+		var concrete: String?
+		if build.testDestination.hasPrefix("platform="), !build.testDestination.contains("macOS") {
+			let listing = await ToolProcess.run(
+				xcodebuild, arguments: ["-showdestinations", build.containerFlag, build.container, "-scheme", build.scheme],
+				directory: workspaceRoot, environment: environment, timeout: 120)
+			concrete = XcodeBuild.pickDestination(fromListing: listing.combined, platform: String(build.testDestination.dropFirst("platform=".count)))
+		}
+		let arguments = build.testArguments(filter: filter, destination: concrete)
+		let output = await ToolProcess.run(xcodebuild, arguments: arguments, directory: workspaceRoot, environment: environment, timeout: buildTimeout)
+		if output.status != 0, output.combined.contains("not currently configured for the test action") {
+			return "Tests not run: scheme \(build.scheme) has no test action (add a test target to it in Xcode)."
+		}
+		return Self.describeTests(output, command: "xcodebuild test -scheme \(build.scheme)" + (filter.map { " -only-testing:\($0)" } ?? ""))
+	}
+
+	static func describeTests(_ output: ProcessOutput, command: String) -> String {
 		let seconds = String(format: "%.1f", output.seconds)
-		let head = "Tests (swift \(arguments.joined(separator: " ")), \(seconds)s)"
+		let head = "Tests (\(command), \(seconds)s)"
 		if output.timedOut { return "\(head): timed out." }
 		let all = output.combined.components(separatedBy: "\n")
 		let failures = all.filter { $0.contains("✘") || $0.contains(": error:") || $0.contains(" failed") && $0.contains("Test Case") }
-		let summary = all.last(where: { $0.contains("Test run with") || $0.contains("Executed ") }) ?? all.filter { !$0.isEmpty }.last ?? ""
+		let summary = all.last(where: { $0.contains("Test run with") || $0.contains("Executed ") || $0.contains("** TEST ") }) ?? all.filter { !$0.isEmpty }.last ?? ""
 		if output.status == 0 { return "\(head): ✓ \(summary.trimmingCharacters(in: .whitespaces))" }
 		var lines = ["\(head): ✗ \(summary.trimmingCharacters(in: .whitespaces))"]
-		for failure in failures.prefix(20) { lines.append("  " + failure.trimmingCharacters(in: .whitespaces)) }
+		for failure in failures.prefix(20) {
+			let text = failure.trimmingCharacters(in: .whitespaces)
+			lines.append("  " + (text.count > 240 ? text.prefix(240) + "…" : text))
+		}
 		if failures.isEmpty { lines.append(all.filter { !$0.isEmpty }.suffix(8).map { "  " + $0 }.joined(separator: "\n")) }
 		return lines.joined(separator: "\n")
 	}

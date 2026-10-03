@@ -139,14 +139,13 @@ extension SwiftNavigator {
 				if !mentions.comments.isEmpty {
 					staging.needsAttention(
 						"`\(old.base)` still appears in \(mentions.comments.count) comment/string(s), left as they are: "
-							+ mentions.comments.prefix(6).map { "\($0.path):\($0.line)" }.joined(separator: ", ")
-							+ (mentions.comments.count > 6 ? " …" : "")
+							+ Self.perFile(mentions.comments)
 							+ " (strings such as #selector names, JSON keys or storyboard identifiers are not updated by a rename)")
 				}
 				if !mentions.code.isEmpty {
-					let shown = mentions.code.prefix(6).map { "\($0.path):\($0.line)" }.joined(separator: ", ")
+					let shown = Self.perFile(mentions.code)
 					staging.needsAttention(
-						"`\(old.base)` still appears in \(mentions.code.count) code position(s) (other symbols with the same name, or places the compiler couldn't resolve, such as Objective-C): \(shown)\(mentions.code.count > 6 ? " …" : "")")
+						"`\(old.base)` still appears in \(mentions.code.count) code position(s) (other symbols with the same name, or places the compiler couldn't resolve, such as Objective-C; a conforming type or caller in a module the language server can't see into belongs here): \(shown)")
 				}
 			}
 			if let found {
@@ -170,6 +169,21 @@ extension SwiftNavigator {
 
 	/// Whole-word occurrences of `word` left in the (staged) sources, split into those in code and those in
 	/// comments or string literals.
+	/// `File.swift (3: L10, L22, L40), Other.swift (1: L7)`: one entry per file, so a file that was missed stands out.
+	static func perFile(_ mentions: [Mention], files: Int = 8) -> String {
+		var order: [String] = []
+		var lines: [String: [Int]] = [:]
+		for mention in mentions {
+			if lines[mention.path] == nil { order.append(mention.path) }
+			lines[mention.path, default: []].append(mention.line)
+		}
+		let shown = order.prefix(files).map { path -> String in
+			let all = lines[path] ?? []
+			return "\(path) (\(all.count): " + all.prefix(3).map { "L\($0)" }.joined(separator: ", ") + (all.count > 3 ? ", …" : "") + ")"
+		}
+		return shown.joined(separator: ", ") + (order.count > files ? " … and \(order.count - files) more file(s)" : "")
+	}
+
 	func mentions(of word: String, staging: inout Staging, limit: Int = 200) throws -> (code: [Mention], comments: [Mention]) {
 		var code: [Mention] = []
 		var comments: [Mention] = []

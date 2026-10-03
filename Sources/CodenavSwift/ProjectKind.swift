@@ -216,7 +216,7 @@ public enum ProjectKind: Equatable, Sendable {
 
 	/// Whether a gzip-compressed `.xcactivitylog` mentions a Swift compile step. Unreadable logs count as yes so a
 	/// format change can't produce a false alarm.
-	private static func logRecordsSwiftCompilation(atPath path: String) -> Bool {
+	static func logRecordsSwiftCompilation(atPath path: String) -> Bool {
 		let process = Process()
 		process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
 		process.arguments = ["-dc", path]

@@ -73,6 +73,11 @@ struct Staging {
 	mutating func read(_ filePath: String) throws -> String? {
 		let path = canonical(filePath)
 		if let entry = entries[path] { return entry.current }
+		// Say "outside the workspace" before anything about the text: an edit aimed at /etc/hosts shouldn't
+		// be told which of its lines `old_text` matched.
+		if !allowedRoots.contains(where: { relativePath(path, in: $0) != nil }) {
+			throw ToolInputError("Refusing to edit \(path): it is outside the workspace.")
+		}
 		guard FileManager.default.fileExists(atPath: path) else { return nil }
 		return try readTextFile(URL(fileURLWithPath: path))
 	}
@@ -242,6 +247,8 @@ struct EditEngine {
 	/// The package's targets and their dependencies, when known: decides which files an in-memory check
 	/// can speak for.
 	var graph: PackageGraph?
+	/// For an Xcode project: which module each file compiles into (there is no package graph to ask).
+	var xcodeModules: XcodeModules?
 	static let maxCheckedDependents = 40
 	static let maxNamesScanned = 25
 
@@ -320,11 +327,20 @@ struct EditEngine {
 		// depends on a changed module would be judged against the old version of that module: its answers
 		// are wrong either way, so it is left to a real build.
 		let changedModules = Set(swiftChanges.compactMap { moduleName($0.path) })
+		var importCache: [String: String] = [:]
+		func imports(_ path: String, anyOf modules: Set<String>) -> Bool {
+			let text = importCache[path] ?? ((try? readTextFile(URL(fileURLWithPath: path))) ?? "")
+			importCache[path] = text
+			return modules.contains { PositionResolver.importsModule(text, Self.bareModuleName($0)) }
+		}
 		func isStale(_ path: String) -> Bool {
 			guard let module = moduleName(path) else { return false }
 			let others = changedModules.subtracting([module])
 			if others.isEmpty { return false }
 			if let graph, graph.target(ofPath: path) != nil { return !others.isDisjoint(with: graph.upstream(of: module)) }
+			// Without a package graph, a file is judged against the old version of another changed module
+			// when it imports that module.
+			if xcodeModules != nil { return imports(path, anyOf: others) }
 			return true  // no dependency information: assume the worst
 		}
 		var sameModule: [String] = []
@@ -426,7 +442,13 @@ struct EditEngine {
 
 	/// The module a source file belongs to: its SwiftPM target, or the `Sources/<T>` / `Tests/<T>` layout.
 	func moduleName(_ path: String) -> String? {
-		graph?.target(ofPath: path)?.name ?? targetName(ofPath: path)
+		graph?.target(ofPath: path)?.name ?? xcodeModules?.module(ofPath: path) ?? targetName(ofPath: path)
+	}
+
+	/// `Sources/Core` and `Tests/CoreTests` are layout names; the module the compiler imports is the part after.
+	static func bareModuleName(_ name: String) -> String {
+		for prefix in ["Sources/", "Tests/"] where name.hasPrefix(prefix) { return String(name.dropFirst(prefix.count)) }
+		return name
 	}
 
 	// MARK: Writing

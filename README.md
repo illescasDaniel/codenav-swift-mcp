@@ -194,32 +194,22 @@ The check has two tiers, and every result says which ones ran:
    writing (`verify=auto`). If the build adds errors, every file is put back. Errors that were already there are
    recognised and don't block. `check_edit verify=build` does the same in a temporary write that is always undone.
 
-### Xcode projects: the build tier is not done yet (to try on a Mac)
+### Xcode projects
 
-The second tier above is SwiftPM-only today, and it has **never been run against an Xcode project**: the development
-machine for it was Linux. Until it is done, an edit in an Xcode project is judged in memory per target, and the result
-says that files in other targets were not compiled. Two ways to close the gap, to be tried on a Mac with Xcode:
+With a `buildServer.json` from xcode-build-server, the second tier is `xcodebuild build-for-testing` (falling back to
+`build` for a scheme without a test action) on the scheme in that file, with the project's own DerivedData, so builds are
+incremental and keep the index store current. Module boundaries come from the `.SwiftFileList` of each target in that build;
+a file is left to the build when it imports a module the edit changed. Tried on a real app with a local package
+(`rename_symbol` on a protocol requirement across the package, the app and its tests: about 5 s for the build).
 
-1. **Let the agent build (works today, nothing to implement).** Apply the edit with `verify=none`, then have the agent
-   call the Xcode MCP's build tool (`BuildProject`, from `xcrun mcpbridge`, e.g. via
-   `"xcode-tools": {"command": "uvx", "args": ["--from", "mcpbridge-wrapper", "mcpbridge-wrapper", "--broker"]}`) and
-   read its errors. codenav is itself an MCP *server* and can't call another one, so this stays on the agent's side.
-   To check: does the build report errors in other targets that the in-memory check missed? Does `undo_edit` still
-   restore the files cleanly while Xcode has the project open?
-2. **Let codenav run `xcodebuild`.** Needs: the scheme and project/workspace (both are in the `buildServer.json` that
-   xcode-build-server writes), a destination, and a way to know which target a file belongs to (today that comes from
-   `swift package describe`; for Xcode it could come from the compile commands xcode-build-server records, or from
-   `import` statements). To check on a Mac:
-   * `xcodebuild -scheme <S> -destination 'generic/platform=macOS' build` output is parsed by `BuildRunner.parse`
-     (it expects `/path/File.swift:LINE:COL: error: message`; Xcode may prefix or format differently);
-   * how long an incremental build takes, and whether it fights with Xcode's own build for the DerivedData lock;
-   * whether `-quiet` / `-skipPackagePluginValidation` are needed.
+* Close Xcode's own build while an edit runs: both use the same DerivedData.
+* Test targets of a local package that the scheme doesn't build (`swift test` only) are not compiled by this tier.
+  Idea for later: an opt-in text-based fallback for `rename_symbol` that renames whole-word mentions in those
+  files (today they are only listed under "Needs a look"); it needs care not to touch unrelated same-named symbols.
+* `verify tests=true` on an Xcode project runs `xcodebuild test-without-building` on a simulator (macOS for Mac schemes); `filter` takes an `-only-testing` identifier.
 
 Limits worth knowing:
 
-* The build tier needs a SwiftPM package (it reads the target graph from `swift package describe`). For an Xcode
-  project the in-memory tier still runs, but module boundaries are unknown, and the result says that files in other
-  targets were not compiled: build the project to be sure.
 * While a file has type errors, the Swift compiler skips flow analysis (missing returns, uninitialized variables), so
   a check on a file that already had errors is incomplete; the result says so. For the declarations an edit touched,
   a small heuristic looks for the commonest case (a function that returns a value but has an empty body or no

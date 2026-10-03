@@ -44,7 +44,8 @@ struct PackageGraph: Sendable {
 		let targets = rawTargets.compactMap { raw -> Target? in
 			guard let name = raw["name"] as? String, let path = raw["path"] as? String else { return nil }
 			let directory = (path.hasPrefix("/") ? path : base + "/" + path)
-			let folder = URL(fileURLWithPath: directory).standardizedFileURL.path
+			// `describe` reports the manifest's spelling of the path (`/var/…`); files are looked up by real path (`/private/var/…`).
+			let folder = URL(fileURLWithPath: directory).standardizedFileURL.realPath.path
 			return Target(
 				name: name, directory: folder, dependencies: (raw["target_dependencies"] as? [String]) ?? [],
 				sources: ((raw["sources"] as? [String]) ?? []).map { folder + "/" + $0 })

@@ -31,7 +31,13 @@ extension SwiftNavigator {
 		var files = [path]
 		var module = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
 		var key = "file:" + path
-		if let target = await packageGraph()?.target(ofPath: path), !target.sources.isEmpty {
+		var graph = await packageGraph()
+		// The graph is cached until the manifest changes; a file added since then isn't in it.
+		if let known = graph?.target(ofPath: path), !known.sources.contains(path) {
+			packageGraphCache = nil
+			graph = await packageGraph()
+		}
+		if let target = graph?.target(ofPath: path), !target.sources.isEmpty {
 			files = target.sources.filter { FileManager.default.fileExists(atPath: $0) }
 			module = target.name
 			key = "target:" + target.name

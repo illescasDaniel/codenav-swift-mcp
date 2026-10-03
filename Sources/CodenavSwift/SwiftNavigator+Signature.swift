@@ -5,6 +5,7 @@ extension SwiftNavigator {
 	/// Reads the `operations` of change_signature: `{op: add|remove|reorder|retype|default, ...}`.
 	static func signatureOperations(_ arguments: ToolArguments) throws -> [(operation: [String: JSONValue], parsed: SignatureOperation)] {
 		var objects = try arguments.objects("operations") ?? []
+		let listed = !objects.isEmpty
 		if objects.isEmpty, arguments.string("op") != nil { objects = [arguments.values] }
 		guard !objects.isEmpty else {
 			throw ToolInputError(
@@ -12,6 +13,7 @@ extension SwiftNavigator {
 		}
 		return try objects.map { object in
 			let args = ToolArguments(object)
+			if listed { try rejectUnknownKeys(of: object) }
 			func position() throws -> SignatureOperation.Position {
 				let raw = (args.string("position") ?? "last").trimmingCharacters(in: .whitespaces)
 				if raw == "last" { return .last }
@@ -42,6 +44,24 @@ extension SwiftNavigator {
 				throw ToolInputError("Unknown op '\(args.string("op") ?? "")': use add, remove, reorder, retype or default.")
 			}
 		}
+	}
+
+	/// A key an operation doesn't read would otherwise be ignored without a word (`default` on an `add`
+	/// silently dropping the default), so name it and say where it belongs.
+	private static func rejectUnknownKeys(of object: [String: JSONValue]) throws {
+		let allowed: [String: Set<String>] = [
+			"add": ["op", "param", "position", "call_value"], "remove": ["op", "param"], "reorder": ["op", "order"],
+			"retype": ["op", "param", "type"], "default": ["op", "param", "value"],
+		]
+		guard let op = object["op"]?.stringValue?.lowercased(), let keys = allowed[op] else { return }
+		let unknown = object.keys.filter { !keys.contains($0) }.sorted()
+		guard !unknown.isEmpty else { return }
+		var hint = ""
+		if op == "add", unknown.contains(where: { $0 == "default" || $0 == "value" || $0 == "default_value" }) {
+			hint = " To give an added parameter a default, write it in `param` (e.g. \"force: Bool = false\"), or follow with a `default` operation."
+		}
+		throw ToolInputError(
+			"The '\(op)' operation doesn't take \(unknown.map { "`\($0)`" }.joined(separator: ", ")); it reads \(keys.sorted().map { "`\($0)`" }.joined(separator: ", ")).\(hint)")
 	}
 
 	static func isIdentifierUnit(_ unit: UInt16) -> Bool {

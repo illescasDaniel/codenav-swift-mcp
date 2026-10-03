@@ -42,6 +42,7 @@ public actor SwiftNavigator {
 	var writeLockHeld = false
 	var writeWaiters: [CheckedContinuation<Void, Never>] = []
 	var packageGraphCache: (stamp: Date, graph: PackageGraph?)?
+	var xcodeModulesCache: (buildRoot: String, when: Date, modules: XcodeModules)?
 
 	public init(
 		environment: [String: String] = ProcessInfo.processInfo.environment,

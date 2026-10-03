@@ -219,10 +219,10 @@ public enum ToolCatalog {
 			description:
 				"Does the project build? Runs the real compiler (`swift build --build-tests` for a SwiftPM package) and reports errors with file and line, "
 				+ "which also covers what the language server can't see: other modules that depend on a changed one. Use it after edits made by other means, "
-				+ "or before relying on the write tools' in-memory check across modules. `tests` also runs `swift test` (optionally narrowed by `filter`, a regex on test names).",
+				+ "or before relying on the write tools' in-memory check across modules. `tests` also runs the tests: `swift test` (`filter` is a regex on test names), or for an Xcode project `xcodebuild test` on a simulator (`filter` is an `-only-testing` identifier: `Target`, `Target/Class` or `Target/Class/method`).",
 			parameters: [
 				p("tests", .boolean, "Also run the tests after a successful build."),
-				p("filter", .string, "With tests: regex on test names (`swift test --filter`)."),
+				p("filter", .string, "With tests: regex on test names (`swift test --filter`); for an Xcode project an `-only-testing` identifier (`Target/Class/method`)."),
 			]),
 		ToolSpec(
 			name: "affected_tests",
