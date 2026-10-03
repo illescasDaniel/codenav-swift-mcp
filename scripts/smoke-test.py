@@ -32,6 +32,11 @@ tools = request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["
 names = sorted(tool["name"] for tool in tools)
 print("tools:", ", ".join(names))
 process.terminate()
-if len(names) != 11 or "symbol_info" not in names:
-    sys.exit(f"expected 11 tools including symbol_info, got {len(names)}")
+# The read-only tools; the editing tools are listed only with CODENAV_SWIFT_WRITE=1.
+expected = sorted([
+    "affected_tests", "callers", "definition", "diagnostics", "hover", "implementations", "outline",
+    "references", "search_symbol", "symbol_info", "type_at", "verify", "workspace",
+])
+if names != expected:
+    sys.exit(f"expected tools {expected}, got {names}")
 print("smoke test passed")
