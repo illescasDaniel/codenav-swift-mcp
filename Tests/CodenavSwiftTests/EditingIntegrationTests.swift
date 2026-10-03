@@ -701,6 +701,49 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func editsThroughAnInWorkspaceSymlinkLandOnTheRealFileAndKeepTheLink() async throws {
+		let workspace = try Workspace()
+		let fileManager = FileManager.default
+		// A symlinked file and a symlinked directory, both pointing at files inside the workspace.
+		try workspace.write("Sources/SampleKit/Crlf.swift", "public struct Crlf {\n\tpublic func other() -> Int { 1 }\n}\n")
+		try fileManager.createSymbolicLink(
+			atPath: workspace.root.appendingPathComponent("Sources/SampleKit/Linked.swift").path, withDestinationPath: "Crlf.swift")
+		try fileManager.createSymbolicLink(
+			atPath: workspace.root.appendingPathComponent("AliasDir").path, withDestinationPath: "Sources/SampleKit")
+
+		let viaFile = await workspace.call(
+			"apply_edit", #"{"file_path":"Sources/SampleKit/Linked.swift","old_text":"{ 1 }","new_text":"{ 2 }","require":"none"}"#)
+		#expect(!viaFile.isError)
+		#expect(try workspace.read("Sources/SampleKit/Crlf.swift").contains("{ 2 }"))
+		let viaDirectory = await workspace.call(
+			"apply_edit", #"{"file_path":"AliasDir/Crlf.swift","old_text":"{ 2 }","new_text":"{ 3 }","require":"none"}"#)
+		#expect(!viaDirectory.isError)
+		#expect(try workspace.read("Sources/SampleKit/Crlf.swift").contains("{ 3 }"))
+		// The link itself survives (the write didn't replace it with a regular file).
+		let destination = try fileManager.destinationOfSymbolicLink(
+			atPath: workspace.root.appendingPathComponent("Sources/SampleKit/Linked.swift").path)
+		#expect(destination == "Crlf.swift")
+		await workspace.finish()
+	}
+
+	@Test func aSymlinkPointingOutsideTheWorkspaceIsRefused() async throws {
+		let workspace = try Workspace()
+		let outside = FileManager.default.temporaryDirectory.appendingPathComponent("codenav-outside-\(UUID().uuidString).swift")
+		let original = "public let outsideValue = 1\n"
+		try original.write(to: outside, atomically: true, encoding: .utf8)
+		defer { try? FileManager.default.removeItem(at: outside) }
+		try FileManager.default.createSymbolicLink(
+			atPath: workspace.root.appendingPathComponent("Sources/SampleKit/Escape.swift").path, withDestinationPath: outside.path)
+
+		let edit = await workspace.call(
+			"apply_edit", #"{"file_path":"Sources/SampleKit/Escape.swift","old_text":"= 1","new_text":"= 2","require":"none"}"#)
+		#expect(edit.isError)
+		#expect(edit.contains("outside the workspace"))
+		#expect(try String(contentsOf: outside, encoding: .utf8) == original)
+		#expect(FileManager.default.fileExists(atPath: workspace.root.appendingPathComponent("Sources/SampleKit/Escape.swift").path))
+		await workspace.finish()
+	}
+
 	@Test func removingAParameterWarnsWhenTheDroppedArgumentWasACall() async throws {
 		let workspace = try Workspace()
 		try workspace.write(

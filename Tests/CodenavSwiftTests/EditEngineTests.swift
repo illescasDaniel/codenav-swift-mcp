@@ -905,6 +905,21 @@ private func symbol(
 		#expect(SwiftNavigator.isTestFile("/p/Tests/AppTests/X.swift"))
 		#expect(SwiftNavigator.isTestFile("/p/App/StoreTests.swift"))
 	}
+
+	@Test func testFilesWithoutATestNameAreRecognisedByTheirImports() throws {
+		let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codenav-istest-\(UUID().uuidString)")
+		try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: directory) }
+		func write(_ name: String, _ text: String) throws -> String {
+			let url = directory.appendingPathComponent(name)
+			try text.write(to: url, atomically: true, encoding: .utf8)
+			return url.path
+		}
+		#expect(SwiftNavigator.isTestFile(try write("A.swift", "// \u{1F600}\nimport XCTest\nfinal class A {}\n")))
+		#expect(SwiftNavigator.isTestFile(try write("B.swift", "import Testing\n")))
+		#expect(!SwiftNavigator.isTestFile(try write("C.swift", "import Foundation\n" + String(repeating: "let x = 1\n", count: 5000) + "// import XCTest\n")))
+		#expect(!SwiftNavigator.isTestFile(directory.appendingPathComponent("missing.swift").path))
+	}
 }
 
 @Suite struct IdentifierTests {

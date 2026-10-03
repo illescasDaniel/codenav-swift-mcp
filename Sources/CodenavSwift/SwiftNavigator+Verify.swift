@@ -381,7 +381,11 @@ extension SwiftNavigator {
 	static func isTestFile(_ path: String) -> Bool {
 		let name = URL(fileURLWithPath: path).lastPathComponent
 		if path.contains("/Tests/") || name.hasSuffix("Tests.swift") || name.hasSuffix("Test.swift") { return true }
-		guard let text = try? readTextFile(URL(fileURLWithPath: path)) else { return false }
+		// Imports sit at the top of a file: read a prefix, not every source file in full.
+		guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+		defer { try? handle.close() }
+		guard let data = try? handle.read(upToCount: 16 * 1024) else { return false }
+		let text = String(decoding: data, as: UTF8.self)
 		return text.contains("import XCTest") || text.contains("import Testing")
 	}
 
