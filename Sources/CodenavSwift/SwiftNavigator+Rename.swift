@@ -163,11 +163,19 @@ extension SwiftNavigator {
 					for: found.symbol, parents: found.parents, text: original, index: originalIndex, newFull: newFull,
 					aliasKept: arguments.bool("keep_deprecated_alias", default: false), staging: &staging)
 			}
-			staging.note("renamed \(oldFull) → \(newFull) across \(staging.plan().changes.count) file(s)")
+			// The language server takes `reload` for a no-argument function; show it the way the user wrote it.
+			let shownOld = Self.displayName(oldFull, noArguments: resolved.qualifiedName.hasSuffix("()"))
+			let shownNew = Self.displayName(newFull, noArguments: requested.labels?.isEmpty == true)
+			staging.note("renamed \(shownOld) → \(shownNew) across \(staging.plan().changes.count) file(s)")
 			return try await self.finishEdit(
-				staging, client: client, title: "rename_symbol \(resolved.qualifiedName) → \(newFull)", options: options,
+				staging, client: client, title: "rename_symbol \(resolved.qualifiedName) → \(shownNew)", options: options,
 				extraNames: baseChanged ? [old.base] : [])
 		}
+	}
+
+	/// `name` with `()` appended when it names a function that takes no arguments and doesn't already show them.
+	static func displayName(_ name: String, noArguments: Bool) -> String {
+		noArguments && !name.contains("(") ? name + "()" : name
 	}
 
 	/// Edits for the calls of a struct's synthesized memberwise initializer that pass `oldBase:` for the renamed

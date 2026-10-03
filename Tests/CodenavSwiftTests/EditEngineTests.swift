@@ -660,3 +660,27 @@ private func symbol(
 	}
 
 }
+
+@Suite struct RenameDisplayAndDependencyTests {
+	@Test func showsNoArgumentFunctionsWithParentheses() {
+		#expect(SwiftNavigator.displayName("reload", noArguments: true) == "reload()")
+		#expect(SwiftNavigator.displayName("reload()", noArguments: true) == "reload()")
+		#expect(SwiftNavigator.displayName("make(named:)", noArguments: false) == "make(named:)")
+		#expect(SwiftNavigator.displayName("logger", noArguments: false) == "logger")
+	}
+
+	@Test func explainsEditsThatReachIntoDependencies() throws {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("staging-\(UUID().uuidString)", isDirectory: true).realPath
+		try FileManager.default.createDirectory(at: root.appendingPathComponent("DerivedData/SourcePackages/checkouts/Dep"), withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: root) }
+		var staging = Staging(root: root, allowedRoots: [root])
+		let dependency = root.appendingPathComponent("DerivedData/SourcePackages/checkouts/Dep/D.swift")
+		let edit = LSPWorkspaceEdit(fileEdits: [dependency.absoluteString: [TextEdit(line: 0, column: 0, endLine: 0, endColumn: 0, newText: "x")]])
+		do {
+			try staging.apply(edit)
+			Issue.record("expected a refusal")
+		} catch let error as ToolInputError {
+			#expect("\(error)".contains("implements or overrides a requirement"))
+		}
+	}
+}

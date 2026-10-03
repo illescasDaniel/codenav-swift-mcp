@@ -64,9 +64,14 @@ struct Staging {
 		guard let base = allowedRoots.first(where: { relativePath(path, in: $0) != nil }) else {
 			throw ToolInputError("Refusing to edit \(path): it is outside the workspace.")
 		}
-		if Exclude.isExcluded(url, root: base) || path.contains("/checkouts/") || path.contains("/DerivedSources/") {
+		if isBuildProductOrDependency(path) {
 			throw ToolInputError("Refusing to edit \(relative(path)): it is a build product or a dependency checkout.")
 		}
+	}
+
+	private func isBuildProductOrDependency(_ path: String) -> Bool {
+		guard let base = allowedRoots.first(where: { relativePath(path, in: $0) != nil }) else { return false }
+		return Exclude.isExcluded(URL(fileURLWithPath: path), root: base) || path.contains("/checkouts/") || path.contains("/DerivedSources/")
 	}
 
 	/// The staged text of a file, else its text on disk; nil when it doesn't exist.
@@ -127,6 +132,13 @@ struct Staging {
 		guard edit.resourceOperations.isEmpty else {
 			throw ToolInputError(
 				"The language server's edit includes file operations (\(edit.resourceOperations.joined(separator: ", "))), which codenav doesn't apply."
+			)
+		}
+		// An edit that reaches into a dependency means the symbol implements or overrides something declared there.
+		let blocked = edit.fileEdits.keys.compactMap(uriToPath).map(canonical).filter(isBuildProductOrDependency).sorted()
+		if let first = blocked.first {
+			throw ToolInputError(
+				"This change would also edit \(relative(first)), a dependency or build product that can't be edited. The symbol most likely implements or overrides a requirement declared there (a protocol or superclass member), so renaming it would break that conformance. Nothing was written."
 			)
 		}
 		for (uri, edits) in edit.fileEdits.sorted(by: { $0.key < $1.key }) {
