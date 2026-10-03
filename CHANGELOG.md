@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 * The in-memory check finds the files that use a changed name in one pass over the tree for all names (it walked the tree
   once per name, for at most 25 names); up to 200 changed names are searched. Added tests for multiple trailing closures in
