@@ -26,7 +26,8 @@
 * `symbol_info` lists the members the compiler writes for a type and the source never declares (memberwise `init`,
   Codable / Equatable / Hashable / RawRepresentable / CaseIterable members), marked `[Auto-Generated]`, using
   `swiftc -print-ast`; `Type.init(...)` and `Type.encode(to:)` lookups answer for them, and `outline` takes `synthesized`.
-  Falls back to working out the memberwise `init` when the compiler can't be used.
+  Falls back to working out the memberwise `init` when the compiler can't be used, taking the types of properties the
+  source doesn't write (`var count = 0`) from the language server's hover.
 * `rename_symbol keep_deprecated_alias` no longer gives a get-only computed property a setter.
 * A file that still has errors gets a heuristic check for missing returns in the declarations an edit touched, since the
   compiler skips flow analysis there.

@@ -825,7 +825,7 @@ public actor SwiftNavigator {
 					for symbol in symbols where sections.count < 12 {
 						if SymbolKind.types.contains(symbol.kind), symbol.kind != SymbolKind.protocol,
 							let result = await synthesizedMembers(
-								file: await client.resolve(filePath).path, symbol: symbol, parents: parents, text: source, supertypes: nil),
+								file: await client.resolve(filePath).path, symbol: symbol, parents: parents, text: source, supertypes: nil, client: client),
 							let section = Self.formatSynthesized(typeName: (parents.map(\.name) + [symbol.name]).joined(separator: "."), result)
 						{
 							sections.append(section)

@@ -99,7 +99,8 @@ extension SwiftNavigator {
 	}
 
 	func synthesizedMembers(
-		file path: String, symbol: DocumentSymbol, parents: [DocumentSymbol], text: String, supertypes: String?, force: Bool = false
+		file path: String, symbol: DocumentSymbol, parents: [DocumentSymbol], text: String, supertypes: String?, force: Bool = false,
+		client: LSPClient? = nil
 	) async -> SynthesisResult? {
 		guard force || Self.mayHaveSynthesizedMembers(symbol, text: text, supertypes: supertypes) else { return nil }
 		let known = Set((symbol.children ?? []).flatMap { [$0.name, NavShared.baseName($0.name)] })
@@ -112,7 +113,18 @@ extension SwiftNavigator {
 			reason = "the compiler's listing doesn't contain \(symbol.name) (declared under #if, or in a file outside this module)"
 		}
 		// Without the compiler's listing, the commonest case can still be worked out.
-		if let inferred = InferredMembers.memberwiseInit(for: symbol, in: text) {
+		// A property whose type isn't written (`var count = 0`) is asked of the language server: hover knows it.
+		var types: [String: String] = [:]
+		if let client {
+			for property in InferredMembers.untypedProperties(of: symbol, in: text) {
+				let position = property.selectionRange.start
+				guard let hover = try? await client.hover(path, line: position.line + 1, column: position.character + 1),
+					let type = InferredMembers.type(fromHover: hover, property: property.name)
+				else { break }
+				types[property.name] = type
+			}
+		}
+		if let inferred = InferredMembers.memberwiseInit(for: symbol, in: text, types: types) {
 			return SynthesisResult(members: [inferred], inferred: true, problem: reason)
 		}
 		return SynthesisResult(members: [], inferred: false, problem: reason)
@@ -143,7 +155,7 @@ extension SwiftNavigator {
 			let text = try? readTextFile(URL(fileURLWithPath: path)), let tree = try? await client.documentSymbol(path),
 			let found = DeclarationLookup.find(in: tree, at: LSPPosition(line: resolved.line, character: resolved.column))
 		else { return nil }
-		guard let result = await synthesizedMembers(file: path, symbol: found.symbol, parents: found.parents, text: text, supertypes: supertypes)
+		guard let result = await synthesizedMembers(file: path, symbol: found.symbol, parents: found.parents, text: text, supertypes: supertypes, client: client)
 		else { return nil }
 		return Self.formatSynthesized(typeName: found.symbol.name, result)
 	}
@@ -151,9 +163,9 @@ extension SwiftNavigator {
 	/// The answer for one member the compiler writes, from its owning type's declaration.
 	private func answer(
 		member query: ParsedQuery, ownerSymbol: ResolvedSymbol, found: (symbol: DocumentSymbol, parents: [DocumentSymbol], siblings: [DocumentSymbol]),
-		path: String, text: String
+		path: String, text: String, client: LSPClient
 	) async -> String? {
-		guard let result = await synthesizedMembers(file: path, symbol: found.symbol, parents: found.parents, text: text, supertypes: nil, force: true)
+		guard let result = await synthesizedMembers(file: path, symbol: found.symbol, parents: found.parents, text: text, supertypes: nil, force: true, client: client)
 		else { return nil }
 		let wanted = query.signature.map { query.base + $0 }
 		let member = result.members.first { candidate in
@@ -177,7 +189,7 @@ extension SwiftNavigator {
 			let text = try? readTextFile(URL(fileURLWithPath: path)), let tree = try? await client.documentSymbol(path),
 			let found = DeclarationLookup.find(in: tree, at: LSPPosition(line: owner.symbol.line, character: owner.symbol.column))
 		else { return nil }
-		return await answer(member: parsed, ownerSymbol: owner.symbol, found: found, path: path, text: text)
+		return await answer(member: parsed, ownerSymbol: owner.symbol, found: found, path: path, text: text, client: client)
 	}
 
 	/// sourcekit's index does list a memberwise initializer, but at the line of the type: hover and definition then
@@ -191,6 +203,6 @@ extension SwiftNavigator {
 		let owner = ResolvedSymbol(
 			name: found.symbol.name, containerName: found.parents.isEmpty ? nil : found.parents.map(\.name).joined(separator: "."),
 			kind: found.symbol.kind, uri: resolved.uri, line: resolved.line, column: resolved.column)
-		return await answer(member: ParsedQuery(resolved.name), ownerSymbol: owner, found: found, path: path, text: text)
+		return await answer(member: ParsedQuery(resolved.name), ownerSymbol: owner, found: found, path: path, text: text, client: client)
 	}
 }

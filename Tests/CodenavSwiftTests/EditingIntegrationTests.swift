@@ -182,6 +182,12 @@ struct EditingIntegrationTests {
 		#expect(!person.contains("encode(to"))  // not guessed
 		let level = await workspace.call("symbol_info", #"{"name":"Level","include_references":false}"#)
 		#expect(level.contains("Auto-generated members of Level: not listed (turned off"))
+
+		// A property whose type isn't written: the language server's hover knows it.
+		try workspace.write(
+			"Sources/SampleKit/Counter.swift", "public struct Counter {\n\tvar count = 0\n\tvar ratio = 0.5\n\tvar label = \"x\"\n\tlet id: Int\n}\n")
+		let counter = await workspace.call("symbol_info", #"{"name":"Counter","include_references":false}"#)
+		#expect(counter.contains("internal init(count: Int = 0, ratio: Double = 0.5, label: String = \"x\", id: Int)  [Auto-Generated: memberwise initializer]"))
 		await workspace.finish()
 	}
 

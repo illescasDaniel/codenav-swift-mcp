@@ -179,3 +179,40 @@ private let dump = """
 		#expect(InferredMembers.memberwiseInit(for: notAStruct, in: text3) == nil)
 	}
 }
+
+@Suite struct InferredTypesTests {
+	@Test func propertiesWithoutAWrittenTypeAreNamedSoTheirTypeCanBeAsked() {
+		let lines = ["struct C {", "\tvar count = 0", "\tvar ratio = 0.5", "\tlet name: String", "\tvar tags: [String] = []", "}"]
+		let text = lines.joined(separator: "\n") + "\n"
+		func property(_ name: String, _ line: Int) -> DocumentSymbol {
+			let column = (lines[line] as NSString).range(of: name).location
+			return DocumentSymbol(
+				name: name, detail: nil, kind: SymbolKind.property,
+				range: LSPRange(start: LSPPosition(line: line, character: 1), end: LSPPosition(line: line, character: lines[line].utf16.count)),
+				selectionRange: LSPRange(start: LSPPosition(line: line, character: column), end: LSPPosition(line: line, character: column + name.utf16.count)),
+				children: nil)
+		}
+		let symbol = DocumentSymbol(
+			name: "C", detail: nil, kind: SymbolKind.structure,
+			range: LSPRange(start: LSPPosition(line: 0, character: 0), end: LSPPosition(line: 5, character: 1)),
+			selectionRange: LSPRange(start: LSPPosition(line: 0, character: 7), end: LSPPosition(line: 0, character: 8)),
+			children: [property("count", 1), property("ratio", 2), property("name", 3), property("tags", 4)])
+		#expect(InferredMembers.untypedProperties(of: symbol, in: text).map(\.name) == ["count", "ratio"])
+		#expect(InferredMembers.memberwiseInit(for: symbol, in: text) == nil)
+		// With the types the language server reported, the init is complete, defaults included.
+		let member = InferredMembers.memberwiseInit(for: symbol, in: text, types: ["count": "Int", "ratio": "Double"])
+		#expect(member?.declaration == "internal init(count: Int = 0, ratio: Double = 0.5, name: String, tags: [String] = [])")
+		#expect(member?.key == "init(count:ratio:name:tags:)")
+		// One type still missing: no init rather than a wrong one.
+		#expect(InferredMembers.memberwiseInit(for: symbol, in: text, types: ["count": "Int"]) == nil)
+	}
+
+	@Test func theTypeIsReadFromAHover() {
+		#expect(InferredMembers.type(fromHover: "```swift\npublic var count: Int\n```", property: "count") == "Int")
+		#expect(InferredMembers.type(fromHover: "```swift\nvar items: [String : Int] = [:]\n```\n\nDocs.", property: "items") == "[String : Int]")
+		#expect(InferredMembers.type(fromHover: "```swift\nlet handler: (Int) -> Void\n```", property: "handler") == "(Int) -> Void")
+		#expect(InferredMembers.type(fromHover: "```swift\nvar total: Int { get }\n```", property: "total") == "Int")
+		#expect(InferredMembers.type(fromHover: "```swift\nvar other: Int\n```", property: "count") == nil)
+		#expect(InferredMembers.type(fromHover: "", property: "count") == nil)
+	}
+}

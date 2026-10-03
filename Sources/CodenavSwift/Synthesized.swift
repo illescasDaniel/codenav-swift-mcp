@@ -188,12 +188,23 @@ enum ASTDump {
 
 /// The memberwise initializer worked out from the stored properties, for when the compiler can't be asked.
 enum InferredMembers {
-	static func memberwiseInit(for symbol: DocumentSymbol, in text: String) -> SynthesizedMember? {
+	/// A stored property that takes part in the memberwise initializer.
+	struct Stored {
+		var symbol: DocumentSymbol
+		/// The type as written; nil when it is inferred from the initial value (`var count = 0`).
+		var type: String?
+		/// The initial value as written, for a `var` that has one (it becomes a default argument).
+		var initial: String?
+	}
+
+	/// The properties of a struct in declaration order, or nil when it has no memberwise initializer (not a
+	/// struct, or it declares an initializer itself).
+	static func storedProperties(of symbol: DocumentSymbol, in text: String) -> [Stored]? {
 		guard symbol.kind == SymbolKind.structure else { return nil }
 		let children = symbol.children ?? []
 		if children.contains(where: { $0.kind == SymbolKind.initializer }) { return nil }  // an explicit init removes the memberwise one
 		let index = TextIndex(text)
-		var parameters: [String] = []
+		var result: [Stored] = []
 		for child in children where [SymbolKind.property, SymbolKind.field, SymbolKind.variable, SymbolKind.constant].contains(child.kind) {
 			guard let start = try? index.offset(child.range.start), let end = try? index.offset(child.range.end) else { return nil }
 			let declaration = index.text(from: start, to: end)
@@ -201,21 +212,56 @@ enum InferredMembers {
 			if line.range(of: #"\b(static|class|lazy)\b"#, options: .regularExpression) != nil { continue }
 			let scan = SwiftScan(declaration)
 			let nameEnd = (try? index.offset(child.selectionRange.end)).map { $0 - start } ?? 0
-			let hasInitial = scan.firstTopLevel("=", in: nameEnd..<scan.units.count) != nil
+			let equals = scan.firstTopLevel("=", in: nameEnd..<scan.units.count)
 			// A computed property (a body without an initial value) isn't stored.
-			if !hasInitial, scan.firstTopLevel("{", in: nameEnd..<scan.units.count) != nil { continue }
+			if equals == nil, scan.firstTopLevel("{", in: nameEnd..<scan.units.count) != nil { continue }
 			let isLet = line.range(of: #"\blet\b"#, options: .regularExpression) != nil
-			if isLet, hasInitial { continue }  // a constant with a value can't be set
-			guard let colon = scan.nextSignificant(from: nameEnd), scan.units[colon] == scan.unit(":") else { return nil }  // type is inferred
-			var typeEnd = scan.units.count
-			if let equals = scan.firstTopLevel("=", in: (colon + 1)..<typeEnd) { typeEnd = equals }
-			if let brace = scan.firstTopLevel("{", in: (colon + 1)..<typeEnd) { typeEnd = brace }
-			let type = scan.text(colon + 1, typeEnd).trimmingCharacters(in: .whitespacesAndNewlines)
-			let initial = hasInitial ? scan.text((scan.firstTopLevel("=", in: (colon + 1)..<scan.units.count) ?? 0) + 1, scan.units.count).trimmingCharacters(in: .whitespacesAndNewlines) : nil
-			let value = initial.flatMap { $0.components(separatedBy: "\n").first }.map { " = " + $0 } ?? ""
-			parameters.append("\(child.name): \(type)\(value)")
+			if isLet, equals != nil { continue }  // a constant with a value can't be set
+			var type: String?
+			if let colon = scan.nextSignificant(from: nameEnd), scan.units[colon] == scan.unit(":") {
+				var typeEnd = scan.units.count
+				if let equals { typeEnd = equals }
+				if let brace = scan.firstTopLevel("{", in: (colon + 1)..<typeEnd) { typeEnd = brace }
+				type = scan.text(colon + 1, typeEnd).trimmingCharacters(in: .whitespacesAndNewlines)
+			}
+			let initial = equals.map { scan.text($0 + 1, scan.units.count).trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")[0] }
+			result.append(Stored(symbol: child, type: type, initial: initial))
 		}
-		let key = "init(" + parameters.map { ($0.components(separatedBy: ":").first ?? "") + ":" }.joined() + ")"
+		return result
+	}
+
+	/// The properties whose type isn't written and has to come from elsewhere.
+	static func untypedProperties(of symbol: DocumentSymbol, in text: String) -> [DocumentSymbol] {
+		(storedProperties(of: symbol, in: text) ?? []).filter { $0.type == nil }.map(\.symbol)
+	}
+
+	/// `types` supplies the properties whose type isn't written (name -> type). Nil when one is still missing.
+	static func memberwiseInit(for symbol: DocumentSymbol, in text: String, types: [String: String] = [:]) -> SynthesizedMember? {
+		guard let stored = storedProperties(of: symbol, in: text) else { return nil }
+		var parameters: [String] = []
+		for property in stored {
+			guard let type = property.type ?? types[property.symbol.name] else { return nil }
+			parameters.append("\(property.symbol.name): \(type)" + (property.initial.map { " = " + $0 } ?? ""))
+		}
+		let key = "init(" + stored.map { $0.symbol.name + ":" }.joined() + ")"
 		return SynthesizedMember(key: key, declaration: "internal init(" + parameters.joined(separator: ", ") + ")", reason: "memberwise initializer")
+	}
+
+	/// The type a hover reports for a property: `public var count: Int` -> `Int`.
+	static func type(fromHover hover: String, property name: String) -> String? {
+		for line in hover.components(separatedBy: "\n") {
+			let trimmed = line.trimmingCharacters(in: .whitespaces)
+			guard trimmed.range(of: "(?<![A-Za-z0-9_])(var|let)\\s+" + NSRegularExpression.escapedPattern(for: name) + "\\s*:", options: .regularExpression) != nil else { continue }
+			let scan = SwiftScan(trimmed)
+			guard let nameRange = trimmed.range(of: name), let colon = scan.nextSignificant(from: trimmed.utf16.distance(from: trimmed.startIndex, to: nameRange.upperBound)),
+				scan.units[colon] == scan.unit(":")
+			else { continue }
+			var end = scan.units.count
+			if let equals = scan.firstTopLevel("=", in: (colon + 1)..<end) { end = equals }
+			if let brace = scan.firstTopLevel("{", in: (colon + 1)..<end) { end = brace }
+			let type = scan.text(colon + 1, end).trimmingCharacters(in: .whitespacesAndNewlines)
+			return type.isEmpty ? nil : type
+		}
+		return nil
 	}
 }
