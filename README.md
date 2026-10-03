@@ -140,7 +140,7 @@ diagnostics from before, and written only if it introduces no new errors. Off by
 | `change_signature` | Adds, removes, reorders, retypes or re-defaults parameters **and rewrites every call site** (trailing closures included, while the closure stays last); overrides and protocol witnesses change with it, and a witness pulls in the requirement it implements |
 | `edit_symbol` | Replaces a declaration, or only its body, addressed by name: no text to quote, no wrong overload |
 | `insert_member` | Adds a member to a type or extension (`first`, `last`, `after:x`, `before:x`), or a top-level declaration, indented like its neighbours |
-| `delete_symbol`, `move_symbol` | Delete refuses while anything still uses the symbol and lists the usages; move carries the doc comment to another file (top-level declarations, imports included) or into another type (`to_container`, members) |
+| `delete_symbol`, `move_symbol` | Delete refuses while anything still uses the symbol and lists the usages; move carries the doc comment to another file (top-level declarations, with only the imports they need) or into another type (`to_container`, members) |
 | `add_conformance` | `extension T: P` (or inline) with the compiler's stubs, re-indented, returning stubs as `fatalError` so it compiles |
 | `fix_diagnostics` | Applies the compiler's own fix-its in a file, re-checking between rounds |
 | `refactor` | sourcekit-lsp's Extract Method / Expression, Convert to Async, Memberwise Init... with tidy indentation and your name for the result |

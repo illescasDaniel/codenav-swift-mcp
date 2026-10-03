@@ -498,6 +498,45 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func aMovedDeclarationBringsOnlyTheImportsItUses() async throws {
+		let workspace = try await Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Stamps.swift",
+			"import Foundation\nimport Dispatch\n\nstruct Stamp {\n\tvar made = Date()\n}\n\nstruct Marker {}\n")
+		let moved = await workspace.call("move_symbol", #"{"name":"Stamp","to_file":"Sources/SampleKit/Stamp.swift","verify":"none"}"#)
+		#expect(!moved.isError)
+		let stamp = try workspace.read("Sources/SampleKit/Stamp.swift")
+		#expect(stamp.contains("import Foundation"))
+		#expect(!stamp.contains("import Dispatch"))
+		#expect(moved.contains("left out import(s)"))
+		#expect(moved.contains("import Dispatch"))
+		// The old file keeps its own imports.
+		#expect(try workspace.read("Sources/SampleKit/Stamps.swift").contains("import Dispatch"))
+		await workspace.finish()
+	}
+
+	@Test func aMovedDeclarationKeepsEveryImportWhenItCannotTellWhichAreUsed() async throws {
+		let workspace = try await Workspace()
+		// Models.swift has no imports: nothing to prune, nothing to note.
+		let moved = await workspace.call("move_symbol", #"{"name":"Dog","to_file":"Sources/SampleKit/Dog.swift","verify":"none"}"#)
+		#expect(!moved.isError)
+		#expect(!moved.contains("left out import(s)"))
+		await workspace.finish()
+	}
+
+	@Test func typeAtLooksInsideSDKWrappersForProjectTypes() async throws {
+		let workspace = try await Workspace()
+		try workspace.write("Sources/SampleKit/Roster.swift", "func roster(users: [User]) -> Int {\n\tlet all: [User] = users\n\treturn all.count\n}\n")
+		let type = await workspace.call("type_at", #"{"file_path":"Sources/SampleKit/Roster.swift","line":2,"symbol":"all"}"#)
+		#expect(!type.isError)
+		#expect(type.contains("holds these project type(s)"))
+		#expect(type.contains("Models.swift"))
+		#expect(!type.contains("Type is defined in the SDK or the standard library."))
+		let plain = await workspace.call("type_at", #"{"file_path":"Sources/SampleKit/Roster.swift","line":1,"symbol":"roster"}"#)
+		#expect(!plain.contains("holds these project type(s)"))
+		await workspace.finish()
+	}
+
 	// MARK: rename_symbol
 
 	@Test func renamingAStoredPropertyFollowsTheMemberwiseInitializerLabel() async throws {

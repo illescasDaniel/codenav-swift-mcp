@@ -695,10 +695,17 @@ public actor SwiftNavigator {
 			let local = locations.filter { !isExternal($0.uri) }.prefix(Self.maxTypeLocations)
 			var parts = [text]
 			if local.isEmpty {
-				parts.append(
-					locations.isEmpty
-						? "(no type definition reported: the position may be a type itself, a function, or have no declared type)"
-						: "Type is defined in the SDK or the standard library.")
+				if locations.isEmpty {
+					parts.append("(no type definition reported: the position may be a type itself, a function, or have no declared type)")
+				} else {
+					// `[User]`, `User?` or `Result<User, Failure>`: the wrapper is the SDK's, what it holds may be the project's.
+					let inner = await projectTypes(inHover: text, client: client)
+					parts.append(
+						inner.isEmpty
+							? "Type is defined in the SDK or the standard library."
+							: "The outer type is defined in the SDK or the standard library; it holds these project type(s):")
+					parts += inner
+				}
 			} else {
 				parts += local.map(describeTypeDefinition)
 			}
@@ -1105,6 +1112,40 @@ public actor SwiftNavigator {
 		let declaration = String(text[match])
 		guard let name = declaration.split(whereSeparator: { $0 == ":" || $0.isWhitespace }).last else { return nil }
 		return String(name)
+	}
+
+	/// Type names in a declaration's type (`let games: [GameSummary]`), in order, without the standard library's own
+	/// containers and scalars: the candidates for "which project types does this SDK wrapper hold?".
+	static func typeNames(inHover text: String) -> [String] {
+		let declaration = text.replacingOccurrences(of: "```swift", with: "").replacingOccurrences(of: "```", with: "")
+		guard let colon = declaration.firstIndex(of: ":") else { return [] }
+		let typeText = declaration[declaration.index(after: colon)...].split(separator: "\n").first.map(String.init) ?? ""
+		var names: [String] = []
+		for match in typeText.matches(of: #/[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*/#) {
+			let name = String(match.output)
+			let first = name.split(separator: ".").first.map(String.init) ?? name
+			guard first.first?.isUppercase == true, !Self.standardTypeNames.contains(first), !names.contains(name) else { continue }
+			names.append(name)
+		}
+		return names
+	}
+
+	static let standardTypeNames: Set<String> = [
+		"Array", "Dictionary", "Set", "Optional", "Result", "Task", "Void", "Never", "Any", "AnyObject", "Self", "Type",
+		"String", "Substring", "Character", "Bool", "Int", "Int8", "Int16", "Int32", "Int64", "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
+		"Float", "Double", "Data", "Date", "URL", "UUID", "Error", "Sendable", "MainActor", "Range", "ClosedRange",
+	]
+
+	/// The definition site of each project (not SDK) type named in a declaration's type; at most `maxTypeLocations`.
+	private func projectTypes(inHover text: String, client: LSPClient) async -> [String] {
+		var described: [String] = []
+		for name in Self.typeNames(inHover: text) {
+			guard described.count < Self.maxTypeLocations else { break }
+			guard let found = try? await resolveSymbol(client: client, workspaceRoot: workspaceRoot, query: name), !isExternal(found.uri) else { continue }
+			let position = LSPPosition(line: found.line, character: found.column)
+			described.append(describeTypeDefinition(LSPLocation(uri: found.uri, range: LSPRange(start: position, end: position))))
+		}
+		return described
 	}
 
 	private func describeTypeDefinition(_ location: LSPLocation) -> String {

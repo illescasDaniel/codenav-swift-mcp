@@ -441,7 +441,12 @@ extension SwiftNavigator {
 			let snippetSpan = DeclarationRange.wholeLines(of: range, in: index, includingDocComment: true, swallowBlank: false)
 			let snippet = index.text(from: snippetSpan.start, to: snippetSpan.end).trimmingCharacters(in: .newlines)
 			let removal = DeclarationRange.wholeLines(of: range, in: index, includingDocComment: true, swallowBlank: true)
-			let imports = importLayout(of: declaration.text.components(separatedBy: "\n")).topLevel
+			let allImports = importLayout(of: declaration.text.components(separatedBy: "\n")).topLevel
+			let imports = await self.importsNeeded(by: snippet, among: allImports, in: declaration, client: client)
+			if imports.count < allImports.count {
+				let left = allImports.filter { !imports.contains($0) }
+				staging.note("left out import(s) of \(declaration.path.components(separatedBy: "/").last ?? "the old file") that \(declaration.qualifiedName) doesn't use: " + left.map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: ", "))
+			}
 			try staging.apply([Self.edit(index, from: removal.start, to: removal.end, "")], to: declaration.path)
 
 			if let existing = try staging.read(destination) {
@@ -480,6 +485,31 @@ extension SwiftNavigator {
 }
 
 extension SwiftNavigator {
+	/// The imports of a file that a declaration moved out of it still needs. Swift has no unused-import check, so each
+	/// import is tried: the old file is shown to the language server as just the imports and the declaration (same module,
+	/// same build settings), and an import stays only when taking it away adds a compile error. Any doubt (the server
+	/// can't analyze the file, errors already there that an import could be hiding) keeps every import.
+	func importsNeeded(by snippet: String, among imports: [String], in declaration: Declaration, client: LSPClient) async -> [String] {
+		guard !imports.isEmpty else { return imports }
+		let path = declaration.path
+		func errors(_ kept: [String]) async -> Int? {
+			await client.setOverlay(path, text: (kept.isEmpty ? "" : kept.joined(separator: "\n") + "\n\n") + snippet + "\n")
+			await client.touch([path])
+			guard let found = try? await client.diagnostics(path), !found.contains(where: { EditEngine.isAnalysisFailure($0) }) else { return nil }
+			return found.filter(\.isError).count
+		}
+		var kept = imports
+		if let baseline = await errors(kept) {
+			for candidate in imports {
+				let trial = kept.filter { $0 != candidate }
+				if let count = await errors(trial), count <= baseline { kept = trial }
+			}
+		}
+		await client.clearAllOverlays()
+		await client.touch([path])
+		return kept
+	}
+
 	/// Moves a member (with its doc comment) into another type or extension, in the same or another file.
 	func moveMember(
 		_ member: Declaration, to containerName: String, arguments: ToolArguments, client: LSPClient, staging: inout Staging, options: EditOptions

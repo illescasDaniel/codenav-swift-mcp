@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+* `move_symbol` (to another file) no longer copies every import of the old file: the old file is shown to the language
+  server as just the imports and the moved declaration, and an import is carried over only when taking it away adds a
+  compile error. The result lists the imports left out; when the file can't be analyzed, every import is kept as before.
+* `type_at` looks inside SDK wrappers: for `[User]`, `User?` or `Result<User, Failure>` it no longer stops at "defined in the
+  SDK or the standard library" but also lists the project types the declaration holds, with their definition sites.
+
 ## 0.2.0
 
 * The in-memory check finds the files that use a changed name in one pass over the tree for all names (it walked the tree

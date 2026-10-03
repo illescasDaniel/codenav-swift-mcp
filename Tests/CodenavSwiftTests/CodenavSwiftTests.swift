@@ -31,6 +31,16 @@ import Testing
 	}
 }
 
+@Suite struct TypeArgumentTests {
+	@Test func listsProjectTypeCandidatesInsideSDKWrappers() {
+		#expect(SwiftNavigator.typeNames(inHover: "```swift\nvar games: [GameSummary]\n```") == ["GameSummary"])
+		#expect(SwiftNavigator.typeNames(inHover: "let result: Result<User, Models.LoadError>") == ["User", "Models.LoadError"])
+		#expect(SwiftNavigator.typeNames(inHover: "var cache: [String: Set<User>]?") == ["User"])
+		#expect(SwiftNavigator.typeNames(inHover: "let count: Int") == [])
+		#expect(SwiftNavigator.typeNames(inHover: "func make() -> User") == [])
+	}
+}
+
 @Suite struct CatalogTests {
 	@Test func exposesAllTools() {
 		#expect(ToolCatalog.readTools.map(\.name) == [
