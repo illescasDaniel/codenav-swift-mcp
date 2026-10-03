@@ -173,7 +173,7 @@ public enum ProjectKind: Equatable, Sendable {
 		]
 	}
 
-	private static func buildRootProblems(in root: URL) -> [String] {
+	static func buildRootProblems(in root: URL) -> [String] {
 		let fileManager = FileManager.default
 		let configURL = root.appendingPathComponent("buildServer.json")
 		guard !fileManager.fileExists(atPath: root.appendingPathComponent("Package.swift").path),

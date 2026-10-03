@@ -81,7 +81,16 @@ public actor SwiftNavigator {
 	func useWorkspace() async {
 		let roots = selector.pinned ? [] : await (rootsProvider?() ?? [])
 		let selection = selector.select(clientRootURIs: roots, isProject: { ProjectKind.detect(in: $0).isNavigable })
-		guard selection.root != workspaceRoot else { return }
+		guard selection.root != workspaceRoot else {
+			// `buildServer.json` (or a Package.swift) may have appeared since startup: the project kind decides whether
+			// module boundaries, builds and the compile-check caveats apply, so it must not stay what it was at launch.
+			let kind = ProjectKind.detect(in: workspaceRoot)
+			if kind != projectKind {
+				projectKind = kind
+				xcodeModulesCache = nil
+			}
+			return
+		}
 		await stopClient()
 		outlineFileIndex.clear()
 		workspaceRoot = selection.root

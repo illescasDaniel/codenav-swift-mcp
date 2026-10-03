@@ -152,6 +152,13 @@ extension SwiftNavigator {
 							+ Self.perFile(mentions.comments)
 							+ " (strings such as #selector names, JSON keys or storyboard identifiers are not updated by a rename)")
 				}
+				let inactive = mentions.code.filter { $0.condition != nil }
+				if !inactive.isEmpty {
+					let conditions = Set(inactive.compactMap(\.condition)).sorted().prefix(3).map { "`\($0)`" }.joined(separator: ", ")
+					staging.needsAttention(
+						"\(inactive.count) of the remaining `\(old.base)` position(s) are inside conditional compilation (\(conditions)): the compiler only sees the branches active in this build, so these are likely real references the rename missed, and the in-memory check and a Debug build can pass while another configuration breaks: "
+							+ Self.perFile(inactive))
+				}
 				if !mentions.code.isEmpty {
 					let shown = Self.perFile(mentions.code)
 					staging.needsAttention(
@@ -240,6 +247,27 @@ extension SwiftNavigator {
 	struct Mention {
 		var path: String
 		var line: Int
+		/// The innermost `#if` / `#elseif` / `#else` line this mention sits under, when it is in conditional compilation.
+		var condition: String?
+	}
+
+	/// For each line (0-based) inside a conditional-compilation block, the directive that opened its innermost branch.
+	static func conditionalContext(of text: String) -> [Int: String] {
+		var stack: [String] = []
+		var result: [Int: String] = [:]
+		for (number, rawLine) in text.components(separatedBy: "\n").enumerated() {
+			let line = rawLine.trimmingCharacters(in: .whitespaces)
+			if line.hasPrefix("#if") {
+				stack.append(line)
+			} else if line.hasPrefix("#elseif") || line.hasPrefix("#else") {
+				if !stack.isEmpty { stack[stack.count - 1] = line }
+			} else if line.hasPrefix("#endif") {
+				if !stack.isEmpty { stack.removeLast() }
+			} else if let top = stack.last {
+				result[number] = top
+			}
+		}
+		return result
 	}
 
 	/// Whole-word occurrences of `word` left in the (staged) sources, split into those in code and those in
@@ -283,15 +311,16 @@ extension SwiftNavigator {
 				guard text.contains(word) else { continue }
 				let scan = SwiftScan(text)
 				let index = TextIndex(text)
+				let conditional = Self.conditionalContext(of: text)
 				let relativeName = EditFormat.relativeName(path, root: workspaceRoot)
 				for match in pattern.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length)) {
 					let line = index.position(at: match.range.location).line + 1
 					let trimmed = index.lineText(line - 1).trimmingCharacters(in: .whitespaces)
 					if trimmed.hasPrefix("import ") { continue }
 					if scan.isCode[match.range.location] {
-						code.append(Mention(path: relativeName, line: line))
+						code.append(Mention(path: relativeName, line: line, condition: conditional[line - 1]))
 					} else {
-						comments.append(Mention(path: relativeName, line: line))
+						comments.append(Mention(path: relativeName, line: line, condition: nil))
 					}
 				}
 			}
@@ -365,9 +394,12 @@ extension SwiftNavigator {
 			var prefix = ""
 			if tail.contains("throws") { prefix += "try " }
 			if tail.contains("async") { prefix += "await " }
-			let arguments = parameters.map { parameter -> String in
+			// The call uses the NEW argument labels: a rename like `scrollTo(_:)` → `scroll(to:)` changes them.
+			let newLabels = argumentLabels(of: newFull)
+			let arguments = parameters.enumerated().map { offset, parameter -> String in
 				let value = parameter.type.hasPrefix("inout ") ? "&" + parameter.name : parameter.name
-				return parameter.label == "_" ? value : "\(parameter.label): \(value)"
+				let label = newLabels.flatMap { offset < $0.count ? $0[offset] : nil } ?? parameter.label
+				return label == "_" ? value : "\(label): \(value)"
 			}.joined(separator: ", ")
 			return "\n\n\(base)\(attribute)\n\(base)\(header) { \(prefix)\(newBase)(\(arguments)) }"
 
@@ -405,6 +437,13 @@ extension SwiftNavigator {
 		default:
 			return nil
 		}
+	}
+
+	/// The argument labels a full name spells (`scroll(to:)` → ["to"], `f(_:b:)` → ["_", "b"]); nil when it spells none.
+	static func argumentLabels(of fullName: String) -> [String]? {
+		guard let open = fullName.firstIndex(of: "("), fullName.hasSuffix(")") else { return nil }
+		let inside = fullName[fullName.index(after: open)..<fullName.index(before: fullName.endIndex)]
+		return inside.split(separator: ":", omittingEmptySubsequences: false).dropLast().map { String($0).trimmingCharacters(in: .whitespaces) }
 	}
 
 	/// The access level written on a declaration line (`open` is forwarded as `public`).

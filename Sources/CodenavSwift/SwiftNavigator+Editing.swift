@@ -118,7 +118,14 @@ extension SwiftNavigator {
 			return text
 		}
 		let engine = EditEngine(client: client, root: workspaceRoot, graph: await packageGraph(), xcodeModules: xcodeModules())
-		let report = try await engine.check(plan)
+		var report = try await engine.check(plan)
+		if projectKind == .buildServer {
+			// Only what makes the compiler guess (fallback arguments, no build root); a missing index store or a newer
+			// project file doesn't change what a compile check says.
+			report.settingsProblems = ProjectKind.buildRootProblems(in: workspaceRoot).filter {
+				$0.contains("fallback arguments") || $0.contains("doesn't exist") || $0.contains("valid JSON")
+			}
+		}
 		let build = buildPlan(report: report, options: options)
 
 		var lines: [String] = []
@@ -133,7 +140,7 @@ extension SwiftNavigator {
 			lines.append(
 				report.hasNewErrors
 					? "\(title): NOT applied. The change introduces \(report.newErrors.count) compile error(s); no file was modified."
-					: "\(title): NOT applied. The change can't be verified because the language server could not analyze the files; nothing was modified.")
+					: "\(title): NOT applied. The change can't be verified (\(report.settingsProblems.isEmpty ? "the language server could not analyze the files" : "the build settings are incomplete")); nothing was modified.")
 		}
 		lines.append(EditFormat.summary(plan, root: workspaceRoot))
 		lines.append(EditFormat.check(report, root: workspaceRoot))
@@ -148,7 +155,7 @@ extension SwiftNavigator {
 			lines.append(
 				report.hasNewErrors
 					? "Fix what is listed (or pass require=none to write it anyway), then retry. Diff that was rejected:"
-					: "Fix the project setup, or pass require=none to write without a compile check. Diff that was rejected:")
+					: "Fix the project setup (see above), or pass require=none to write without a compile check. Diff that was rejected:")
 			lines.append(EditFormat.diff(plan, root: workspaceRoot))
 			throw ToolInputError(lines.joined(separator: "\n"))
 		}

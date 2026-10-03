@@ -187,11 +187,14 @@ struct CheckReport: Sendable {
 	/// Files the language server could not analyze at all (broken build settings, a failed build): a clean
 	/// answer for them would mean nothing.
 	var analysisFailures: [String] = []
+	/// Problems with the build settings the language server compiles with (no Swift compilation recorded, a missing
+	/// build root…): files then get fallback arguments, so a clean answer — or an error — means nothing.
+	var settingsProblems: [String] = []
 	/// Likely problems in edited declarations of files that still have errors (see `FlowLint`).
 	var flowWarnings: [String] = []
 
 	var hasNewErrors: Bool { !newErrors.isEmpty }
-	var isVerified: Bool { analysisFailures.isEmpty }
+	var isVerified: Bool { analysisFailures.isEmpty && settingsProblems.isEmpty }
 }
 
 // MARK: - What a change touched
@@ -563,7 +566,11 @@ enum EditFormat {
 		var lines: [String] = []
 		let checked = "\(report.checkedFiles.count) file(s)"
 		let rel = { (path: String) in relativePath(path, in: root) ?? displayPathOutside(path, root: root) }
-		if !report.isVerified {
+		if !report.settingsProblems.isEmpty {
+			lines.append("Compile check (sourcekit-lsp, in memory, \(checked)): ⚠ NOT VERIFIED, the build settings are incomplete, so the compiler is working with fallback arguments and neither its errors nor a clean result can be trusted:")
+			lines += report.settingsProblems.map { "  - \($0)" }
+		}
+		if !report.analysisFailures.isEmpty {
 			lines.append("Compile check (sourcekit-lsp, in memory, \(checked)): ⚠ NOT VERIFIED, the language server could not analyze \(report.analysisFailures.count) file(s); run `workspace` to see why (build settings, a failing build).")
 		}
 		if report.hasNewErrors {

@@ -453,3 +453,35 @@ struct MixedLanguageIntegrationTests {
 		#expect(text.contains("1 more in SDK/module interface files"))
 	}
 }
+
+
+@Suite struct RenameHelpersTests {
+	@Test func argumentLabelsAreReadFromAFullName() {
+		#expect(SwiftNavigator.argumentLabels(of: "scroll(to:)") == ["to"])
+		#expect(SwiftNavigator.argumentLabels(of: "f(_:b:)") == ["_", "b"])
+		#expect(SwiftNavigator.argumentLabels(of: "plain") == nil)
+		#expect(SwiftNavigator.argumentLabels(of: "noArgs()") == [])
+	}
+
+	@Test func conditionalContextNamesTheInnermostBranch() {
+		let text = "a()\n#if DEBUG\nb()\n#else\nc()\n#endif\nd()\n"
+		let context = SwiftNavigator.conditionalContext(of: text)
+		#expect(context[0] == nil)
+		#expect(context[2] == "#if DEBUG")
+		#expect(context[4] == "#else")
+		#expect(context[6] == nil)
+	}
+
+	@Test func aBuildServerFileCreatedLaterIsNoticed() async throws {
+		let root = FileManager.default.temporaryDirectory.appendingPathComponent("codenav-kind-\(UUID().uuidString)", isDirectory: true)
+		try FileManager.default.createDirectory(at: root.appendingPathComponent("App.xcodeproj"), withIntermediateDirectories: true)
+		defer { try? FileManager.default.removeItem(at: root) }
+		let navigator = SwiftNavigator(environment: ["CODENAV_SWIFT_WORKSPACE": root.path])
+		let before = await navigator.projectKind
+		#expect(before == .xcodeWithoutBuildServer(name: "App.xcodeproj"))
+		try Data("{}".utf8).write(to: root.appendingPathComponent("buildServer.json"))
+		await navigator.useWorkspace()
+		let after = await navigator.projectKind
+		#expect(after == .buildServer)
+	}
+}

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+* Fixes from a trial on a real Xcode app: the project kind is re-detected on every tool call, so a `buildServer.json`
+  generated after the MCP started is picked up (before, cross-module detection, `verify=build` and the module checks stayed
+  off and a correct rename of a property used from the test target was rejected); the in-memory compile check says
+  "NOT VERIFIED" (and refuses to write unless `require=none`) when the build settings are incomplete, instead of printing
+  "no new errors" or a wall of bogus ones; `keep_deprecated_alias` calls the new name with the NEW argument labels
+  (`scrollTo(_:)` → `scroll(to:)` produced a forwarder that didn't compile); `rename_symbol` calls out leftover mentions that sit
+  inside `#if` blocks the current build doesn't compile (a Release-only call site survived a rename that built fine in Debug).
 * Fixes from trying the tools on three real Xcode projects: `verify` and the build checks find the project from
   `buildServer.json`'s `workspace` (a project in a subfolder such as `src/App/App.xcodeproj` used to be "not buildable");
   `rename_symbol` on a stored property also updates `Type(old: …)` memberwise-initializer labels the language server

@@ -487,6 +487,29 @@ struct EditingIntegrationTests {
 		await workspace.finish()
 	}
 
+	@Test func aDeprecatedAliasForwardsWithTheNewArgumentLabels() async throws {
+		let workspace = try Workspace()
+		try workspace.write("Sources/SampleKit/Scroller.swift", "public struct Scroller {\n\tpublic func scrollTo(_ value: Int) {}\n}\n")
+		let result = await workspace.call(
+			"rename_symbol", #"{"name":"Scroller.scrollTo(_:)","new_name":"scroll(to:)","keep_deprecated_alias":true,"verify":"none"}"#)
+		#expect(!result.isError)
+		let text = try workspace.read("Sources/SampleKit/Scroller.swift")
+		#expect(text.contains("public func scroll(to value: Int) {}"))
+		#expect(text.contains("public func scrollTo(_ value: Int) { scroll(to: value) }"))
+		await workspace.finish()
+	}
+
+	@Test func leftoverMentionsInConditionalCompilationAreCalledOut() async throws {
+		let workspace = try Workspace()
+		try workspace.write(
+			"Sources/SampleKit/Flagged.swift",
+			"public func ping() {}\n\npublic func use() {\n#if !DEBUG\n\tping()\n#endif\n}\n")
+		let result = await workspace.call("rename_symbol", #"{"name":"ping()","new_name":"pong","dry_run":true}"#)
+		#expect(result.contains("conditional compilation"))
+		#expect(result.contains("#if !DEBUG"))
+		await workspace.finish()
+	}
+
 	@Test func typesAndPropertiesKeepDeprecatedAliases() async throws {
 		let workspace = try Workspace()
 		try workspace.write("Sources/SampleKit/Profile.swift", "public struct Profile {\n\tpublic var displayName: String\n\tpublic static let limit: Int = 3\n}\n")
