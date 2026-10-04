@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+* `verify` and the compile check after an edit read the build's errors also when the host runs from a terminal: the compiler
+  then colours its output, and the colour codes hid every error ("✗ failed, 0 error(s)", no file or line). The build now
+  runs without colours and any left in the output are removed before it is read.
+
 ## 0.2.2
 
 * `type_at` looks inside SDK wrappers (`[User]`, `User?`, `Result<User, Failure>`) also with Swift 6.3 and earlier, whose
