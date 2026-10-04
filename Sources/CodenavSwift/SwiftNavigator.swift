@@ -695,16 +695,20 @@ public actor SwiftNavigator {
 			let local = locations.filter { !isExternal($0.uri) }.prefix(Self.maxTypeLocations)
 			var parts = [text]
 			if local.isEmpty {
-				if locations.isEmpty {
+				// `[User]`, `User?` or `Result<User, Failure>`: the wrapper is the SDK's, what it holds may be the project's.
+				// Older sourcekit-lsp reports no location for the wrapper and `[User]` has no name to look up, so a variable's
+				// type is looked inside even then.
+				var inner: [String] = []
+				if !locations.isEmpty || Self.isVariableHover(text) {
+					inner = await projectTypes(inHover: text, client: client)
+				}
+				if !inner.isEmpty {
+					parts.append("The outer type is defined in the SDK or the standard library; it holds these project type(s):")
+					parts += inner
+				} else if locations.isEmpty {
 					parts.append("(no type definition reported: the position may be a type itself, a function, or have no declared type)")
 				} else {
-					// `[User]`, `User?` or `Result<User, Failure>`: the wrapper is the SDK's, what it holds may be the project's.
-					let inner = await projectTypes(inHover: text, client: client)
-					parts.append(
-						inner.isEmpty
-							? "Type is defined in the SDK or the standard library."
-							: "The outer type is defined in the SDK or the standard library; it holds these project type(s):")
-					parts += inner
+					parts.append("Type is defined in the SDK or the standard library.")
 				}
 			} else {
 				parts += local.map(describeTypeDefinition)
