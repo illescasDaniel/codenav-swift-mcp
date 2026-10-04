@@ -3,7 +3,7 @@ import Foundation
 import MCP
 import NavShared
 
-let serverVersion = "0.2.2"
+let serverVersion = "0.2.3"
 
 // A write to a pipe whose reader died (sourcekit-lsp crashed) must fail with an error, not kill this process.
 signal(SIGPIPE, SIG_IGN)

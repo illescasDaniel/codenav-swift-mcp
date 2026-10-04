@@ -398,6 +398,13 @@ private func symbol(
 		#expect(parsed[1].severity == "warning")
 	}
 
+	@Test func colouredCompilerOutputIsStrippedBeforeParsing() {
+		let output = ProcessOutput(
+			status: 1, stdout: "", stderr: "\u{1B}[1m/p/A.swift:1:5: \u{1B}[0;1;31merror: \u{1B}[0;1mboom\u{1B}[0m", timedOut: false, seconds: 1)
+		let parsed = BuildRunner.parse(output.combined)
+		#expect(parsed.count == 1 && parsed[0].line == 1 && parsed[0].message == "boom")
+	}
+
 	@Test func newErrorsIgnoreLineShiftsButCountRepeats() {
 		func error(_ file: String, _ line: Int, _ message: String) -> BuildDiagnostic {
 			BuildDiagnostic(path: "/p/\(file)", line: line, column: 1, severity: "error", message: message)

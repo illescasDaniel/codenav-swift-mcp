@@ -63,7 +63,11 @@ struct ProcessOutput: Sendable {
 	var timedOut: Bool
 	var seconds: Double
 
-	var combined: String { stdout + (stdout.isEmpty || stderr.isEmpty ? "" : "\n") + stderr }
+	/// Both streams without ANSI colour escapes, which the compiler adds when the host itself runs in a terminal.
+	var combined: String {
+		(stdout + (stdout.isEmpty || stderr.isEmpty ? "" : "\n") + stderr)
+			.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+	}
 }
 
 enum ToolProcess {
@@ -277,12 +281,14 @@ enum BuildRunner {
 	static func run(swift: String, root: URL, buildTests: Bool, environment: [String: String], timeout: TimeInterval) async -> BuildResult {
 		var arguments = ["build"]
 		if buildTests { arguments.append("--build-tests") }
+		let shown = "swift " + arguments.joined(separator: " ")
+		arguments.append("--no-color-diagnostics")
 		let output = await ToolProcess.run(swift, arguments: arguments, directory: root, environment: environment, timeout: timeout)
 		let diagnostics = parse(output.combined)
 		let tail = output.combined.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.suffix(6)
 			.joined(separator: "\n")
 		return BuildResult(
-			command: "swift " + arguments.joined(separator: " "), status: output.status, timedOut: output.timedOut,
+			command: shown, status: output.status, timedOut: output.timedOut,
 			seconds: output.seconds, errors: diagnostics.filter { $0.severity == "error" },
 			warnings: diagnostics.filter { $0.severity == "warning" }.count, tail: tail)
 	}
