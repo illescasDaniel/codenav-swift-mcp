@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+* `type_at` looks inside SDK wrappers (`[User]`, `User?`, `Result<User, Failure>`) also with Swift 6.3 and earlier, whose
+  sourcekit-lsp reports no type definition for them: 0.2.1 only did this when the language server answered. The release
+  tests of 0.2.1 failed on CI for this reason.
+
 ## 0.2.1
 
 * `move_symbol` (to another file) no longer copies every import of the old file: the old file is shown to the language
