@@ -3,7 +3,7 @@ import Foundation
 import MCP
 import NavShared
 
-let serverVersion = "0.2.3"
+let serverVersion = "0.2.4"
 
 // A write to a pipe whose reader died (sourcekit-lsp crashed) must fail with an error, not kill this process.
 signal(SIGPIPE, SIG_IGN)
@@ -66,7 +66,8 @@ let server = Server(
 	name: "codenav-swift",
 	version: serverVersion,
 	instructions: ToolCatalog.instructions + (writesEnabled ? " " + ToolCatalog.writeInstructions : ""),
-	capabilities: .init(tools: .init(listChanged: false))
+	capabilities: .init(tools: .init(listChanged: false)),
+	configuration: .strict
 )
 
 let navigator = SwiftNavigator(
@@ -109,11 +110,14 @@ await server.withMethodHandler(CallTool.self) { params in
 	return .init(content: [.text(text: result.text, annotations: nil, _meta: nil)], isError: result.isError)
 }
 
+await server.onNotification(InitializedNotification.self) { _ in
+	Task { await navigator.warmUp() }
+}
+
 do {
-	try await server.start(transport: StdioTransport())
+	try await server.start(transport: MCPStdioTransport())
 } catch {
 	FileHandle.standardError.write(Data("codenav-swift: failed to start: \(error)\n".utf8))
 	exit(1)
 }
-Task { await navigator.warmUp() }
 await server.waitUntilCompleted()

@@ -8,35 +8,60 @@ import os
 import subprocess
 import sys
 
-binary = sys.argv[1]
+binary = os.path.abspath(sys.argv[1])
 workspace = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.getcwd()
-env = dict(os.environ, CODENAV_SWIFT_WORKSPACE=workspace)
-process = subprocess.Popen(
-    [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True
-)
+env = dict(os.environ)
+# Exercise workspace selection without a pin so an unexpected roots/list request fails the test.
+env.pop("CODENAV_SWIFT_WORKSPACE", None)
 
 
-def request(message):
-    process.stdin.write(json.dumps(message) + "\n")
-    process.stdin.flush()
-    return json.loads(process.stdout.readline())
+def smoke_test(protocol, capabilities, client_info):
+    with subprocess.Popen(
+        [binary], cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, env=env, text=True,
+    ) as process:
+        def send(message):
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+
+        def request(request_id, method, params=None):
+            message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+            if params is not None:
+                message["params"] = params
+            send(message)
+            reply = json.loads(process.stdout.readline())
+            if reply.get("id") != request_id or "result" not in reply:
+                raise AssertionError(f"{method}: expected a result, got {reply}")
+            return reply["result"]
+
+        try:
+            init = request(1, "initialize", {
+                "protocolVersion": protocol,
+                "capabilities": capabilities,
+                "clientInfo": client_info,
+            })
+            assert init["protocolVersion"] == protocol, init
+            print("server:", init["serverInfo"], "for", client_info["name"])
+            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            tools = request(2, "tools/list")["tools"]
+            names = sorted(tool["name"] for tool in tools)
+            assert names == expected, names
+            # Neither client advertises roots. A tool that selects a workspace must still answer.
+            result = request(3, "tools/call", {"name": "workspace", "arguments": {}})
+            assert not result.get("isError"), result
+        finally:
+            process.terminate()
 
 
-init = request({
-    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-    "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "smoke-test", "version": "0"}},
-})
-print("server:", init["result"]["serverInfo"])
-process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
-tools = request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
-names = sorted(tool["name"] for tool in tools)
-print("tools:", ", ".join(names))
-process.terminate()
 # The read-only tools; the editing tools are listed only with CODENAV_SWIFT_WRITE=1.
 expected = sorted([
     "affected_tests", "callers", "definition", "diagnostics", "hover", "implementations", "outline",
     "references", "search_symbol", "symbol_info", "type_at", "verify", "workspace",
 ])
-if names != expected:
-    sys.exit(f"expected tools {expected}, got {names}")
+smoke_test("2025-03-26", {}, {"name": "smoke-test", "version": "0"})
+smoke_test(
+    "2025-06-18",
+    {"experimental": {"codex/auth-change": {}}, "elicitation": {"form": {}, "url": {}}},
+    {"name": "codex-mcp-client", "title": "Codex", "version": "0.169.0"},
+)
 print("smoke test passed")

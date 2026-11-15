@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+* Codex connects directly over stdio. CodeNav accepts object-valued experimental client capabilities and requests
+  workspace roots only after initialization and only from clients that advertise them.
+
 ## 0.2.3
 
 * `verify` and the compile check after an edit read the build's errors also when the host runs from a terminal: the compiler

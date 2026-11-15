@@ -298,6 +298,19 @@ To share the server with a team through the repository instead, add it to the pr
 }
 ```
 
+### Codex
+
+Run `codex mcp add codenav-swift -- codenav-swift-mcp`, or add this to a trusted project's
+`.codex/config.toml`:
+
+```toml
+[mcp_servers.codenav-swift]
+command = "codenav-swift-mcp"
+```
+
+Start Codex in your Swift project directory. CodeNav uses that directory when the client does not advertise MCP roots.
+For a source build, use the absolute path to the built binary in the registration command or configuration.
+
 ### Cursor
 
 Add the server to `~/.cursor/mcp.json` (all projects) or to `.cursor/mcp.json` in a project:
